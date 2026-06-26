@@ -1536,6 +1536,12 @@
             }
 
             document.querySelectorAll('.tab-content').forEach(view => {
+                if (view.classList.contains('active')) {
+                    view.querySelectorAll('input[type="text"], input[type="password"], input[type="search"], input[type="url"], input[type="email"], textarea').forEach(input => {
+                        if (input.hasAttribute('data-preserve-on-tab-switch') || input.readOnly) return;
+                        input.value = '';
+                    });
+                }
                 view.classList.remove('active');
             });
             document.querySelectorAll('.nav-btn').forEach(btn => {
