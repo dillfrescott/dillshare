@@ -679,9 +679,9 @@ async fn login_user(
         return Err((StatusCode::UNAUTHORIZED, "Invalid username or password".to_string()));
     }
 
-    // Generate token valid for 30 days with a unique session id
+    // Generate token valid for 1 year with a unique session id
     let session_id = uuid::Uuid::new_v4().to_string();
-    let expiry = chrono::Utc::now().timestamp() + (30 * 24 * 60 * 60);
+    let expiry = chrono::Utc::now().timestamp() + (365 * 24 * 60 * 60);
     let token = generate_token(username, &state.jwt_secret, expiry, &session_id);
 
     // Extract user agent and IP
@@ -1644,7 +1644,7 @@ async fn admin_login(
         return Err((StatusCode::FORBIDDEN, "Invalid admin token".to_string()));
     }
     
-    let expiry = chrono::Utc::now().timestamp() + 30 * 24 * 60 * 60; // 30 days
+    let expiry = chrono::Utc::now().timestamp() + 365 * 24 * 60 * 60; // 1 year
     let session_id = uuid::Uuid::new_v4().to_string();
     let session_token = generate_token("admin", &state.jwt_secret, expiry, &session_id);
     
