@@ -109,10 +109,14 @@ async fn main() {
         .route("/api/user/profile", get(get_user_profile).post(save_user_profile))
         .route("/api/user/change_password", post(user_change_password))
         .route("/api/user/account", delete(user_delete_account))
+        .route("/api/user/sessions", get(get_user_sessions))
+        .route("/api/user/sessions/:id", delete(revoke_user_session))
         // Admin routes
         .route("/api/admin/stats", get(admin_get_stats))
         .route("/api/admin/share/:uuid", delete(admin_delete_share))
         .route("/api/admin/user/:username", delete(admin_delete_user))
+        .route("/api/admin/user/:username/sessions", get(admin_get_user_sessions))
+        .route("/api/admin/user/:username/sessions/:id", delete(admin_revoke_user_session))
         // Static assets/routing (all fallback to SPA index.html)
         .route("/", get(serve_index))
         .route("/shares", get(serve_index))
@@ -150,7 +154,8 @@ async fn upload_files(
     mut multipart: Multipart,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let token = extract_token(&headers)?;
-    let username = verify_token(&token, &state.jwt_secret)
+    let (username, _) = verify_session(&token, &state)
+        .await
         .ok_or_else(|| (StatusCode::UNAUTHORIZED, "Invalid or expired session".to_string()))?;
 
     let uuid = uuid::Uuid::new_v4().to_string();
@@ -443,7 +448,8 @@ async fn delete_share(
     Path(uuid): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let token = extract_token(&headers)?;
-    let username = verify_token(&token, &state.jwt_secret)
+    let (username, _) = verify_session(&token, &state)
+        .await
         .ok_or_else(|| (StatusCode::UNAUTHORIZED, "Invalid or expired session".to_string()))?;
 
     // Check ownership
@@ -635,6 +641,7 @@ async fn register_user(
 
 async fn login_user(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     axum::Json(payload): axum::Json<AuthRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let username = payload.username.trim();
@@ -669,9 +676,61 @@ async fn login_user(
         return Err((StatusCode::UNAUTHORIZED, "Invalid username or password".to_string()));
     }
 
-    // Generate token valid for 30 days
+    // Generate token valid for 30 days with a unique session id
+    let session_id = uuid::Uuid::new_v4().to_string();
     let expiry = chrono::Utc::now().timestamp() + (30 * 24 * 60 * 60);
-    let token = generate_token(username, &state.jwt_secret, expiry);
+    let token = generate_token(username, &state.jwt_secret, expiry, &session_id);
+
+    // Extract user agent and IP
+    let user_agent = headers.get("user-agent")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("Unknown")
+        .to_string();
+    let ip = headers.get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .or_else(|| headers.get("x-real-ip").and_then(|v| v.to_str().ok()))
+        .unwrap_or("Unknown")
+        .to_string();
+
+    let new_session = UserSession {
+        id: session_id,
+        created_at: chrono::Utc::now().timestamp(),
+        user_agent,
+        ip,
+        expires_at: expiry,
+    };
+
+    let sessions_key = format!("users/{}/sessions.json", username);
+    let mut sessions: Vec<UserSession> = match state.s3_client.get_object()
+        .bucket(&state.bucket)
+        .key(&sessions_key)
+        .send()
+        .await
+    {
+        Ok(output) => {
+            if let Ok(bytes) = output.body.collect().await {
+                serde_json::from_slice(&bytes.into_bytes()).unwrap_or_default()
+            } else {
+                Vec::new()
+            }
+        }
+        Err(_) => Vec::new(),
+    };
+
+    // Filter out expired sessions
+    let now = chrono::Utc::now().timestamp();
+    sessions.retain(|s| s.expires_at > now);
+    sessions.push(new_session);
+
+    if let Ok(session_bytes) = serde_json::to_vec(&sessions) {
+        let _ = state.s3_client.put_object()
+            .bucket(&state.bucket)
+            .key(&sessions_key)
+            .content_type("application/json")
+            .body(aws_sdk_s3::primitives::ByteStream::from(session_bytes))
+            .send()
+            .await;
+    }
 
     let pfp = user_json.get("pfp").and_then(|v| v.as_str()).unwrap_or("");
 
@@ -686,7 +745,8 @@ async fn get_user_shares(
     headers: axum::http::HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let token = extract_token(&headers)?;
-    let username = verify_token(&token, &state.jwt_secret)
+    let (username, _) = verify_session(&token, &state)
+        .await
         .ok_or_else(|| (StatusCode::UNAUTHORIZED, "Invalid or expired session".to_string()))?;
 
     let shares_key = format!("users/{}/shares.enc", username);
@@ -721,7 +781,8 @@ async fn save_user_shares(
     axum::Json(payload): axum::Json<SaveSharesRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let token = extract_token(&headers)?;
-    let username = verify_token(&token, &state.jwt_secret)
+    let (username, _) = verify_session(&token, &state)
+        .await
         .ok_or_else(|| (StatusCode::UNAUTHORIZED, "Invalid or expired session".to_string()))?;
 
     // Decode hex string back to bytes
@@ -766,24 +827,34 @@ fn extract_token(headers: &axum::http::HeaderMap) -> Result<String, (StatusCode,
 
 type HmacSha256 = Hmac<Sha256>;
 
-fn generate_token(username: &str, secret: &[u8], expiry_timestamp: i64) -> String {
-    let payload = format!("{}:{}", username, expiry_timestamp);
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+struct UserSession {
+    id: String,
+    created_at: i64,
+    user_agent: String,
+    ip: String,
+    expires_at: i64,
+}
+
+fn generate_token(username: &str, secret: &[u8], expiry_timestamp: i64, session_id: &str) -> String {
+    let payload = format!("{}:{}:{}", username, expiry_timestamp, session_id);
     let mut mac = HmacSha256::new_from_slice(secret).expect("HMAC can take key of any size");
     mac.update(payload.as_bytes());
     let signature = mac.finalize().into_bytes().iter().map(|b| format!("{:02x}", b)).collect::<String>();
     
     let username_hex = username.as_bytes().iter().map(|b| format!("{:02x}", b)).collect::<String>();
-    format!("{}.{}.{}", username_hex, expiry_timestamp, signature)
+    format!("{}.{}.{}.{}", username_hex, expiry_timestamp, session_id, signature)
 }
 
-fn verify_token(token: &str, secret: &[u8]) -> Option<String> {
+fn verify_token_signature(token: &str, secret: &[u8]) -> Option<(String, i64, String)> {
     let parts: Vec<&str> = token.split('.').collect();
-    if parts.len() != 3 {
+    if parts.len() != 4 {
         return None;
     }
     let username_hex = parts[0];
     let expiry_str = parts[1];
-    let signature = parts[2];
+    let session_id = parts[2];
+    let signature = parts[3];
     
     let expiry_timestamp = expiry_str.parse::<i64>().ok()?;
     let now = chrono::Utc::now().timestamp();
@@ -800,15 +871,41 @@ fn verify_token(token: &str, secret: &[u8]) -> Option<String> {
     }
     let username = String::from_utf8(username_bytes).ok()?;
     
-    let payload = format!("{}:{}", username, expiry_timestamp);
+    let payload = format!("{}:{}:{}", username, expiry_timestamp, session_id);
     let mut mac = HmacSha256::new_from_slice(secret).ok()?;
     mac.update(payload.as_bytes());
     let expected_sig = mac.finalize().into_bytes().iter().map(|b| format!("{:02x}", b)).collect::<String>();
     
     if expected_sig == signature {
-        Some(username)
+        Some((username, expiry_timestamp, session_id.to_string()))
     } else {
         None
+    }
+}
+
+async fn verify_session(token: &str, state: &AppState) -> Option<(String, String)> {
+    let (username, _expiry, session_id) = verify_token_signature(token, &state.jwt_secret)?;
+    
+    let sessions_key = format!("users/{}/sessions.json", username);
+    let res = state.s3_client.get_object()
+        .bucket(&state.bucket)
+        .key(&sessions_key)
+        .send()
+        .await;
+        
+    match res {
+        Ok(output) => {
+            let bytes = output.body.collect().await.ok()?.into_bytes();
+            let sessions: Vec<UserSession> = serde_json::from_slice(&bytes).ok()?;
+            
+            let exists = sessions.iter().any(|s| s.id == session_id);
+            if exists {
+                Some((username, session_id))
+            } else {
+                None
+            }
+        }
+        Err(_) => None,
     }
 }
 
@@ -1047,7 +1144,8 @@ async fn get_user_profile(
     headers: axum::http::HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let token = extract_token(&headers)?;
-    let username = verify_token(&token, &state.jwt_secret)
+    let (username, _) = verify_session(&token, &state)
+        .await
         .ok_or_else(|| (StatusCode::UNAUTHORIZED, "Invalid or expired session".to_string()))?;
 
     let user_key = format!("users/{}.json", username);
@@ -1084,7 +1182,8 @@ async fn save_user_profile(
     axum::Json(payload): axum::Json<SaveProfileRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let token = extract_token(&headers)?;
-    let username = verify_token(&token, &state.jwt_secret)
+    let (username, _) = verify_session(&token, &state)
+        .await
         .ok_or_else(|| (StatusCode::UNAUTHORIZED, "Invalid or expired session".to_string()))?;
 
     let user_key = format!("users/{}.json", username);
@@ -1139,7 +1238,8 @@ async fn user_change_password(
     axum::Json(payload): axum::Json<ChangePasswordRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let token = extract_token(&headers)?;
-    let username = verify_token(&token, &state.jwt_secret)
+    let (username, current_session_id) = verify_session(&token, &state)
+        .await
         .ok_or_else(|| (StatusCode::UNAUTHORIZED, "Invalid or expired session".to_string()))?;
 
     let user_key = format!("users/{}.json", username);
@@ -1212,6 +1312,37 @@ async fn user_change_password(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to save new shares: {:?}", e)))?;
 
+    // Revoke all OTHER sessions of this user upon password change (forces relogin on other devices)
+    let sessions_key = format!("users/{}/sessions.json", username);
+    let mut sessions: Vec<UserSession> = match state.s3_client.get_object()
+        .bucket(&state.bucket)
+        .key(&sessions_key)
+        .send()
+        .await
+    {
+        Ok(output) => {
+            if let Ok(bytes) = output.body.collect().await {
+                serde_json::from_slice(&bytes.into_bytes()).unwrap_or_default()
+            } else {
+                Vec::new()
+            }
+        }
+        Err(_) => Vec::new(),
+    };
+
+    let now = chrono::Utc::now().timestamp();
+    sessions.retain(|s| s.id == current_session_id && s.expires_at > now);
+
+    if let Ok(session_bytes) = serde_json::to_vec(&sessions) {
+        let _ = state.s3_client.put_object()
+            .bucket(&state.bucket)
+            .key(&sessions_key)
+            .content_type("application/json")
+            .body(aws_sdk_s3::primitives::ByteStream::from(session_bytes))
+            .send()
+            .await;
+    }
+
     Ok(StatusCode::OK)
 }
 
@@ -1220,7 +1351,8 @@ async fn user_delete_account(
     headers: axum::http::HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let token = extract_token(&headers)?;
-    let username = verify_token(&token, &state.jwt_secret)
+    let (username, _) = verify_session(&token, &state)
+        .await
         .ok_or_else(|| (StatusCode::UNAUTHORIZED, "Invalid or expired session".to_string()))?;
 
     let public_shares_key = format!("users/{}/public_shares.json", username);
@@ -1243,10 +1375,12 @@ async fn user_delete_account(
 
     let user_profile_key = format!("users/{}.json", username);
     let user_shares_enc_key = format!("users/{}/shares.enc", username);
+    let sessions_key = format!("users/{}/sessions.json", username);
 
     let _ = state.s3_client.delete_object().bucket(&state.bucket).key(&user_profile_key).send().await;
     let _ = state.s3_client.delete_object().bucket(&state.bucket).key(&user_shares_enc_key).send().await;
     let _ = state.s3_client.delete_object().bucket(&state.bucket).key(&public_shares_key).send().await;
+    let _ = state.s3_client.delete_object().bucket(&state.bucket).key(&sessions_key).send().await;
 
     Ok(StatusCode::OK)
 }
@@ -1266,4 +1400,184 @@ async fn generate_and_save_jwt_secret(s3_client: &aws_sdk_s3::Client, bucket: &s
         .await;
 
     secret
+}
+
+async fn get_user_sessions(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let token = extract_token(&headers)?;
+    let (username, current_session_id) = verify_session(&token, &state)
+        .await
+        .ok_or_else(|| (StatusCode::UNAUTHORIZED, "Invalid or expired session".to_string()))?;
+
+    let sessions_key = format!("users/{}/sessions.json", username);
+    let sessions: Vec<UserSession> = match state.s3_client.get_object()
+        .bucket(&state.bucket)
+        .key(&sessions_key)
+        .send()
+        .await
+    {
+        Ok(output) => {
+            if let Ok(bytes) = output.body.collect().await {
+                serde_json::from_slice(&bytes.into_bytes()).unwrap_or_default()
+            } else {
+                Vec::new()
+            }
+        }
+        Err(_) => Vec::new(),
+    };
+
+    let now = chrono::Utc::now().timestamp();
+    let mut response_sessions = Vec::new();
+
+    for s in sessions {
+        if s.expires_at > now {
+            let is_current = s.id == current_session_id;
+            response_sessions.push(serde_json::json!({
+                "id": s.id,
+                "created_at": s.created_at,
+                "user_agent": s.user_agent,
+                "ip": s.ip,
+                "expires_at": s.expires_at,
+                "is_current": is_current,
+            }));
+        }
+    }
+
+    Ok(axum::Json(response_sessions))
+}
+
+async fn revoke_user_session(
+    State(state): State<AppState>,
+    axum::extract::Path(session_id): axum::extract::Path<String>,
+    headers: axum::http::HeaderMap,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let token = extract_token(&headers)?;
+    let (username, _current_session_id) = verify_session(&token, &state)
+        .await
+        .ok_or_else(|| (StatusCode::UNAUTHORIZED, "Invalid or expired session".to_string()))?;
+
+    let sessions_key = format!("users/{}/sessions.json", username);
+    let mut sessions: Vec<UserSession> = match state.s3_client.get_object()
+        .bucket(&state.bucket)
+        .key(&sessions_key)
+        .send()
+        .await
+    {
+        Ok(output) => {
+            if let Ok(bytes) = output.body.collect().await {
+                serde_json::from_slice(&bytes.into_bytes()).unwrap_or_default()
+            } else {
+                Vec::new()
+            }
+        }
+        Err(_) => Vec::new(),
+    };
+
+    let original_len = sessions.len();
+    sessions.retain(|s| s.id != session_id);
+
+    if sessions.len() < original_len {
+        let session_bytes = serde_json::to_vec(&sessions)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+        state.s3_client.put_object()
+            .bucket(&state.bucket)
+            .key(&sessions_key)
+            .content_type("application/json")
+            .body(aws_sdk_s3::primitives::ByteStream::from(session_bytes))
+            .send()
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to update sessions: {:?}", e)))?;
+    }
+
+    Ok(StatusCode::OK)
+}
+
+async fn admin_get_user_sessions(
+    State(state): State<AppState>,
+    Path(username): Path<String>,
+    headers: axum::http::HeaderMap,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    verify_admin(&headers)?;
+
+    let sessions_key = format!("users/{}/sessions.json", username);
+    let sessions: Vec<UserSession> = match state.s3_client.get_object()
+        .bucket(&state.bucket)
+        .key(&sessions_key)
+        .send()
+        .await
+    {
+        Ok(output) => {
+            if let Ok(bytes) = output.body.collect().await {
+                serde_json::from_slice(&bytes.into_bytes()).unwrap_or_default()
+            } else {
+                Vec::new()
+            }
+        }
+        Err(_) => Vec::new(),
+    };
+
+    let now = chrono::Utc::now().timestamp();
+    let mut response_sessions = Vec::new();
+
+    for s in sessions {
+        if s.expires_at > now {
+            response_sessions.push(serde_json::json!({
+                "id": s.id,
+                "created_at": s.created_at,
+                "user_agent": s.user_agent,
+                "ip": s.ip,
+                "expires_at": s.expires_at,
+                "is_current": false,
+            }));
+        }
+    }
+
+    Ok(axum::Json(response_sessions))
+}
+
+async fn admin_revoke_user_session(
+    State(state): State<AppState>,
+    Path((username, session_id)): Path<(String, String)>,
+    headers: axum::http::HeaderMap,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    verify_admin(&headers)?;
+
+    let sessions_key = format!("users/{}/sessions.json", username);
+    let mut sessions: Vec<UserSession> = match state.s3_client.get_object()
+        .bucket(&state.bucket)
+        .key(&sessions_key)
+        .send()
+        .await
+    {
+        Ok(output) => {
+            if let Ok(bytes) = output.body.collect().await {
+                serde_json::from_slice(&bytes.into_bytes()).unwrap_or_default()
+            } else {
+                Vec::new()
+            }
+        }
+        Err(_) => Vec::new(),
+    };
+
+    let original_len = sessions.len();
+    sessions.retain(|s| s.id != session_id);
+
+    if sessions.len() < original_len {
+        let session_bytes = serde_json::to_vec(&sessions)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+        state.s3_client.put_object()
+            .bucket(&state.bucket)
+            .key(&sessions_key)
+            .content_type("application/json")
+            .body(aws_sdk_s3::primitives::ByteStream::from(session_bytes))
+            .send()
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to update sessions: {:?}", e)))?;
+    }
+
+    Ok(StatusCode::OK)
 }

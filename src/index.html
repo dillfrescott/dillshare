@@ -970,6 +970,7 @@
             <div id="nav-links" style="display: none; align-items: center; gap: 0.5rem;">
                 <button class="nav-btn active" id="nav-upload">Upload</button>
                 <button class="nav-btn" id="nav-shares">Active Shares</button>
+                <button class="nav-btn" id="nav-sessions">Sessions</button>
                 <button class="nav-btn" id="nav-profile">Profile</button>
                 <span class="nav-separator" style="color: var(--surface-border); font-size: 0.8rem; margin: 0 0.25rem;">|</span>
             </div>
@@ -1184,6 +1185,10 @@
                         <label for="settings-new-password" style="font-size: 0.8rem; color: var(--text-muted); font-weight: 500;">New Password</label>
                         <input type="password" id="settings-new-password" required autocomplete="new-password" style="background: rgba(0,0,0,0.2); border: 1px solid var(--surface-border); border-radius: 4px; padding: 0.5rem 0.75rem; color: var(--text-main); font-family: inherit; font-size: 0.85rem; outline: none; width: 100%;">
                     </div>
+                    <div style="display: flex; flex-direction: column; gap: 0.4rem;">
+                        <label for="settings-new-password-confirm" style="font-size: 0.8rem; color: var(--text-muted); font-weight: 500;">Confirm New Password</label>
+                        <input type="password" id="settings-new-password-confirm" required autocomplete="new-password" style="background: rgba(0,0,0,0.2); border: 1px solid var(--surface-border); border-radius: 4px; padding: 0.5rem 0.75rem; color: var(--text-main); font-family: inherit; font-size: 0.85rem; outline: none; width: 100%;">
+                    </div>
                     <button class="btn" type="submit" id="btn-settings-password-submit" style="justify-content: center; padding: 0.6rem; font-weight: 600; font-size: 0.85rem; width: 100%;">
                         Update Password
                     </button>
@@ -1198,6 +1203,36 @@
                     </button>
                 </div>
 
+            </div>
+        </div>
+
+        <!-- SESSIONS VIEW -->
+        <div id="view-sessions" class="tab-content">
+            <div class="glass-card" style="display: flex; flex-direction: column; gap: 1.5rem; max-width: 800px; margin: 0 auto; width: 100%;">
+                <div style="display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--surface-border); padding-bottom: 0.5rem;">
+                    <h2 style="font-size: 1.5rem; color: var(--primary); margin: 0;">Active Sessions</h2>
+                    <button class="btn btn-secondary" id="btn-refresh-sessions" style="padding: 0.4rem 0.8rem; font-size: 0.75rem; font-weight: 600;">
+                        Refresh
+                    </button>
+                </div>
+                <p style="font-size: 0.85rem; color: var(--text-muted); margin: 0;">These are the devices and sessions currently logged into your account. You can revoke any session to log it out immediately.</p>
+                
+                <div class="shares-table-wrapper" style="overflow-x: auto;">
+                    <table style="width: 100%; border-collapse: collapse; text-align: left;" id="sessions-table">
+                        <thead>
+                            <tr style="border-bottom: 1px solid var(--surface-border);">
+                                <th style="padding: 0.85rem; font-size: 0.8rem; text-transform: uppercase; color: var(--text-muted);">Device / Browser</th>
+                                <th style="padding: 0.85rem; font-size: 0.8rem; text-transform: uppercase; color: var(--text-muted);">IP Address</th>
+                                <th style="padding: 0.85rem; font-size: 0.8rem; text-transform: uppercase; color: var(--text-muted);">Last Active</th>
+                                <th style="padding: 0.85rem; font-size: 0.8rem; text-transform: uppercase; color: var(--text-muted);">Expires</th>
+                                <th style="padding: 0.85rem; font-size: 0.8rem; text-transform: uppercase; color: var(--text-muted); text-align: right;">Action</th>
+                            </tr>
+                        </thead>
+                        <tbody id="sessions-list-body">
+                            <!-- Populated dynamically -->
+                        </tbody>
+                    </table>
+                </div>
             </div>
         </div>
 
@@ -1316,8 +1351,10 @@
         const viewShareDetails = document.getElementById('view-share-details');
         const viewAdmin = document.getElementById('view-admin');
         const viewProfile = document.getElementById('view-profile');
+        const viewSessions = document.getElementById('view-sessions');
         const navUpload = document.getElementById('nav-upload');
         const navShares = document.getElementById('nav-shares');
+        const navSessions = document.getElementById('nav-sessions');
         const navProfile = document.getElementById('nav-profile');
         const logoLink = document.getElementById('logo-link');
 
@@ -1471,6 +1508,10 @@
                 navShares.classList.add('active');
                 loadSharesList();
             }
+            if (viewId === 'view-sessions') {
+                if (navSessions) navSessions.classList.add('active');
+                loadUserSessionsView();
+            }
             if (viewId === 'view-profile') {
                 navProfile.classList.add('active');
                 loadUserProfileView();
@@ -1489,6 +1530,13 @@
             window.history.pushState({}, '', '/shares');
             showTab('view-shares');
         });
+
+        if (navSessions) {
+            navSessions.addEventListener('click', () => {
+                window.history.pushState({}, '', '/sessions');
+                showTab('view-sessions');
+            });
+        }
 
         navProfile.addEventListener('click', () => {
             window.history.pushState({}, '', '/profile');
@@ -1516,6 +1564,14 @@
                 const isLoggedIn = !!localStorage.getItem('dill_session_token');
                 if (isLoggedIn) {
                     showTab('view-shares');
+                } else {
+                    window.history.replaceState({}, '', '/');
+                    showTab('view-upload');
+                }
+            } else if (path === '/sessions') {
+                const isLoggedIn = !!localStorage.getItem('dill_session_token');
+                if (isLoggedIn) {
+                    showTab('view-sessions');
                 } else {
                     window.history.replaceState({}, '', '/');
                     showTab('view-upload');
@@ -1920,7 +1976,18 @@
                             </td>
                         </tr>
                     `;
-                    shares = await fetchAccountShares();
+                    try {
+                        shares = await fetchAccountShares();
+                    } catch (err) {
+                        sharesListBody.innerHTML = `
+                            <tr>
+                                <td colspan="6" style="text-align:center; color:var(--danger); padding:2rem 0;">
+                                    Failed to decrypt synced account shares. Your encryption key may be outdated due to a password change on another device. Please log out and log back in to derive the new key.
+                                </td>
+                            </tr>
+                        `;
+                        return;
+                    }
                 } else {
                     shares = JSON.parse(localStorage.getItem('my_shares') || '[]');
                 }
@@ -2659,10 +2726,11 @@
             };
         }
 
-        async function fetchAccountShares() {
+        async function fetchAccountShares(overrideKeyBuf = null) {
             const token = localStorage.getItem('dill_session_token');
             const encKeyHex = localStorage.getItem('dill_enc_key');
-            if (!token || !encKeyHex) return [];
+            if (!token) return [];
+            if (!overrideKeyBuf && !encKeyHex) return [];
 
             try {
                 const res = await fetch('/api/user/shares', {
@@ -2672,15 +2740,16 @@
                     if (res.status === 401) {
                         logoutUser();
                     }
-                    return [];
+                    throw new Error('Failed to fetch user shares from server');
                 }
 
                 const data = await res.json();
                 if (!data.shares_enc) return [];
 
+                const decryptionKeyBuf = overrideKeyBuf || hexToBuf(encKeyHex);
                 const key = await window.crypto.subtle.importKey(
                     "raw",
-                    hexToBuf(encKeyHex),
+                    decryptionKeyBuf,
                     { name: "AES-GCM" },
                     false,
                     ["decrypt"]
@@ -2688,8 +2757,8 @@
                 const decBuf = await decryptData(hexToBuf(data.shares_enc), key);
                 return JSON.parse(new TextDecoder().decode(decBuf));
             } catch (e) {
-                showToast('Failed to decrypt account shares', 'error');
-                return [];
+                showToast('Failed to decrypt account shares: ' + e.message, 'error');
+                throw e;
             }
         }
 
@@ -2973,10 +3042,16 @@
             e.preventDefault();
             const currentPassword = document.getElementById('settings-current-password').value;
             const newPassword = document.getElementById('settings-new-password').value;
+            const newPasswordConfirm = document.getElementById('settings-new-password-confirm').value;
             const username = localStorage.getItem('dill_username');
             const token = localStorage.getItem('dill_session_token');
 
-            if (!currentPassword || !newPassword || !username || !token) return;
+            if (!currentPassword || !newPassword || !newPasswordConfirm || !username || !token) return;
+
+            if (newPassword !== newPasswordConfirm) {
+                showToast('New passwords do not match', 'error');
+                return;
+            }
 
             btnSettingsPasswordSubmit.disabled = true;
             btnSettingsPasswordSubmit.innerHTML = `<div class="loader" style="width:0.85rem; height:0.85rem; border-width:1px; margin:0 auto; display:inline-block; vertical-align:middle;"></div>`;
@@ -2986,8 +3061,8 @@
                 const currentKeys = await deriveUserKeys(username, currentPassword);
                 const newKeys = await deriveUserKeys(username, newPassword);
 
-                // 2. Fetch and decrypt all account shares using current key
-                const currentShares = await fetchAccountShares();
+                // 2. Fetch and decrypt all account shares using current key (checks password validity client-side)
+                const currentShares = await fetchAccountShares(currentKeys.encKeyBuf);
 
                 // 3. Re-encrypt all account shares using new key
                 const rawData = new TextEncoder().encode(JSON.stringify(currentShares));
@@ -3224,6 +3299,9 @@
                                 <button class="action-btn toggle-shares-btn" data-username="${u.username}" style="padding: 0.35rem 0.6rem; font-size:0.75rem; font-weight:600; color:var(--primary);">
                                     View Shares
                                 </button>
+                                <button class="action-btn toggle-sessions-btn" data-username="${u.username}" style="padding: 0.35rem 0.6rem; font-size:0.75rem; font-weight:600; color:var(--primary);">
+                                    View Sessions
+                                </button>
                                 <button class="action-btn delete delete-user-btn" data-username="${u.username}" style="padding: 0.35rem 0.6rem; font-size:0.75rem; font-weight:600;">
                                     Delete User
                                 </button>
@@ -3280,6 +3358,22 @@
                         </td>
                     `;
                     usersBody.appendChild(subRow);
+
+                    // Add nested sessions sub-row (initially hidden)
+                    const sessionsSubRow = document.createElement('tr');
+                    sessionsSubRow.id = `sessions-subrow-${u.username}`;
+                    sessionsSubRow.style.display = 'none';
+                    sessionsSubRow.innerHTML = `
+                        <td colspan="4" style="background: rgba(255, 255, 255, 0.005); padding: 0.5rem 1rem 1rem 1rem;">
+                            <div style="border-left: 2px solid var(--primary); padding-left: 1rem;">
+                                <h4 style="font-size:0.8rem; margin-bottom:0.25rem;">Active Sessions for ${u.username}</h4>
+                                <div id="admin-sessions-container-${u.username}">
+                                    <div class="loader" style="margin:1rem auto; display:block;"></div>
+                                </div>
+                            </div>
+                        </td>
+                    `;
+                    usersBody.appendChild(sessionsSubRow);
                 });
 
                 // Toggle share list sub-row display
@@ -3288,11 +3382,125 @@
                         const username = e.currentTarget.getAttribute('data-username');
                         const subRow = document.getElementById(`shares-subrow-${username}`);
                         if (subRow.style.display === 'none') {
+                            // Hide any open sessions row
+                            const sessionsRow = document.getElementById(`sessions-subrow-${username}`);
+                            if (sessionsRow) {
+                                sessionsRow.style.display = 'none';
+                                const viewSessionsBtn = document.querySelector(`.toggle-sessions-btn[data-username="${username}"]`);
+                                if (viewSessionsBtn) viewSessionsBtn.textContent = 'View Sessions';
+                            }
                             subRow.style.display = 'table-row';
                             e.currentTarget.textContent = 'Hide Shares';
                         } else {
                             subRow.style.display = 'none';
                             e.currentTarget.textContent = 'View Shares';
+                        }
+                    });
+                });
+
+                // Toggle session list sub-row display
+                document.querySelectorAll('.toggle-sessions-btn').forEach(btn => {
+                    btn.addEventListener('click', async (e) => {
+                        const username = e.currentTarget.getAttribute('data-username');
+                        const subRow = document.getElementById(`sessions-subrow-${username}`);
+                        const container = document.getElementById(`admin-sessions-container-${username}`);
+                        
+                        if (subRow.style.display === 'none') {
+                            // Hide any open shares row
+                            const sharesRow = document.getElementById(`shares-subrow-${username}`);
+                            if (sharesRow) {
+                                sharesRow.style.display = 'none';
+                                const viewSharesBtn = document.querySelector(`.toggle-shares-btn[data-username="${username}"]`);
+                                if (viewSharesBtn) viewSharesBtn.textContent = 'View Shares';
+                            }
+
+                            subRow.style.display = 'table-row';
+                            e.currentTarget.textContent = 'Hide Sessions';
+                            
+                            // Load sessions via API
+                            container.innerHTML = `<div class="loader" style="margin:1rem auto; display:block;"></div>`;
+                            try {
+                                const sessRes = await fetch(`/api/admin/user/${username}/sessions`, {
+                                    headers: { 'Authorization': `Bearer ${token}` }
+                                });
+                                
+                                if (!sessRes.ok) {
+                                    throw new Error(await sessRes.text());
+                                }
+                                
+                                const userSessions = await sessRes.json();
+                                if (userSessions.length === 0) {
+                                    container.innerHTML = `<div style="color:var(--text-muted); padding:0.5rem 1rem; font-size:0.8rem;">No active sessions.</div>`;
+                                    return;
+                                }
+                                
+                                container.innerHTML = `
+                                    <table style="width:100%; border:1px solid var(--surface-border); background:rgba(0,0,0,0.1); border-radius:4px; margin-top:0.5rem;">
+                                        <thead>
+                                            <tr>
+                                                <th style="padding:0.5rem; font-size:0.75rem; width:45%;">Device / Browser</th>
+                                                <th style="padding:0.5rem; font-size:0.75rem;">IP Address</th>
+                                                <th style="padding:0.5rem; font-size:0.75rem;">Last Active</th>
+                                                <th style="padding:0.5rem; font-size:0.75rem;">Expires</th>
+                                                <th style="padding:0.5rem; font-size:0.75rem; text-align:right;">Actions</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody>
+                                            ${userSessions.map(s => `
+                                                <tr>
+                                                    <td style="padding:0.5rem; font-size:0.75rem;">
+                                                        <div style="display:flex; flex-direction:column;">
+                                                            <span style="font-weight:600;">${parseUserAgent(s.user_agent)}</span>
+                                                            <span style="font-size:0.65rem; color:var(--text-muted); font-family:monospace; margin-top:0.1rem; word-break:break-all;">${s.user_agent}</span>
+                                                        </div>
+                                                    </td>
+                                                    <td style="padding:0.5rem; font-size:0.75rem; font-family:monospace;">${s.ip}</td>
+                                                    <td style="padding:0.5rem; font-size:0.75rem;">${new Date(s.created_at * 1000).toLocaleString()}</td>
+                                                    <td style="padding:0.5rem; font-size:0.75rem;">${new Date(s.expires_at * 1000).toLocaleString()}</td>
+                                                    <td style="padding:0.5rem; font-size:0.75rem; text-align:right;">
+                                                        <button class="action-btn delete admin-revoke-session-btn" data-username="${username}" data-session-id="${s.id}" style="padding: 0.2rem 0.4rem; font-size:0.7rem; font-weight:600; display:inline-flex;">
+                                                            Revoke
+                                                        </button>
+                                                    </td>
+                                                </tr>
+                                            `).join('')}
+                                        </tbody>
+                                    </table>
+                                `;
+
+                                // Attach event listeners to admin revoke session buttons
+                                container.querySelectorAll('.admin-revoke-session-btn').forEach(revokeBtn => {
+                                    revokeBtn.addEventListener('click', async (evt) => {
+                                        const uName = evt.currentTarget.getAttribute('data-username');
+                                        const sId = evt.currentTarget.getAttribute('data-session-id');
+                                        if (confirm(`Are you sure you want to revoke this session for user ${uName}?`)) {
+                                            try {
+                                                const delSessRes = await fetch(`/api/admin/user/${uName}/sessions/${sId}`, {
+                                                    method: 'DELETE',
+                                                    headers: { 'Authorization': `Bearer ${token}` }
+                                                });
+                                                
+                                                if (delSessRes.ok) {
+                                                    showToast('Session revoked successfully', 'success');
+                                                    // Reload sessions list
+                                                    btn.click(); // close it
+                                                    btn.click(); // open it and reload
+                                                } else {
+                                                    showToast('Failed to revoke session: ' + await delSessRes.text(), 'error');
+                                                }
+                                            } catch (err) {
+                                                showToast('Network error during session revocation', 'error');
+                                            }
+                                        }
+                                    });
+                                });
+
+                            } catch (err) {
+                                container.innerHTML = `<div style="color:var(--danger); padding:0.5rem 1rem; font-size:0.8rem;">Failed to load sessions: ${err.message}</div>`;
+                            }
+                        } else {
+                            subRow.style.display = 'none';
+                            e.currentTarget.textContent = 'View Sessions';
                         }
                     });
                 });
@@ -3355,6 +3563,171 @@
                 showToast(err.message, 'error');
                 usersBody.innerHTML = `<tr><td colspan="4" style="text-align:center; color:var(--danger); padding:2rem;">Error: ${err.message}</td></tr>`;
             }
+        }
+
+        // Parse User Agent to readable format
+        function parseUserAgent(ua) {
+            if (!ua) return 'Unknown Device';
+            let browser = 'Unknown Browser';
+            let os = 'Unknown OS';
+
+            // Simple OS detection
+            if (ua.indexOf('Windows NT 10.0') !== -1) os = 'Windows 10/11';
+            else if (ua.indexOf('Windows NT 6.2') !== -1) os = 'Windows 8';
+            else if (ua.indexOf('Windows NT 6.1') !== -1) os = 'Windows 7';
+            else if (ua.indexOf('Android') !== -1) os = 'Android';
+            else if (ua.indexOf('Macintosh') !== -1) os = 'macOS';
+            else if (ua.indexOf('iPhone') !== -1) os = 'iOS (iPhone)';
+            else if (ua.indexOf('iPad') !== -1) os = 'iOS (iPad)';
+            else if (ua.indexOf('Linux') !== -1) os = 'Linux';
+
+            // Simple Browser detection
+            if (ua.indexOf('Firefox') !== -1) browser = 'Firefox';
+            else if (ua.indexOf('SamsungBrowser') !== -1) browser = 'Samsung Browser';
+            else if (ua.indexOf('Chrome') !== -1) browser = 'Chrome';
+            else if (ua.indexOf('Safari') !== -1) browser = 'Safari';
+            else if (ua.indexOf('Edge') !== -1) browser = 'Edge';
+            else if (ua.indexOf('Opera') !== -1 || ua.indexOf('OPR') !== -1) browser = 'Opera';
+
+            return `${browser} on ${os}`;
+        }
+
+        // Fetch and display active user sessions
+        async function loadUserSessionsView() {
+            const token = localStorage.getItem('dill_session_token');
+            const sessionsListBody = document.getElementById('sessions-list-body');
+            if (!token) return;
+
+            sessionsListBody.innerHTML = `
+                <tr>
+                    <td colspan="5" style="text-align:center; padding: 2rem 0;">
+                        <div class="loader" style="margin:1rem auto;"></div>
+                        <span style="font-size:0.85rem; color:var(--text-muted);">Loading active sessions...</span>
+                    </td>
+                </tr>
+            `;
+
+            try {
+                const res = await fetch('/api/user/sessions', {
+                    headers: { 'Authorization': `Bearer ${token}` }
+                });
+
+                if (!res.ok) {
+                    if (res.status === 401) {
+                        logoutUser();
+                        return;
+                    }
+                    throw new Error(await res.text());
+                }
+
+                const sessions = await res.json();
+                sessionsListBody.innerHTML = '';
+
+                if (sessions.length === 0) {
+                    sessionsListBody.innerHTML = `
+                        <tr>
+                            <td colspan="5" style="text-align:center; color:var(--text-muted); padding:2rem 0;">
+                                No active sessions found.
+                            </td>
+                        </tr>
+                    `;
+                    return;
+                }
+
+                // Sort: current session first, then by created_at desc
+                sessions.sort((a, b) => {
+                    if (a.is_current && !b.is_current) return -1;
+                    if (!a.is_current && b.is_current) return 1;
+                    return b.created_at - a.created_at;
+                });
+
+                sessions.forEach(session => {
+                    const row = document.createElement('tr');
+                    
+                    const deviceName = parseUserAgent(session.user_agent);
+                    const ipStr = session.ip;
+                    
+                    const createdDate = new Date(session.created_at * 1000).toLocaleString();
+                    const expiresDate = new Date(session.expires_at * 1000).toLocaleString();
+                    
+                    const currentBadge = session.is_current 
+                        ? `<span class="badge success" style="margin-left:0.5rem; font-size:0.7rem; font-family:sans-serif; text-transform:uppercase;">Current</span>` 
+                        : '';
+                    
+                    const revokeBtnText = session.is_current ? 'Log Out' : 'Revoke';
+                    const buttonClass = session.is_current ? 'btn btn-secondary' : 'btn btn-danger';
+                    
+                    row.innerHTML = `
+                        <td style="padding: 1rem 0.85rem; border-bottom: 1px solid var(--surface-border);">
+                            <div style="display:flex; flex-direction:column;">
+                                <span style="font-weight:500; display:flex; align-items:center;">
+                                    ${deviceName} ${currentBadge}
+                                </span>
+                                <span style="font-size:0.75rem; color:var(--text-muted); font-family:monospace; margin-top:0.2rem; word-break:break-all;">
+                                    ${session.user_agent}
+                                </span>
+                            </div>
+                        </td>
+                        <td style="padding: 1rem 0.85rem; font-family:monospace; border-bottom: 1px solid var(--surface-border);">${ipStr}</td>
+                        <td style="padding: 1rem 0.85rem; border-bottom: 1px solid var(--surface-border); font-size:0.8rem;">${createdDate}</td>
+                        <td style="padding: 1rem 0.85rem; border-bottom: 1px solid var(--surface-border); font-size:0.8rem;">${expiresDate}</td>
+                        <td style="padding: 1rem 0.85rem; text-align:right; border-bottom: 1px solid var(--surface-border);">
+                            <button class="${buttonClass} btn-revoke-session" data-id="${session.id}" data-current="${session.is_current}" style="padding: 0.3rem 0.6rem; font-size: 0.75rem; font-weight: 600;">
+                                ${revokeBtnText}
+                            </button>
+                        </td>
+                    `;
+                    sessionsListBody.appendChild(row);
+                });
+
+                // Attach event listeners to revoke buttons
+                document.querySelectorAll('.btn-revoke-session').forEach(btn => {
+                    btn.addEventListener('click', async (e) => {
+                        const id = e.currentTarget.getAttribute('data-id');
+                        const isCurrent = e.currentTarget.getAttribute('data-current') === 'true';
+                        
+                        const confirmMsg = isCurrent 
+                            ? 'Are you sure you want to log out of your current session?'
+                            : 'Are you sure you want to revoke this session? That device will be logged out immediately.';
+                            
+                        if (confirm(confirmMsg)) {
+                            try {
+                                const revRes = await fetch(`/api/user/sessions/${id}`, {
+                                    method: 'DELETE',
+                                    headers: { 'Authorization': `Bearer ${token}` }
+                                });
+                                
+                                if (revRes.ok) {
+                                    showToast(isCurrent ? 'Logged out successfully' : 'Session revoked successfully', 'success');
+                                    if (isCurrent) {
+                                        logoutUser();
+                                    } else {
+                                        loadUserSessionsView();
+                                    }
+                                } else {
+                                    showToast('Failed to revoke session: ' + await revRes.text(), 'error');
+                                }
+                            } catch (err) {
+                                showToast('Network error while revoking session', 'error');
+                            }
+                        }
+                    });
+                });
+
+            } catch (err) {
+                sessionsListBody.innerHTML = `
+                    <tr>
+                        <td colspan="5" style="text-align:center; color:var(--danger); padding:2rem 0;">
+                            Failed to load sessions: ${err.message}
+                        </td>
+                    </tr>
+                `;
+            }
+        }
+
+        const btnRefreshSessions = document.getElementById('btn-refresh-sessions');
+        if (btnRefreshSessions) {
+            btnRefreshSessions.addEventListener('click', loadUserSessionsView);
         }
 
         // Mobile Navigation Toggle
