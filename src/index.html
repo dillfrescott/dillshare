@@ -3288,7 +3288,26 @@
         const viewAdminSessions = document.getElementById('admin-sessions-view');
 
         if (btnLogoutAdmin) {
-            btnLogoutAdmin.addEventListener('click', () => {
+            btnLogoutAdmin.addEventListener('click', async () => {
+                const token = localStorage.getItem('dill_admin_token');
+                // Revoke the current admin session on the server before clearing local state
+                if (token) {
+                    try {
+                        const res = await fetch('/api/admin/sessions', {
+                            headers: { 'Authorization': `Bearer ${token}` }
+                        });
+                        if (res.ok) {
+                            const sessions = await res.json();
+                            const current = sessions.find(s => s.is_current);
+                            if (current) {
+                                await fetch(`/api/admin/sessions/${current.id}`, {
+                                    method: 'DELETE',
+                                    headers: { 'Authorization': `Bearer ${token}` }
+                                });
+                            }
+                        }
+                    } catch (e) { /* ignore network errors during logout */ }
+                }
                 localStorage.removeItem('dill_admin_token');
                 const adminTokenInput = document.getElementById('admin-token-input');
                 if (adminTokenInput) adminTokenInput.value = '';
