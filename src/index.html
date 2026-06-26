@@ -1501,6 +1501,88 @@
             }
         }
 
+        // --- STREAMING PREVIEW SERVICE WORKER ---
+        // Registers /sw.js once and provides a promise that resolves when the
+        // worker is active and ready to receive decryption keys. Used by the
+        // media preview path so <video>/<audio> can start playing immediately
+        // while the file is still being fetched and decrypted in 4 MB chunks.
+        let swRegistrationPromise = null;
+        let swReadyResolve = null;
+        const swReadyPromise = new Promise((resolve) => { swReadyResolve = resolve; });
+        const pendingStreamInits = new Map(); // streamPath -> {resolve, reject}
+
+        navigator.serviceWorker.addEventListener('message', (event) => {
+            const d = event.data;
+            if (!d) return;
+            if (d.type === 'DILL_SW_ACTIVE' && swReadyResolve) {
+                const r = swReadyResolve;
+                swReadyResolve = null;
+                r();
+            }
+            if (d.type === 'DILL_PREVIEW_READY' && pendingStreamInits.has(d.streamPath)) {
+                const { resolve, reject } = pendingStreamInits.get(d.streamPath);
+                pendingStreamInits.delete(d.streamPath);
+                if (d.error) reject(new Error(d.error));
+                else resolve();
+            }
+        });
+
+        async function ensureStreamingSW() {
+            if (!('serviceWorker' in navigator)) return false;
+            if (!swRegistrationPromise) {
+                swRegistrationPromise = navigator.serviceWorker.register('/sw.js', { scope: '/' }).then(async (reg) => {
+                    // Wait for active controller
+                    if (navigator.serviceWorker.controller) {
+                        swReadyResolve && swReadyResolve();
+                        return reg;
+                    }
+                    await new Promise((resolve) => {
+                        const handler = () => { navigator.serviceWorker.removeEventListener('controllerchange', handler); resolve(); };
+                        navigator.serviceWorker.addEventListener('controllerchange', handler);
+                    });
+                    return reg;
+                });
+            }
+            await swRegistrationPromise;
+            await swReadyPromise;
+            return true;
+        }
+
+        // Send decryption metadata for a given stream path to the SW and
+        // resolve once the SW acknowledges it is ready to serve that path.
+        async function initPreviewStream(streamPath, key, fileMeta, contentType) {
+            await ensureStreamingSW();
+            const rawKey = await window.crypto.subtle.exportKey('raw', key);
+            return new Promise((resolve, reject) => {
+                pendingStreamInits.set(streamPath, { resolve, reject });
+                navigator.serviceWorker.controller.postMessage({
+                    type: 'DILL_PREVIEW_INIT',
+                    streamPath,
+                    keyRaw: new Uint8Array(rawKey),
+                    size: fileMeta.size,
+                    chunked: !!(fileMeta && fileMeta.chunked),
+                    contentType: contentType || 'application/octet-stream',
+                    url: `/api/share/${currentShareUUID}/file/file_${fileMeta.id}.enc`
+                });
+            });
+        }
+
+        const MEDIA_VIDEO_EXTS = ['mp4', 'webm', 'ogg', 'mov', 'mkv', 'ogv', 'm4v', 'avi', 'ts', 'm2ts'];
+        const MEDIA_AUDIO_EXTS = ['mp3', 'wav', 'ogg', 'aac', 'flac', 'm4a', 'opus', 'oga', 'wma', 'aiff', 'aif'];
+
+        // Minimal extension -> MIME map for media types the browser must know to
+        // play a stream; falls back to octet-stream. Used for the SW streaming URL.
+        const EXT_MIME = {
+            mp4: 'video/mp4', m4v: 'video/mp4', webm: 'video/webm', ogv: 'video/ogg',
+            ogg: 'audio/ogg', mov: 'video/quicktime', mkv: 'video/x-matroska',
+            mp3: 'audio/mpeg', wav: 'audio/wav', aac: 'audio/aac', flac: 'audio/flac',
+            m4a: 'audio/mp4', opus: 'audio/ogg', oga: 'audio/ogg', wma: 'audio/x-ms-wma',
+            aiff: 'audio/aiff', aif: 'audio/aiff'
+        };
+        function mimeForExt(ext) {
+            return EXT_MIME[ext] || 'application/octet-stream';
+        }
+
         async function encryptData(arrayBuffer, key) {
             const iv = window.crypto.getRandomValues(new Uint8Array(12));
             const ciphertext = await window.crypto.subtle.encrypt(
@@ -1560,10 +1642,14 @@
 
         // Streaming decryptor for chunked files: yields plaintext Uint8Array chunks
         // as they are verified, so memory stays flat regardless of file size.
-        async function* streamDecryptChunked(reader, key, totalPlaintextSize) {
+        // onProgress, if provided, is called with { bytesReceived, bytesDecrypted,
+        // totalBytes } after each chunk is processed (totalBytes is the plaintext size).
+        async function* streamDecryptChunked(reader, key, totalPlaintextSize, onProgress) {
             const chunkSize = ENCRYPT_CHUNK_SIZE;
             const totalChunks = Math.max(1, Math.ceil(totalPlaintextSize / chunkSize));
             let remaining = totalPlaintextSize;
+            let bytesReceived = 0;
+            let bytesDecrypted = 0;
             // Pull a queue of bytes from the response stream.
             const queue = [];
             let queueLen = 0;
@@ -1574,6 +1660,7 @@
                     if (done) break;
                     queue.push(value);
                     queueLen += value.length;
+                    bytesReceived += value.length;
                 }
             }
 
@@ -1611,13 +1698,63 @@
                 );
                 yield new Uint8Array(pt);
                 remaining -= thisPlain;
+                bytesDecrypted += thisPlain;
+                if (onProgress) onProgress({ bytesReceived, bytesDecrypted, totalBytes: totalPlaintextSize });
             }
+        }
+
+        // Core decrypt-and-deliver routine. If `sink` (a FileSystemWritableFileStream)
+        // is supplied, decrypted bytes are streamed straight to it; otherwise they are
+        // buffered into plaintextChunks and (if `ownSink` is true) delivered via an
+        // anchor download at the end. onProgress is invoked per chunk.
+        async function decryptAndDeliver(url, key, fileMeta, sink, ownSink, onProgress) {
+            const res = await fetch(url);
+            if (!res.ok) throw new Error('File download failed');
+
+            const isChunked = fileMeta && fileMeta.chunked === true;
+            const plaintextChunks = sink ? null : [];
+            try {
+                if (isChunked) {
+                    const totalSize = fileMeta.size;
+                    const reader = res.body.getReader();
+                    for await (const pt of streamDecryptChunked(reader, key, totalSize, onProgress)) {
+                        if (sink) await sink.write(pt);
+                        else plaintextChunks.push(pt);
+                    }
+                    reader.releaseLock?.();
+                } else {
+                    // Legacy single-block format: buffer then decrypt.
+                    const ab = await res.arrayBuffer();
+                    if (onProgress) onProgress({ bytesReceived: ab.byteLength, bytesDecrypted: 0, totalBytes: ab.byteLength });
+                    const pt = new Uint8Array(await decryptData(ab, key));
+                    if (onProgress) onProgress({ bytesReceived: ab.byteLength, bytesDecrypted: pt.length, totalBytes: ab.byteLength });
+                    if (sink) await sink.write(pt);
+                    else plaintextChunks.push(pt);
+                }
+            } finally {
+                if (ownSink && sink) await sink.close();
+            }
+
+            if (ownSink && !sink) {
+                const blob = new Blob(plaintextChunks, {
+                    type: (fileMeta && fileMeta.type) || 'application/octet-stream'
+                });
+                const localUrl = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = localUrl;
+                a.download = fileMeta && fileMeta.name ? fileMeta.name : 'download';
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+                setTimeout(() => URL.revokeObjectURL(localUrl), 15000);
+            }
+            return true;
         }
 
         // Stream a decrypted file directly to disk via the File System Access API when
         // available (Chrome/Edge). Falls back to an in-memory Blob + anchor download
         // elsewhere (Safari/Firefox). Returns true if the download was delivered.
-        async function downloadDecryptedFile(url, key, fileMeta, suggestedName) {
+        async function downloadDecryptedFile(url, key, fileMeta, suggestedName, onProgress) {
             const useFSA = typeof window.showSaveFilePicker === 'function';
             let sink = null;
             if (useFSA) {
@@ -1631,58 +1768,21 @@
                     sink = null; // unsupported / blocked, fall back
                 }
             }
-
-            const res = await fetch(url);
-            if (!res.ok) throw new Error('File download failed');
-
-            const isChunked = fileMeta && fileMeta.chunked === true;
-            const plaintextChunks = sink ? null : [];
-            try {
-                if (isChunked) {
-                    const totalSize = fileMeta.size;
-                    const reader = res.body.getReader();
-                    for await (const pt of streamDecryptChunked(reader, key, totalSize)) {
-                        if (sink) await sink.write(pt);
-                        else plaintextChunks.push(pt);
-                    }
-                    reader.releaseLock?.();
-                } else {
-                    // Legacy single-block format: buffer then decrypt.
-                    const ab = await res.arrayBuffer();
-                    const pt = new Uint8Array(await decryptData(ab, key));
-                    if (sink) await sink.write(pt);
-                    else plaintextChunks.push(pt);
-                }
-            } finally {
-                if (sink) await sink.close();
-            }
-
-            if (!sink) {
-                const blob = new Blob(plaintextChunks, {
-                    type: (fileMeta && fileMeta.type) || 'application/octet-stream'
-                });
-                const localUrl = URL.createObjectURL(blob);
-                const a = document.createElement('a');
-                a.href = localUrl;
-                a.download = suggestedName;
-                document.body.appendChild(a);
-                a.click();
-                document.body.removeChild(a);
-                setTimeout(() => URL.revokeObjectURL(localUrl), 15000);
-            }
-            return true;
+            // Patch fileMeta to carry the suggested name for the anchor fallback.
+            const meta = Object.assign({}, fileMeta || {}, { name: suggestedName });
+            return decryptAndDeliver(url, key, meta, sink, true, onProgress);
         }
 
         // Fully decrypt a (possibly chunked) file into a single ArrayBuffer.
         // Used by the in-browser preview path where the whole file is needed.
-        async function decryptFileToArrayBuffer(url, key, fileMeta) {
+        async function decryptFileToArrayBuffer(url, key, fileMeta, onProgress) {
             const res = await fetch(url);
             if (!res.ok) throw new Error('File retrieval failed');
             if (fileMeta && fileMeta.chunked === true) {
                 const reader = res.body.getReader();
                 const chunks = [];
                 let total = 0;
-                for await (const pt of streamDecryptChunked(reader, key, fileMeta.size)) {
+                for await (const pt of streamDecryptChunked(reader, key, fileMeta.size, onProgress)) {
                     chunks.push(pt);
                     total += pt.length;
                 }
@@ -1693,7 +1793,10 @@
                 return out.buffer;
             }
             const ab = await res.arrayBuffer();
-            return await decryptData(ab, key);
+            if (onProgress) onProgress({ bytesReceived: ab.byteLength, bytesDecrypted: 0, totalBytes: ab.byteLength });
+            const dec = await decryptData(ab, key);
+            if (onProgress) onProgress({ bytesReceived: ab.byteLength, bytesDecrypted: dec.byteLength, totalBytes: ab.byteLength });
+            return dec;
         }
 
         // Navigation Routing
@@ -2675,10 +2778,19 @@
             const ext = filename.split('.').pop().toLowerCase();
 
             previewFilename.textContent = filename;
+            const isVideo = MEDIA_VIDEO_EXTS.includes(ext);
+            const isAudio = MEDIA_AUDIO_EXTS.includes(ext);
+            const isStreamingMedia = (isVideo || isAudio);
             previewContentBox.innerHTML = `
-                <div class="empty-state">
+                <div class="empty-state" style="width:100%;">
                     <div class="loader" style="margin:0 auto 1rem auto;"></div>
-                    <p>Downloading and decrypting file in your browser...</p>
+                    <p>${isStreamingMedia ? 'Starting secure stream...' : 'Downloading and decrypting file in your browser...'}</p>
+                    ${isStreamingMedia ? '' : `
+                    <div class="progress-bar-container" style="margin-top:1rem; width:80%; margin-left:auto; margin-right:auto;">
+                        <div class="progress-bar" id="preview-progress-bar"></div>
+                    </div>
+                    <p id="preview-progress-label" style="font-size:0.8rem; color:var(--text-muted); margin-top:0.5rem;">0%</p>
+                    `}
                 </div>
             `;
             
@@ -2691,21 +2803,95 @@
             
             const fileUrl = `/api/share/${currentShareUUID}/file/file_${file.id}.enc`;
 
+            const previewProgressBar = document.getElementById('preview-progress-bar');
+            const previewProgressLabel = document.getElementById('preview-progress-label');
+            const totalBytes = (file && typeof file.size === 'number') ? file.size : 0;
+            const onPreviewProgress = ({ bytesDecrypted, totalBytes: tb }) => {
+                const denom = tb || totalBytes;
+                if (denom > 0) {
+                    const pct = Math.min(100, Math.round((bytesDecrypted / denom) * 100));
+                    if (previewProgressBar) previewProgressBar.style.width = pct + '%';
+                    if (previewProgressLabel) previewProgressLabel.textContent = pct + '%';
+                }
+            };
+
             // Download Click Handler (streaming decrypted downloader)
             btnPreviewDownload.onclick = async (e) => {
                 e.preventDefault();
                 try {
                     showToast('Streaming decrypted file to disk...', 'info');
-                    const ok = await downloadDecryptedFile(fileUrl, key, file, filename);
+                    const ok = await downloadDecryptedFile(fileUrl, key, file, filename, ({ bytesDecrypted, totalBytes: tb }) => {
+                        const denom = tb || totalBytes;
+                        if (denom > 0) {
+                            const pct = Math.min(100, Math.round((bytesDecrypted / denom) * 100));
+                            showToast(`Decrypting ${pct}%...`, 'info');
+                        }
+                    });
                     if (ok) showToast('Download started successfully.', 'success');
                 } catch (err) {
                     showToast('Download failed: ' + err.message, 'error');
                 }
             };
 
+            // Fast streaming path for media via the preview service worker.
+            // The <video>/<audio> element issues HTTP range requests against a
+            // virtual URL; the SW fetches the needed encrypted 4 MB chunks from
+            // the server, decrypts them, and returns the requested plaintext
+            // range. Playback begins as soon as the first chunk is ready, so it
+            // works for any container (mp4, mkv, webm, mov, mp3, wav, flac,
+            // opus, aac, m4a, ...). Falls back to buffered decryption if the SW
+            // is unavailable (private mode / unsupported browser).
+            if (isStreamingMedia) {
+                let streamUrl = null;
+                try {
+                    const streamPath = `/preview-stream/${currentShareUUID}/${file.id}`;
+                    const contentType = file.type || mimeForExt(ext);
+                    await initPreviewStream(streamPath, key, file, contentType);
+                    streamUrl = streamPath;
+
+                    previewContentBox.innerHTML = '';
+                    btnPreviewDownload.style.opacity = '1';
+                    btnPreviewDownload.style.pointerEvents = 'auto';
+
+                    if (isVideo) {
+                        const video = document.createElement('video');
+                        video.className = 'preview-media';
+                        video.src = streamUrl;
+                        video.controls = true;
+                        video.autoplay = true;
+                        video.preload = 'metadata';
+                        previewContentBox.appendChild(video);
+                    } else {
+                        const wrapper = document.createElement('div');
+                        wrapper.className = 'audio-player-wrapper';
+                        const disc = document.createElement('div');
+                        disc.className = 'audio-disc';
+                        disc.innerHTML = `
+                            <svg viewBox="0 0 24 24" style="width:2rem;height:2rem;fill:white;">
+                                <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 14.5c-2.49 0-4.5-2.01-4.5-4.5S9.51 7.5 12 7.5s4.5 2.01 4.5 4.5-2.01 4.5-4.5 4.5zm0-5.5c-.55 0-1 .45-1 1s.45 1 1 1 1-.45 1-1-.45-1-1-1z"/>
+                            </svg>
+                        `;
+                        const audio = document.createElement('audio');
+                        audio.src = streamUrl;
+                        audio.controls = true;
+                        audio.autoplay = true;
+                        audio.onplay = () => wrapper.classList.add('playing');
+                        audio.onpause = () => wrapper.classList.remove('playing');
+                        audio.onended = () => wrapper.classList.remove('playing');
+                        wrapper.appendChild(disc);
+                        wrapper.appendChild(audio);
+                        previewContentBox.appendChild(wrapper);
+                    }
+                    return;
+                } catch (err) {
+                    // Fall through to the buffered preview path below.
+                    if (streamUrl) console.warn('Streaming preview unavailable, buffering instead:', err);
+                }
+            }
+
             try {
                 // Fetch + decrypt (chunked-aware) for in-browser preview
-                const decBuf = await decryptFileToArrayBuffer(fileUrl, key, file);
+                const decBuf = await decryptFileToArrayBuffer(fileUrl, key, file, onPreviewProgress);
                 const decBytes = new Uint8Array(decBuf);
 
                 const blob = new Blob([decBytes], { type: file.type });
@@ -2724,7 +2910,7 @@
                     img.onload = () => URL.revokeObjectURL(localUrl);
                     previewContentBox.appendChild(img);
                 } 
-                else if (['mp4', 'webm', 'ogg', 'mov', 'mkv'].includes(ext)) {
+                else if (isVideo) {
                     const video = document.createElement('video');
                     video.className = 'preview-media';
                     video.src = localUrl;
@@ -2732,7 +2918,7 @@
                     video.autoplay = true;
                     previewContentBox.appendChild(video);
                 } 
-                else if (['mp3', 'wav', 'ogg', 'aac', 'flac', 'm4a'].includes(ext)) {
+                else if (isAudio) {
                     const wrapper = document.createElement('div');
                     wrapper.className = 'audio-player-wrapper';
                     
@@ -2830,20 +3016,94 @@
             showToast(`Preparing download of ${totalFiles} file(s)...`, 'info');
 
             try {
-                const zip = new JSZip();
+                // Precompute total plaintext size for an accurate overall percent.
+                let totalPlainSize = 0;
+                for (const f of currentShareData.files) {
+                    if (typeof f.size === 'number') totalPlainSize += f.size;
+                }
+                let processedPlainSize = 0;
 
-                for (let i = 0; i < totalFiles; i++) {
-                    const file = currentShareData.files[i];
+                const renderOverall = (idx, pct) => {
                     btnDownloadAll.innerHTML = `
                         <div class="loader" style="width:0.85rem; height:0.85rem; border-width:1px; margin-right:6px; display:inline-block; vertical-align:middle;"></div>
-                        Downloading ${i + 1}/${totalFiles}...
+                        Downloading ${idx + 1}/${totalFiles} (${pct}%)
                     `;
+                };
+
+                // Fast path: File System Access API directory picker (Chrome/Edge).
+                // Streams each decrypted file directly to disk with no in-memory
+                // buffering and no ZIP compression overhead, so it is dramatically
+                // faster and uses flat memory for large shares.
+                const canStreamToDir = typeof window.showDirectoryPicker === 'function';
+                if (canStreamToDir) {
+                    let rootDir = null;
+                    try {
+                        rootDir = await window.showDirectoryPicker({ mode: 'readwrite' });
+                    } catch (e) {
+                        if (e && e.name === 'AbortError') {
+                            throw new Error('Download cancelled');
+                        }
+                        rootDir = null; // blocked / denied; fall through to ZIP
+                    }
+
+                    if (rootDir) {
+                        for (let i = 0; i < totalFiles; i++) {
+                            const file = currentShareData.files[i];
+                            renderOverall(i, totalPlainSize > 0 ? Math.min(100, Math.round((processedPlainSize / totalPlainSize) * 100)) : 0);
+
+                            const fileUrl = `/api/share/${currentShareUUID}/file/file_${file.id}.enc`;
+                            const filePlainSize = (typeof file.size === 'number') ? file.size : 0;
+
+                            // Resolve (creating) any nested subdirectories from file.name
+                            const parts = file.name.split('/').filter(Boolean);
+                            const leafName = parts.pop();
+                            let dirHandle = rootDir;
+                            for (const seg of parts) {
+                                dirHandle = await dirHandle.getDirectoryHandle(seg, { create: true });
+                            }
+                            const fh = await dirHandle.getFileHandle(leafName, { create: true });
+                            const sink = await fh.createWritable();
+
+                            try {
+                                await decryptAndDeliver(fileUrl, key, file, sink, true, ({ bytesDecrypted, totalBytes: tb }) => {
+                                    const denom = tb || filePlainSize;
+                                    if (denom > 0 && totalPlainSize > 0) {
+                                        const overall = Math.min(100, Math.round(((processedPlainSize + Math.min(bytesDecrypted, filePlainSize)) / totalPlainSize) * 100));
+                                        renderOverall(i, overall);
+                                    }
+                                });
+                            } catch (e) {
+                                try { await sink.close(); } catch (_) {}
+                                throw e;
+                            }
+                            processedPlainSize += filePlainSize;
+                        }
+                        renderOverall(totalFiles - 1, 100);
+                        showToast('Files downloaded to selected folder.', 'success');
+                        return;
+                    }
+                }
+
+                // Fallback path: ZIP archive in-memory (Safari/Firefox or when
+                // directory picker is unavailable / declined).
+                const zip = new JSZip();
+                for (let i = 0; i < totalFiles; i++) {
+                    const file = currentShareData.files[i];
+                    renderOverall(i, totalPlainSize > 0 ? Math.min(100, Math.round((processedPlainSize / totalPlainSize) * 100)) : 0);
 
                     const fileUrl = `/api/share/${currentShareUUID}/file/file_${file.id}.enc`;
                     // Decrypt (chunked-aware) into memory for ZIP packaging.
                     // ZIP itself must hold the bytes, so this path is inherently
                     // buffered; chunked decrypt at least avoids buffering ciphertext.
-                    const decBuf = await decryptFileToArrayBuffer(fileUrl, key, file);
+                    const filePlainSize = (typeof file.size === 'number') ? file.size : 0;
+                    const decBuf = await decryptFileToArrayBuffer(fileUrl, key, file, ({ bytesDecrypted, totalBytes: tb }) => {
+                        const denom = tb || filePlainSize;
+                        if (denom > 0 && totalPlainSize > 0) {
+                            const overall = Math.min(100, Math.round(((processedPlainSize + Math.min(bytesDecrypted, filePlainSize)) / totalPlainSize) * 100));
+                            renderOverall(i, overall);
+                        }
+                    });
+                    processedPlainSize += filePlainSize;
 
                     // Add the decrypted file back to zip preserving file paths (directories)
                     zip.file(file.name, decBuf);

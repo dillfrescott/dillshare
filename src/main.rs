@@ -102,6 +102,8 @@ async fn main() {
         .route("/api/upload", post(upload_files))
         .route("/api/share/:uuid", get(get_share).delete(delete_share))
         .route("/api/share/:uuid/file/*filename", get(download_file))
+        // Service worker for streaming decrypted media preview
+        .route("/sw.js", get(serve_service_worker))
         // Authentication routes
         .route("/api/register", post(register_user))
         .route("/api/login", post(login_user))
@@ -148,6 +150,19 @@ async fn main() {
 // Serve embedded single page app index.html
 async fn serve_index() -> impl IntoResponse {
     Html(include_str!("index.html"))
+}
+
+// Serve the streaming-preview service worker. The browser requires this to be
+// served from the same origin with an explicit JavaScript content type and a
+// scope that allows it to control the SPA routes (e.g. /share/<uuid>).
+async fn serve_service_worker() -> impl IntoResponse {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "application/javascript; charset=utf-8")
+        .header(axum::http::header::CACHE_CONTROL, "no-cache")
+        .header("service-worker-allowed", "/")
+        .body(Body::from(include_str!("sw.js")))
+        .unwrap()
 }
 
 // Multipart file uploader - requires authentication
@@ -387,19 +402,40 @@ async fn get_share(
 }
 
 // Download/stream a file from S3 share
+// Supports HTTP Range requests so that a Service Worker can fetch individual
+// encrypted chunks on demand for streaming preview of large media files.
 async fn download_file(
     State(state): State<AppState>,
     Path((uuid, filename)): Path<(String, String)>,
+    headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
     let key = format!("uploads/{}/{}", uuid, filename);
 
-    let res = match state.s3_client
-        .get_object()
-        .bucket(&state.bucket)
-        .key(&key)
-        .send()
-        .await
-    {
+    // Parse a single HTTP range (start-end). Multi-range is not supported and
+    // we respond with the full body (200) in that case, which is spec-compliant.
+    let range_header = headers.get(axum::http::header::RANGE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("bytes="))
+        .and_then(|spec| {
+            // Accept only a single range; ignore multiple ranges / suffix forms.
+            if spec.contains(',') { return None; }
+            let mut it = spec.split('-');
+            let start_str = it.next()?.trim();
+            let end_str = it.next().map(|s| s.trim()).unwrap_or("");
+            let start: u64 = start_str.parse().ok()?;
+            let end: Option<u64> = if end_str.is_empty() { None } else { end_str.parse().ok() };
+            Some((start, end))
+        });
+
+    let mut get_object = state.s3_client.get_object().bucket(&state.bucket).key(&key);
+
+    if let Some((start, end)) = &range_header {
+        let range_end = end.unwrap_or(u64::MAX);
+        let range_value = format!("bytes={}-{}", start, range_end);
+        get_object = get_object.range(range_value);
+    }
+
+    let res = match get_object.send().await {
         Ok(output) => output,
         Err(e) => {
             tracing::error!("S3 GetObject error: {:?}", e);
@@ -415,7 +451,12 @@ async fn download_file(
     let stream = tokio_util::io::ReaderStream::new(reader);
     let body = Body::from_stream(stream);
 
-    let mut builder = Response::builder().status(StatusCode::OK);
+    let status = if range_header.is_some() {
+        StatusCode::PARTIAL_CONTENT
+    } else {
+        StatusCode::OK
+    };
+    let mut builder = Response::builder().status(status);
 
     if let Some(content_type) = res.content_type {
         builder = builder.header(CONTENT_TYPE, content_type);
@@ -429,6 +470,16 @@ async fn download_file(
     if let Some(content_length) = res.content_length {
         builder = builder.header(CONTENT_LENGTH, content_length);
     }
+
+    if let Some(content_range) = res.content_range {
+        builder = builder.header(
+            axum::http::header::CONTENT_RANGE,
+            content_range.as_str().to_string(),
+        );
+    }
+
+    // Advertise range support so media engines will issue range requests.
+    builder = builder.header(axum::http::header::ACCEPT_RANGES, "bytes");
 
     let encoded_filename = percent_encoding::utf8_percent_encode(
         &filename,
