@@ -2998,7 +2998,26 @@
             }
         }
 
-        function logoutUser() {
+        async function logoutUser() {
+            const token = localStorage.getItem('dill_session_token');
+            // Revoke the current session on the server before clearing local state
+            if (token) {
+                try {
+                    const res = await fetch('/api/user/sessions', {
+                        headers: { 'Authorization': `Bearer ${token}` }
+                    });
+                    if (res.ok) {
+                        const sessions = await res.json();
+                        const current = sessions.find(s => s.is_current);
+                        if (current) {
+                            await fetch(`/api/user/sessions/${current.id}`, {
+                                method: 'DELETE',
+                                headers: { 'Authorization': `Bearer ${token}` }
+                            });
+                        }
+                    }
+                } catch (e) { /* ignore network errors during logout */ }
+            }
             localStorage.removeItem('dill_session_token');
             localStorage.removeItem('dill_username');
             localStorage.removeItem('dill_enc_key');
@@ -3007,7 +3026,7 @@
             updateHeaderAuthState();
             
             const activeTab = document.querySelector('.tab-content.active');
-            if (activeTab.id === 'view-shares' || activeTab.id === 'view-admin' || activeTab.id === 'view-profile') {
+            if (activeTab && (activeTab.id === 'view-shares' || activeTab.id === 'view-admin' || activeTab.id === 'view-profile' || activeTab.id === 'view-sessions')) {
                 window.history.pushState({}, '', '/');
                 showTab('view-upload');
             }
