@@ -1525,6 +1525,177 @@
             );
         }
 
+        // --- CHUNKED AES-GCM (enables streaming download/decrypt for large files) ---
+        // Format per chunk: IV(12 bytes) || ciphertext+tag(plaintext_len + 16 bytes)
+        // All chunks concatenated. Plaintext chunk size is fixed (CHUNK_SIZE) except the
+        // final chunk, so boundaries are derivable from the known total plaintext size
+        // (file.size in metadata) without any length prefixes.
+        const ENCRYPT_CHUNK_SIZE = 4 * 1024 * 1024; // 4 MB plaintext per chunk
+
+        async function encryptDataChunked(arrayBuffer, key) {
+            const data = new Uint8Array(arrayBuffer);
+            const total = data.length;
+            const parts = [];
+            let offset = 0;
+            while (offset < total) {
+                const plain = data.subarray(offset, offset + ENCRYPT_CHUNK_SIZE);
+                const iv = window.crypto.getRandomValues(new Uint8Array(12));
+                const ct = await window.crypto.subtle.encrypt(
+                    { name: "AES-GCM", iv: iv },
+                    key,
+                    plain
+                );
+                const block = new Uint8Array(12 + ct.byteLength);
+                block.set(iv, 0);
+                block.set(new Uint8Array(ct), 12);
+                parts.push(block);
+                offset += ENCRYPT_CHUNK_SIZE;
+            }
+            const totalLen = parts.reduce((a, c) => a + c.length, 0);
+            const out = new Uint8Array(totalLen);
+            let o = 0;
+            for (const c of parts) { out.set(c, o); o += c.length; }
+            return out.buffer;
+        }
+
+        // Streaming decryptor for chunked files: yields plaintext Uint8Array chunks
+        // as they are verified, so memory stays flat regardless of file size.
+        async function* streamDecryptChunked(reader, key, totalPlaintextSize) {
+            const chunkSize = ENCRYPT_CHUNK_SIZE;
+            const totalChunks = Math.max(1, Math.ceil(totalPlaintextSize / chunkSize));
+            let remaining = totalPlaintextSize;
+            // Pull a queue of bytes from the response stream.
+            const queue = [];
+            let queueLen = 0;
+
+            async function ensure(n) {
+                while (queueLen < n) {
+                    const { value, done } = await reader.read();
+                    if (done) break;
+                    queue.push(value);
+                    queueLen += value.length;
+                }
+            }
+
+            for (let i = 0; i < totalChunks; i++) {
+                const thisPlain = Math.min(chunkSize, remaining);
+                const thisCtLen = thisPlain + 16; // GCM tag
+                const need = 12 + thisCtLen;
+                await ensure(need);
+                if (queueLen < need) throw new Error('Truncated encrypted stream');
+
+                // Drain exactly `need` bytes into a fresh block buffer.
+                const block = new Uint8Array(need);
+                let o = 0, left = need;
+                while (left > 0) {
+                    const c = queue[0];
+                    if (c.length <= left) {
+                        block.set(c, o);
+                        o += c.length;
+                        left -= c.length;
+                        queue.shift();
+                    } else {
+                        block.set(c.subarray(0, left), o);
+                        queue[0] = c.subarray(left);
+                        left = 0;
+                    }
+                }
+                queueLen -= need;
+
+                const iv = block.subarray(0, 12);
+                const ct = block.subarray(12);
+                const pt = await window.crypto.subtle.decrypt(
+                    { name: "AES-GCM", iv: iv },
+                    key,
+                    ct
+                );
+                yield new Uint8Array(pt);
+                remaining -= thisPlain;
+            }
+        }
+
+        // Stream a decrypted file directly to disk via the File System Access API when
+        // available (Chrome/Edge). Falls back to an in-memory Blob + anchor download
+        // elsewhere (Safari/Firefox). Returns true if the download was delivered.
+        async function downloadDecryptedFile(url, key, fileMeta, suggestedName) {
+            const useFSA = typeof window.showSaveFilePicker === 'function';
+            let sink = null;
+            if (useFSA) {
+                try {
+                    const handle = await window.showSaveFilePicker({
+                        suggestedName: suggestedName
+                    });
+                    sink = await handle.createWritable();
+                } catch (e) {
+                    if (e && e.name === 'AbortError') return false; // user cancelled
+                    sink = null; // unsupported / blocked, fall back
+                }
+            }
+
+            const res = await fetch(url);
+            if (!res.ok) throw new Error('File download failed');
+
+            const isChunked = fileMeta && fileMeta.chunked === true;
+            const plaintextChunks = sink ? null : [];
+            try {
+                if (isChunked) {
+                    const totalSize = fileMeta.size;
+                    const reader = res.body.getReader();
+                    for await (const pt of streamDecryptChunked(reader, key, totalSize)) {
+                        if (sink) await sink.write(pt);
+                        else plaintextChunks.push(pt);
+                    }
+                    reader.releaseLock?.();
+                } else {
+                    // Legacy single-block format: buffer then decrypt.
+                    const ab = await res.arrayBuffer();
+                    const pt = new Uint8Array(await decryptData(ab, key));
+                    if (sink) await sink.write(pt);
+                    else plaintextChunks.push(pt);
+                }
+            } finally {
+                if (sink) await sink.close();
+            }
+
+            if (!sink) {
+                const blob = new Blob(plaintextChunks, {
+                    type: (fileMeta && fileMeta.type) || 'application/octet-stream'
+                });
+                const localUrl = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = localUrl;
+                a.download = suggestedName;
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+                setTimeout(() => URL.revokeObjectURL(localUrl), 15000);
+            }
+            return true;
+        }
+
+        // Fully decrypt a (possibly chunked) file into a single ArrayBuffer.
+        // Used by the in-browser preview path where the whole file is needed.
+        async function decryptFileToArrayBuffer(url, key, fileMeta) {
+            const res = await fetch(url);
+            if (!res.ok) throw new Error('File retrieval failed');
+            if (fileMeta && fileMeta.chunked === true) {
+                const reader = res.body.getReader();
+                const chunks = [];
+                let total = 0;
+                for await (const pt of streamDecryptChunked(reader, key, fileMeta.size)) {
+                    chunks.push(pt);
+                    total += pt.length;
+                }
+                reader.releaseLock?.();
+                const out = new Uint8Array(total);
+                let o = 0;
+                for (const c of chunks) { out.set(c, o); o += c.length; }
+                return out.buffer;
+            }
+            const ab = await res.arrayBuffer();
+            return await decryptData(ab, key);
+        }
+
         // Navigation Routing
         function showTab(viewId) {
             // Close mobile menu if open
@@ -1863,7 +2034,9 @@
                     progressEta.textContent = `Encrypting file ${i+1} of ${selectedFiles.length}...`;
                     
                     const fileBuf = await item.file.arrayBuffer();
-                    const encryptedBuf = await encryptData(fileBuf, key);
+                    // Use chunked encryption for all files so large files can be
+                    // streamed during download. Small files produce a single chunk.
+                    const encryptedBuf = await encryptDataChunked(fileBuf, key);
                     
                     const encBlob = new Blob([encryptedBuf], { type: 'application/octet-stream' });
                     formData.append('files', encBlob, `file_${i}.enc`);
@@ -1872,7 +2045,8 @@
                         id: i.toString(),
                         name: item.relativePath,
                         size: item.file.size,
-                        type: item.file.type || 'application/octet-stream'
+                        type: item.file.type || 'application/octet-stream',
+                        chunked: true
                     });
                 }
 
@@ -2358,11 +2532,7 @@
 
             const fileUrl = `/api/share/${currentShareUUID}/file/file_${file.id}.enc`;
             try {
-                const res = await fetch(fileUrl);
-                if (!res.ok) return;
-
-                const encBuf = await res.arrayBuffer();
-                const decBuf = await decryptData(encBuf, key);
+                const decBuf = await decryptFileToArrayBuffer(fileUrl, key, file);
                 const blob = new Blob([decBuf], { type: file.type });
                 const localUrl = URL.createObjectURL(blob);
 
@@ -2521,44 +2691,24 @@
             
             const fileUrl = `/api/share/${currentShareUUID}/file/file_${file.id}.enc`;
 
-            // Download Click Handler (decrypted stream downloader)
+            // Download Click Handler (streaming decrypted downloader)
             btnPreviewDownload.onclick = async (e) => {
                 e.preventDefault();
                 try {
-                    showToast('Decrypting file contents for download...', 'info');
-                    const res = await fetch(fileUrl);
-                    if (!res.ok) throw new Error('File download failed');
-                    
-                    const encBuf = await res.arrayBuffer();
-                    const decBuf = await decryptData(encBuf, key);
-                    
-                    const blob = new Blob([decBuf], { type: file.type });
-                    const localUrl = URL.createObjectURL(blob);
-                    
-                    const a = document.createElement('a');
-                    a.href = localUrl;
-                    a.download = filename;
-                    document.body.appendChild(a);
-                    a.click();
-                    document.body.removeChild(a);
-                    
-                    setTimeout(() => URL.revokeObjectURL(localUrl), 15000);
-                    showToast('Download started successfully.', 'success');
+                    showToast('Streaming decrypted file to disk...', 'info');
+                    const ok = await downloadDecryptedFile(fileUrl, key, file, filename);
+                    if (ok) showToast('Download started successfully.', 'success');
                 } catch (err) {
                     showToast('Download failed: ' + err.message, 'error');
                 }
             };
 
             try {
-                // Fetch encrypted block from S3
-                const res = await fetch(fileUrl);
-                if (!res.ok) throw new Error('File retrieval failed');
+                // Fetch + decrypt (chunked-aware) for in-browser preview
+                const decBuf = await decryptFileToArrayBuffer(fileUrl, key, file);
+                const decBytes = new Uint8Array(decBuf);
 
-                const encBuf = await res.arrayBuffer();
-                // Decrypt file bytes locally
-                const decBuf = await decryptData(encBuf, key);
-
-                const blob = new Blob([decBuf], { type: file.type });
+                const blob = new Blob([decBytes], { type: file.type });
                 const localUrl = URL.createObjectURL(blob);
 
                 previewContentBox.innerHTML = '';
@@ -2607,7 +2757,7 @@
                     previewContentBox.appendChild(wrapper);
                 } 
                 else if (['txt', 'js', 'html', 'css', 'json', 'md', 'rs', 'py', 'go', 'ts', 'yaml', 'yml', 'toml'].includes(ext)) {
-                    const text = new TextDecoder().decode(decBuf);
+                    const text = new TextDecoder().decode(decBytes);
                     const codeBlock = document.createElement('pre');
                     codeBlock.className = 'code-preview';
                     codeBlock.textContent = text;
@@ -2690,11 +2840,10 @@
                     `;
 
                     const fileUrl = `/api/share/${currentShareUUID}/file/file_${file.id}.enc`;
-                    const res = await fetch(fileUrl);
-                    if (!res.ok) throw new Error(`Failed to fetch file: ${file.name}`);
-
-                    const encBuf = await res.arrayBuffer();
-                    const decBuf = await decryptData(encBuf, key);
+                    // Decrypt (chunked-aware) into memory for ZIP packaging.
+                    // ZIP itself must hold the bytes, so this path is inherently
+                    // buffered; chunked decrypt at least avoids buffering ciphertext.
+                    const decBuf = await decryptFileToArrayBuffer(fileUrl, key, file);
 
                     // Add the decrypted file back to zip preserving file paths (directories)
                     zip.file(file.name, decBuf);
