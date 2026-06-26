@@ -1,0 +1,3242 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Dill Share - Secure File Sharing</title>
+    <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect width='24' height='24' rx='5' fill='%234caf50'/%3E%3Cpath d='M19.35 10.04C18.67 6.59 15.64 4 12 4 9.11 4 6.6 5.64 5.35 8.04 2.34 8.36 0 10.91 0 14c0 3.31 2.69 6 6 6h13c2.76 0 5-2.24 5-5 0-2.64-2.05-4.78-4.65-4.96zM19 18H6c-2.21 0-4-1.79-4-4 0-2.05 1.53-3.76 3.56-3.97l1.07-.11.5-.95C8.08 7.14 9.94 6 12 6c2.62 0 4.88 1.86 5.39 4.43l.3 1.5 1.53.11c1.56.1 2.78 1.41 2.78 2.96 0 1.65-1.35 3-3 3zm-5.55-8h-2.9v3H7.5l4.5 4.5 4.5-4.5h-3.05z' fill='white' transform='matrix(0.6 0 0 0.6 4.8 4.8)'/%3E%3C/svg%3E">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js" referrerpolicy="no-referrer"></script>
+    <style>
+        :root {
+            --bg-color: #0c0d12;
+            --surface-color: #161822;
+            --surface-border: #2c2f3d;
+            --primary: #4caf50;          /* Dill Green */
+            --primary-hover: #388e3c;    /* Darker Dill Green */
+            --success: #2e7d32;
+            --warning: #f59e0b;
+            --danger: #d32f2f;
+            --text-main: #f8fafc;
+            --text-muted: #8892b0;
+            --font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            background-color: var(--bg-color);
+            color: var(--text-main);
+            font-family: var(--font-family);
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            overflow-x: hidden;
+        }
+
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 1rem 1.5rem;
+            border-bottom: 1px solid var(--surface-border);
+            position: sticky;
+            top: 0;
+            z-index: 100;
+            background-color: var(--surface-color);
+        }
+
+        .logo-container {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+            cursor: pointer;
+            text-decoration: none;
+            color: inherit;
+        }
+
+        .logo-icon {
+            width: 2.25rem;
+            height: 2.25rem;
+            background: var(--primary);
+            border-radius: 4px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .logo-icon svg {
+            width: 1.15rem;
+            height: 1.15rem;
+            fill: white;
+        }
+
+        .logo-text {
+            font-size: 1.15rem;
+            font-weight: 700;
+            letter-spacing: -0.5px;
+            color: var(--text-main);
+        }
+
+        nav {
+            display: flex;
+            gap: 0.5rem;
+        }
+
+        .nav-btn {
+            background: transparent;
+            border: 1px solid transparent;
+            color: var(--text-muted);
+            padding: 0.4rem 0.85rem;
+            border-radius: 4px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.15s ease;
+            font-size: 0.85rem;
+        }
+
+        .nav-btn:hover, .nav-btn.active {
+            color: var(--text-main);
+            background-color: rgba(255, 255, 255, 0.05);
+            border-color: var(--surface-border);
+        }
+
+        main {
+            flex: 1;
+            max-width: 900px;
+            width: 100%;
+            margin: 0 auto;
+            padding: 2rem 1rem;
+            display: flex;
+            flex-direction: column;
+            gap: 1.5rem;
+        }
+
+        .tab-content {
+            display: none;
+        }
+
+        .tab-content.active {
+            display: flex;
+            flex-direction: column;
+            gap: 1.5rem;
+            margin: auto 0;
+        }
+
+        /* Card (Flat UI) */
+        .glass-card {
+            background: var(--surface-color);
+            border: 1px solid var(--surface-border);
+            border-radius: 6px;
+            padding: 1.5rem;
+        }
+
+        /* Drop Zone */
+        .drop-zone {
+            border: 1px dashed var(--surface-border);
+            border-radius: 4px;
+            padding: 2.5rem 1.5rem;
+            text-align: center;
+            cursor: pointer;
+            transition: border-color 0.15s, background-color 0.15s;
+            background-color: rgba(255, 255, 255, 0.01);
+        }
+
+        .drop-zone:hover, .drop-zone.dragover {
+            border-color: var(--primary);
+            background-color: rgba(255, 255, 255, 0.02);
+        }
+
+        .drop-icon-container {
+            width: 3.5rem;
+            height: 3.5rem;
+            background: rgba(255, 255, 255, 0.02);
+            border: 1px solid var(--surface-border);
+            border-radius: 4px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin: 0 auto 1.25rem auto;
+            transition: all 0.15s ease;
+        }
+
+        .drop-zone:hover .drop-icon-container, .drop-zone.dragover .drop-icon-container {
+            background: var(--primary);
+            color: white;
+            border-color: var(--primary);
+        }
+
+        .drop-icon-container svg {
+            width: 1.75rem;
+            height: 1.75rem;
+            fill: currentColor;
+            color: var(--text-muted);
+        }
+
+        .drop-zone:hover .drop-icon-container svg, .drop-zone.dragover .drop-icon-container svg {
+            color: white;
+        }
+
+        .drop-zone h3 {
+            font-size: 1.1rem;
+            font-weight: 600;
+            margin-bottom: 0.4rem;
+        }
+
+        .drop-zone p {
+            color: var(--text-muted);
+            font-size: 0.85rem;
+            margin-bottom: 1.25rem;
+        }
+
+        .btn-group {
+            display: flex;
+            justify-content: center;
+            gap: 0.75rem;
+        }
+
+        .btn {
+            background: var(--primary);
+            color: white;
+            border: none;
+            padding: 0.5rem 1.25rem;
+            border-radius: 4px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: background-color 0.15s;
+            display: inline-flex;
+            align-items: center;
+            gap: 0.4rem;
+            font-size: 0.85rem;
+        }
+
+        .btn:hover {
+            background-color: var(--primary-hover);
+        }
+
+        .btn-secondary {
+            background: transparent;
+            border: 1px solid var(--surface-border);
+            color: var(--text-main);
+        }
+
+        .btn-secondary:hover {
+            background: rgba(255, 255, 255, 0.05);
+            border-color: rgba(255, 255, 255, 0.15);
+        }
+
+        .btn-danger {
+            background: var(--danger);
+        }
+        .btn-danger:hover {
+            background: #b71c1c;
+        }
+
+        .file-input {
+            display: none;
+        }
+
+        /* Files List */
+        .files-list-container {
+            display: flex;
+            flex-direction: column;
+            gap: 0.75rem;
+        }
+
+        .files-list-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .files-list {
+            max-height: 250px;
+            overflow-y: auto;
+            border: 1px solid var(--surface-border);
+            border-radius: 4px;
+            background: rgba(0, 0, 0, 0.1);
+        }
+
+        .file-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 0.6rem 0.85rem;
+            border-bottom: 1px solid var(--surface-border);
+        }
+
+        .file-row:last-child {
+            border-bottom: none;
+        }
+
+        .file-info {
+            display: flex;
+            align-items: center;
+            gap: 0.6rem;
+            min-width: 0;
+        }
+
+        .file-info svg {
+            width: 1.15rem;
+            height: 1.15rem;
+            flex-shrink: 0;
+            fill: var(--text-muted);
+        }
+
+        .file-name {
+            font-size: 0.85rem;
+            font-weight: 500;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .file-meta {
+            font-size: 0.75rem;
+            color: var(--text-muted);
+            white-space: nowrap;
+        }
+
+        .remove-file-btn {
+            background: transparent;
+            border: none;
+            color: var(--text-muted);
+            cursor: pointer;
+            padding: 0.2rem;
+            border-radius: 2px;
+            transition: all 0.15s;
+        }
+
+        .remove-file-btn:hover {
+            color: var(--danger);
+            background: rgba(211, 47, 47, 0.1);
+        }
+
+        /* Progress Card */
+        .progress-card {
+            display: flex;
+            flex-direction: column;
+            gap: 0.75rem;
+        }
+
+        .progress-bar-container {
+            width: 100%;
+            height: 0.35rem;
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 2px;
+            overflow: hidden;
+        }
+
+        .progress-bar {
+            height: 100%;
+            width: 0%;
+            background: var(--primary);
+            border-radius: 2px;
+            transition: width 0.1s linear;
+        }
+
+        .progress-stats {
+            display: flex;
+            justify-content: space-between;
+            font-size: 0.8rem;
+            color: var(--text-muted);
+        }
+
+        /* Share Link Output Card */
+        .share-output-card {
+            display: flex;
+            flex-direction: column;
+            gap: 1rem;
+            align-items: center;
+            text-align: center;
+        }
+
+        .share-success-icon {
+            width: 3rem;
+            height: 3rem;
+            background: rgba(46, 125, 50, 0.1);
+            color: var(--primary);
+            border-radius: 4px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin-bottom: 0.25rem;
+        }
+
+        .share-success-icon svg {
+            width: 1.5rem;
+            height: 1.5rem;
+            fill: currentColor;
+        }
+
+        .share-link-input-group {
+            display: flex;
+            width: 100%;
+            border: 1px solid var(--surface-border);
+            background: rgba(0, 0, 0, 0.1);
+            border-radius: 4px;
+            overflow: hidden;
+            padding: 0.2rem;
+        }
+
+        .share-link-input {
+            flex: 1;
+            background: transparent;
+            border: none;
+            color: var(--text-main);
+            padding: 0.5rem;
+            font-family: inherit;
+            font-size: 0.85rem;
+            outline: none;
+            min-width: 0;
+        }
+
+        /* Preview Explorer UI */
+        .preview-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            flex-wrap: wrap;
+            gap: 1rem;
+            border-bottom: 1px solid var(--surface-border);
+            padding-bottom: 1rem;
+            margin-bottom: 1rem;
+        }
+
+        .countdown-timer {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.4rem;
+            background: rgba(245, 158, 11, 0.08);
+            color: var(--warning);
+            border: 1px solid rgba(245, 158, 11, 0.15);
+            padding: 0.4rem 0.75rem;
+            border-radius: 4px;
+            font-size: 0.8rem;
+            font-weight: 600;
+        }
+
+        .countdown-timer svg {
+            width: 0.9rem;
+            height: 0.9rem;
+            fill: currentColor;
+        }
+
+        .breadcrumbs {
+            display: flex;
+            align-items: center;
+            gap: 0.4rem;
+            font-size: 0.85rem;
+            color: var(--text-muted);
+            margin-bottom: 1rem;
+        }
+
+        .breadcrumb-item {
+            cursor: pointer;
+            transition: color 0.15s;
+        }
+
+        .breadcrumb-item:hover {
+            color: var(--text-main);
+        }
+
+        .breadcrumb-item.active {
+            color: var(--text-main);
+            font-weight: 600;
+            pointer-events: none;
+        }
+
+        .explorer-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+            gap: 1rem;
+        }
+
+        .explorer-item {
+            background: rgba(255, 255, 255, 0.01);
+            border: 1px solid var(--surface-border);
+            border-radius: 4px;
+            padding: 1rem;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            text-align: center;
+            cursor: pointer;
+            transition: border-color 0.15s, background-color 0.15s;
+            min-width: 0;
+            position: relative;
+        }
+
+        .explorer-item:hover {
+            background: rgba(255, 255, 255, 0.03);
+            border-color: var(--primary);
+        }
+
+        .explorer-item-icon {
+            width: 100%;
+            height: 6.5rem;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin-bottom: 0.75rem;
+            border-radius: 4px;
+            background: rgba(0, 0, 0, 0.15);
+            color: var(--text-muted);
+            transition: color 0.15s, background-color 0.15s;
+            overflow: hidden;
+            position: relative;
+        }
+
+        .explorer-item:hover .explorer-item-icon {
+            background: rgba(76, 175, 80, 0.05);
+            color: var(--primary);
+        }
+
+        .explorer-item-icon svg {
+            width: 2.25rem;
+            height: 2.25rem;
+            fill: currentColor;
+        }
+
+        .explorer-item-name {
+            font-size: 0.8rem;
+            font-weight: 600;
+            width: 100%;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            margin-bottom: 0.2rem;
+        }
+
+        .explorer-item-size {
+            font-size: 0.7rem;
+            color: var(--text-muted);
+        }
+
+        /* Preview Drawer / Modal */
+        .preview-modal {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(0, 0, 0, 0.8);
+            z-index: 1000;
+            display: none;
+            align-items: center;
+            justify-content: center;
+            padding: 1.5rem;
+            opacity: 0;
+            transition: opacity 0.2s ease;
+        }
+
+        .preview-modal.active {
+            display: flex;
+            opacity: 1;
+        }
+
+        .preview-container {
+            max-width: 750px;
+            width: 100%;
+            background: var(--surface-color);
+            border: 1px solid var(--surface-border);
+            border-radius: 6px;
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+            max-height: 85vh;
+        }
+
+        .preview-modal-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 1rem 1.25rem;
+            border-bottom: 1px solid var(--surface-border);
+        }
+
+        .preview-title {
+            font-weight: 600;
+            font-size: 1rem;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            max-width: 80%;
+        }
+
+        .close-btn {
+            background: transparent;
+            border: none;
+            color: var(--text-muted);
+            cursor: pointer;
+            padding: 0.4rem;
+            border-radius: 4px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.15s;
+        }
+
+        .close-btn:hover {
+            background: rgba(255, 255, 255, 0.05);
+            color: var(--text-main);
+        }
+
+        .preview-content {
+            flex: 1;
+            overflow: auto;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: rgba(0, 0, 0, 0.1);
+            padding: 1.25rem;
+            min-height: 250px;
+        }
+
+        .preview-media {
+            max-width: 100%;
+            max-height: 55vh;
+            border-radius: 4px;
+        }
+
+        .audio-player-wrapper {
+            width: 100%;
+            max-width: 450px;
+            padding: 1.5rem;
+            background: rgba(255, 255, 255, 0.01);
+            border: 1px solid var(--surface-border);
+            border-radius: 4px;
+            display: flex;
+            flex-direction: column;
+            gap: 1.25rem;
+            align-items: center;
+        }
+
+        .audio-disc {
+            width: 4rem;
+            height: 4rem;
+            background: var(--primary);
+            border-radius: 4px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        audio {
+            width: 100%;
+        }
+
+        .code-preview {
+            width: 100%;
+            background: #07080b;
+            color: #81c784;
+            font-family: monospace;
+            padding: 1.25rem;
+            border-radius: 4px;
+            border: 1px solid var(--surface-border);
+            font-size: 0.85rem;
+            line-height: 1.4;
+            white-space: pre-wrap;
+            word-break: break-all;
+            max-height: 50vh;
+            overflow-y: auto;
+        }
+
+        .generic-file-preview {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 0.75rem;
+            text-align: center;
+        }
+
+        .preview-footer {
+            padding: 1rem 1.25rem;
+            border-top: 1px solid var(--surface-border);
+            display: flex;
+            justify-content: flex-end;
+            gap: 0.75rem;
+        }
+
+        /* Active Shares Table */
+        .shares-table-wrapper {
+            overflow-x: auto;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            text-align: left;
+        }
+
+        th {
+            padding: 0.85rem;
+            font-size: 0.8rem;
+            font-weight: 600;
+            color: var(--text-muted);
+            border-bottom: 1px solid var(--surface-border);
+        }
+
+        td {
+            padding: 1rem 0.85rem;
+            font-size: 0.85rem;
+            border-bottom: 1px solid var(--surface-border);
+        }
+
+        tr:last-child td {
+            border-bottom: none;
+        }
+
+        tr:hover td {
+            background-color: rgba(255, 255, 255, 0.01);
+        }
+
+        .share-id-cell {
+            display: flex;
+            align-items: center;
+            gap: 0.4rem;
+            font-weight: 500;
+        }
+
+        .share-actions {
+            display: flex;
+            gap: 0.4rem;
+        }
+
+        .action-btn {
+            background: rgba(255, 255, 255, 0.02);
+            border: 1px solid var(--surface-border);
+            color: var(--text-muted);
+            padding: 0.35rem;
+            border-radius: 4px;
+            cursor: pointer;
+            transition: all 0.15s;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .action-btn:hover {
+            color: var(--text-main);
+            background: rgba(255, 255, 255, 0.05);
+            border-color: rgba(255, 255, 255, 0.1);
+        }
+
+        .action-btn.delete:hover {
+            color: var(--danger);
+            background: rgba(211, 47, 47, 0.1);
+            border-color: rgba(211, 47, 47, 0.2);
+        }
+
+        .action-btn svg {
+            width: 0.95rem;
+            height: 0.95rem;
+            fill: currentColor;
+        }
+
+        .empty-state {
+            text-align: center;
+            padding: 2.5rem 1.25rem;
+            color: var(--text-muted);
+        }
+
+        .empty-state svg {
+            width: 2.5rem;
+            height: 2.5rem;
+            fill: currentColor;
+            margin-bottom: 0.75rem;
+            opacity: 0.3;
+        }
+
+        /* Notification Toast */
+        .toast-container {
+            position: fixed;
+            bottom: 1.5rem;
+            right: 1.5rem;
+            display: flex;
+            flex-direction: column;
+            gap: 0.5rem;
+            z-index: 2000;
+        }
+
+        .toast {
+            background: var(--surface-color);
+            border: 1px solid var(--surface-border);
+            border-left: 3px solid var(--primary);
+            border-radius: 4px;
+            padding: 0.85rem 1.25rem;
+            color: var(--text-main);
+            display: flex;
+            align-items: center;
+            gap: 0.6rem;
+            min-width: 260px;
+            max-width: 380px;
+            font-size: 0.85rem;
+        }
+
+        .toast.success { border-left-color: var(--primary); }
+        .toast.error { border-left-color: var(--danger); }
+        .toast.info { border-left-color: var(--warning); }
+
+        /* Loader */
+        .loader {
+            width: 1.25rem;
+            height: 1.25rem;
+            border: 2px solid rgba(255, 255, 255, 0.1);
+            border-top-color: var(--primary);
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+        }
+
+        .badge {
+            display: inline-block;
+            padding: 0.2rem 0.4rem;
+            border-radius: 2px;
+            font-size: 0.7rem;
+            font-weight: 600;
+            background: rgba(255, 255, 255, 0.05);
+            color: var(--text-muted);
+        }
+
+        .badge.success {
+            background: rgba(76, 175, 80, 0.1);
+            color: var(--primary);
+        }
+
+        /* Custom Scrollbar */
+        ::-webkit-scrollbar {
+            width: 5px;
+            height: 5px;
+        }
+        ::-webkit-scrollbar-track {
+            background: transparent;
+        }
+        ::-webkit-scrollbar-thumb {
+            background: rgba(255, 255, 255, 0.08);
+            border-radius: 2px;
+        }
+        ::-webkit-scrollbar-thumb:hover {
+            background: rgba(255, 255, 255, 0.15);
+        }
+
+        @media (max-width: 640px) {
+            main {
+                padding: 1.25rem 0.75rem;
+            }
+            .btn-group {
+                flex-direction: column;
+            }
+            header {
+                padding: 0.85rem 1rem;
+            }
+        }
+    </style>
+</head>
+<body>
+
+    <header>
+        <a href="/" class="logo-container" id="logo-link">
+            <div class="logo-icon">
+                <svg viewBox="0 0 24 24">
+                    <path d="M19.35 10.04C18.67 6.59 15.64 4 12 4 9.11 4 6.6 5.64 5.35 8.04 2.34 8.36 0 10.91 0 14c0 3.31 2.69 6 6 6h13c2.76 0 5-2.24 5-5 0-2.64-2.05-4.78-4.65-4.96zM19 18H6c-2.21 0-4-1.79-4-4 0-2.05 1.53-3.76 3.56-3.97l1.07-.11.5-.95C8.08 7.14 9.94 6 12 6c2.62 0 4.88 1.86 5.39 4.43l.3 1.5 1.53.11c1.56.1 2.78 1.41 2.78 2.96 0 1.65-1.35 3-3 3zm-5.55-8h-2.9v3H7.5l4.5 4.5 4.5-4.5h-3.05z"/>
+                </svg>
+            </div>
+            <span class="logo-text">Dill Share</span>
+        </a>
+        <nav id="main-nav" style="display: flex; align-items: center; gap: 0.5rem;">
+            <div id="nav-links" style="display: none; align-items: center; gap: 0.5rem;">
+                <button class="nav-btn active" id="nav-upload">Upload</button>
+                <button class="nav-btn" id="nav-shares">Active Shares</button>
+                <button class="nav-btn" id="nav-profile">Profile</button>
+                <span style="color: var(--surface-border); font-size: 0.8rem; margin: 0 0.25rem;">|</span>
+            </div>
+            <button class="nav-btn" id="nav-auth-btn" style="color: var(--primary); border: 1px solid rgba(76, 175, 80, 0.2); font-weight: 600;">Sign In</button>
+            <div id="user-profile-badge" style="display: none; align-items: center; gap: 0.5rem;">
+                <img id="header-pfp" src="" style="width: 1.8rem; height: 1.8rem; border-radius: 50%; object-fit: cover; border: 1px solid var(--surface-border); display: none;">
+                <div id="header-pfp-placeholder" style="width: 1.8rem; height: 1.8rem; border-radius: 50%; background: var(--primary); display: flex; align-items: center; justify-content: center; font-size: 0.85rem; font-weight: bold; font-family: monospace; color: white;">U</div>
+                <span id="header-username" class="badge success" style="font-size: 0.8rem; font-family: monospace; padding: 0.4rem 0.6rem; border-radius: 4px; cursor: pointer; transition: background 0.15s;" title="Settings">user</span>
+                <button class="nav-btn" id="btn-logout" style="padding: 0.4rem 0.6rem; color: var(--danger); background: transparent; border: none; font-weight: 600;">Logout</button>
+            </div>
+        </nav>
+    </header>
+
+    <main>
+        <!-- UPLOAD VIEW -->
+        <div id="view-upload" class="tab-content active">
+            <div class="glass-card">
+                <div class="drop-zone" id="drop-zone">
+                    <input type="file" id="file-select" class="file-input" multiple>
+                    <input type="file" id="folder-select" class="file-input" webkitdirectory directory multiple>
+                    
+                    <div class="drop-icon-container">
+                        <svg viewBox="0 0 24 24">
+                            <path d="M19.35 10.04C18.67 6.59 15.64 4 12 4 9.11 4 6.6 5.64 5.35 8.04 2.34 8.36 0 10.91 0 14c0 3.31 2.69 6 6 6h13c2.76 0 5-2.24 5-5 0-2.64-2.05-4.78-4.65-4.96zM14 13v4h-4v-4H7l5-5 5 5h-3z"/>
+                        </svg>
+                    </div>
+                    <h3 id="upload-box-title">Account Required</h3>
+                    <p id="upload-box-desc" style="color: var(--text-muted);">Please sign in or create an account to start sharing files.</p>
+                    <div class="btn-group" id="upload-box-btn-group" style="display: none;">
+                        <button class="btn" id="btn-select-files">
+                            <svg style="width:1.1rem;height:1.1rem;fill:currentColor;" viewBox="0 0 24 24"><path d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z"/></svg>
+                            Choose Files
+                        </button>
+                        <button class="btn btn-secondary" id="btn-select-folder">
+                            <svg style="width:1.1rem;height:1.1rem;fill:currentColor;" viewBox="0 0 24 24"><path d="M10 4H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2h-8l-2-2z"/></svg>
+                            Choose Folder
+                        </button>
+                    </div>
+                    <div id="upload-box-auth-prompt" style="display: flex; justify-content: center;">
+                        <button class="btn" id="btn-auth-prompt-signin" style="padding: 0.6rem 1.5rem; font-weight:600; pointer-events: auto;">
+                            Sign In to Upload
+                        </button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Pre-upload Files list -->
+            <div class="glass-card files-list-container" id="pre-upload-card" style="display: none;">
+                <div class="files-list-header">
+                    <h4 id="files-count-label">Selected Files (0)</h4>
+                    <span class="badge" id="total-size-badge">0 B</span>
+                </div>
+                <div class="files-list" id="selected-files-list">
+                    <!-- Dynamic Rows -->
+                </div>
+                <div class="btn-group" style="justify-content: flex-end;">
+                    <button class="btn btn-secondary" id="btn-clear-files">Clear</button>
+                    <button class="btn" id="btn-upload">
+                        <svg style="width:1.1rem;height:1.1rem;fill:currentColor;" viewBox="0 0 24 24"><path d="M5 20h14v-2H5v2zm0-10h4v6h6v-6h4l-7-7-7 7z"/></svg>
+                        Upload Files
+                    </button>
+                </div>
+            </div>
+
+            <!-- Upload Progress -->
+            <div class="glass-card progress-card" id="upload-progress-card" style="display: none;">
+                <h4>Uploading files...</h4>
+                <div class="progress-bar-container">
+                    <div class="progress-bar" id="upload-progress-bar"></div>
+                </div>
+                <div class="progress-stats">
+                    <span id="progress-percentage">0%</span>
+                    <span id="progress-speed">0 KB/s</span>
+                    <span id="progress-eta">Calculating...</span>
+                </div>
+            </div>
+
+            <!-- Share Result -->
+            <div class="glass-card share-output-card" id="share-result-card" style="display: none;">
+                <div class="share-success-icon">
+                    <svg viewBox="0 0 24 24">
+                        <path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"/>
+                    </svg>
+                </div>
+                <h3>Share Created Successfully!</h3>
+                <p>Anyone with this link can view and download these files.</p>
+                <div class="share-link-input-group">
+                    <input type="text" class="share-link-input" id="share-link-url" readonly>
+                    <button class="btn" style="border-radius: 0.5rem; margin: 2px;" id="btn-copy-link">
+                        Copy Link
+                    </button>
+                </div>
+                <div class="btn-group" style="margin-top: 1rem;">
+                    <a href="#" class="btn btn-secondary" id="btn-view-created-share">View Share</a>
+                    <button class="btn btn-secondary" id="btn-new-upload">Upload More</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- ACTIVE SHARES VIEW -->
+        <div id="view-shares" class="tab-content">
+            <div class="glass-card">
+                <div class="files-list-header" style="margin-bottom: 1.5rem;">
+                    <h3>All Active Share Links</h3>
+                    <button class="btn btn-secondary" id="btn-refresh-shares" style="padding: 0.5rem 1rem;">
+                        Refresh
+                    </button>
+                </div>
+                <div class="shares-table-wrapper">
+                    <table id="shares-table">
+                        <thead>
+                            <tr>
+                                <th>Share Key / Link</th>
+                                <th>Files</th>
+                                <th>Total Size</th>
+                                <th>Created</th>
+                                <th>Expires In</th>
+                                <th>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody id="shares-list-body">
+                            <!-- Dynamic Content -->
+                        </tbody>
+                    </table>
+                    <div id="shares-empty-state" class="empty-state" style="display: none;">
+                        <svg viewBox="0 0 24 24">
+                            <path d="M19.35 10.04C18.67 6.59 15.64 4 12 4 9.11 4 6.6 5.64 5.35 8.04 2.34 8.36 0 10.91 0 14c0 3.31 2.69 6 6 6h13c2.76 0 5-2.24 5-5 0-2.64-2.05-4.78-4.65-4.96zM19 18H6c-2.21 0-4-1.79-4-4 0-2.05 1.53-3.76 3.56-3.97l1.07-.11.5-.95C8.08 7.14 9.94 6 12 6c2.62 0 4.88 1.86 5.39 4.43l.3 1.5 1.53.11c1.56.1 2.78 1.41 2.78 2.96 0 1.65-1.35 3-3 3z"/>
+                        </svg>
+                        <p>No active shares found. Upload some files to get started!</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- ADMIN PANEL VIEW -->
+        <div id="view-admin" class="tab-content">
+            <div class="glass-card">
+                <div class="preview-header">
+                    <div>
+                        <h2 style="font-size: 1.5rem; margin-bottom: 0.25rem;">Admin Panel</h2>
+                        <p class="file-meta">Manage users and space allocation</p>
+                    </div>
+                    <div style="display: flex; gap: 0.5rem;">
+                        <button class="btn btn-secondary" id="btn-refresh-admin" style="display: none;">Refresh Stats</button>
+                        <button class="btn btn-danger" id="btn-logout-admin" style="display: none;">Admin Logout</button>
+                    </div>
+                </div>
+
+                <div id="admin-token-required" class="empty-state" style="display: none; max-width: 400px; margin: 2rem auto;">
+                    <svg viewBox="0 0 24 24" style="width:2.5rem; height:2.5rem; fill:currentColor; margin-bottom:0.75rem; opacity:0.3;"><path d="M18 8h-1V6c0-2.76-2.24-5-5-5S7 3.24 7 6v2H6c-1.1 0-2 .9-2 2v10c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V10c0-1.1-.9-2-2-2zm-6 9c-1.1 0-2-.9-2-2s.9-2 2-2 2 .9 2 2-.9 2-2 2zm3.1-9H8.9V6c0-1.71 1.39-3.1 3.1-3.1 1.71 0 3.1 1.39 3.1 3.1v2z"/></svg>
+                    <h3>Admin Token Required</h3>
+                    <p style="color: var(--text-muted); font-size:0.85rem; margin-top:0.25rem; margin-bottom:1rem;">Please enter the administrator access token to view the dashboard.</p>
+                    <form id="admin-token-form" style="display: flex; flex-direction: column; gap: 0.75rem; width: 100%;">
+                        <input type="password" id="admin-token-input" placeholder="Admin Token" required style="background: rgba(0,0,0,0.2); border: 1px solid var(--surface-border); border-radius: 4px; padding: 0.5rem 0.75rem; color: var(--text-main); font-family: inherit; font-size: 0.85rem; outline: none; text-align: center; width: 100%;">
+                        <button class="btn" type="submit" style="justify-content: center; padding: 0.5rem; font-weight: 600; font-size: 0.85rem; width: 100%;">Access Dashboard</button>
+                    </form>
+                </div>
+
+                <div id="admin-loading" class="empty-state" style="display: none; max-width: 400px; margin: 2rem auto;">
+                    <div class="loader" style="margin:1rem auto;"></div>
+                    <span style="font-size:0.85rem; color:var(--text-muted);">Verifying administrator access...</span>
+                </div>
+
+                <div class="shares-table-wrapper" id="admin-dashboard" style="display: none;">
+                    <table id="admin-table">
+                        <thead>
+                            <tr>
+                                <th>User</th>
+                                <th>Active Shares</th>
+                                <th>Storage Used</th>
+                                <th>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody id="admin-users-list-body">
+                            <!-- Dynamic Content -->
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <!-- PROFILE VIEW -->
+        <div id="view-profile" class="tab-content">
+            <div class="glass-card" style="display: flex; flex-direction: column; gap: 1.5rem; max-width: 600px; margin: 0 auto; width: 100%;">
+                
+                <h2 style="font-size: 1.5rem; border-bottom: 1px solid var(--surface-border); padding-bottom: 0.5rem; color: var(--primary);">User Profile</h2>
+                
+                <!-- Profile Picture Section -->
+                <div style="display: flex; gap: 1.5rem; align-items: center; border-bottom: 1px solid var(--surface-border); padding-bottom: 1.5rem; flex-wrap: wrap;">
+                    <div style="position: relative; width: 6.5rem; height: 6.5rem; border-radius: 50%; border: 2px solid var(--primary); overflow: hidden; background: rgba(0, 0, 0, 0.3); display: flex; align-items: center; justify-content: center; flex-shrink: 0;">
+                        <img id="settings-pfp-preview" src="" style="width: 100%; height: 100%; object-fit: cover; display: none;">
+                        <div id="settings-pfp-placeholder" style="display: flex; align-items: center; justify-content: center; width: 100%; height: 100%; color: var(--text-muted); font-size: 2.25rem; font-weight: 700; font-family: monospace;">U</div>
+                    </div>
+                    <div style="display: flex; flex-direction: column; gap: 0.5rem; align-items: flex-start;">
+                        <h3 id="profile-username-title" style="font-size: 1.25rem; font-weight: 700; font-family: monospace;">username</h3>
+                        <label class="btn btn-secondary" style="padding: 0.4rem 0.85rem; font-size: 0.75rem; font-weight: 600; cursor: pointer; display: inline-flex; align-items: center; gap: 0.25rem; margin: 0;">
+                            Upload Photo
+                            <input type="file" id="settings-pfp-input" accept="image/png, image/jpeg, image/webp" style="display: none;">
+                        </label>
+                        <span style="font-size: 0.7rem; color: var(--text-muted);">Max size 5MB. PNG, JPG or WEBP.</span>
+                    </div>
+                </div>
+
+                <!-- Change Password Form -->
+                <form id="settings-password-form" style="display: flex; flex-direction: column; gap: 1rem; border-bottom: 1px solid var(--surface-border); padding-bottom: 1.5rem;">
+                    <h4 style="font-size: 0.9rem; font-weight: 600; color: var(--text-main); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 0.25rem;">Change Password</h4>
+                    <div style="display: flex; flex-direction: column; gap: 0.4rem;">
+                        <label for="settings-current-password" style="font-size: 0.8rem; color: var(--text-muted); font-weight: 500;">Current Password</label>
+                        <input type="password" id="settings-current-password" required autocomplete="current-password" style="background: rgba(0,0,0,0.2); border: 1px solid var(--surface-border); border-radius: 4px; padding: 0.5rem 0.75rem; color: var(--text-main); font-family: inherit; font-size: 0.85rem; outline: none; width: 100%;">
+                    </div>
+                    <div style="display: flex; flex-direction: column; gap: 0.4rem;">
+                        <label for="settings-new-password" style="font-size: 0.8rem; color: var(--text-muted); font-weight: 500;">New Password</label>
+                        <input type="password" id="settings-new-password" required autocomplete="new-password" style="background: rgba(0,0,0,0.2); border: 1px solid var(--surface-border); border-radius: 4px; padding: 0.5rem 0.75rem; color: var(--text-main); font-family: inherit; font-size: 0.85rem; outline: none; width: 100%;">
+                    </div>
+                    <button class="btn" type="submit" id="btn-settings-password-submit" style="justify-content: center; padding: 0.6rem; font-weight: 600; font-size: 0.85rem; width: 100%;">
+                        Update Password
+                    </button>
+                </form>
+
+                <!-- Delete Account Section -->
+                <div style="display: flex; flex-direction: column; gap: 0.8rem;">
+                    <h4 style="font-size: 0.9rem; font-weight: 600; color: var(--danger); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 0.25rem;">Danger Zone</h4>
+                    <p style="font-size: 0.8rem; color: var(--text-muted); margin-bottom: 0.2rem;">Deleting your account is permanent and irreversible. It will instantly delete your profile and ALL files uploaded under your active shares.</p>
+                    <button class="btn btn-danger" id="btn-delete-account" style="justify-content: center; padding: 0.6rem; font-weight: 600; font-size: 0.85rem; width: 100%;">
+                        Permanently Delete Account
+                    </button>
+                </div>
+
+            </div>
+        </div>
+
+        <!-- SHARE VIEWER VIEW (PREVIEW MODE) -->
+        <div id="view-share-details" class="tab-content">
+            <div class="glass-card">
+                <div class="preview-header">
+                    <div>
+                        <h2 style="font-size: 1.5rem; margin-bottom: 0.25rem;">Shared Files</h2>
+                        <div style="display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 0.25rem;">
+                            <div id="share-owner-badge" style="display: none; align-items: center; gap: 0.35rem; background: rgba(255,255,255,0.05); padding: 0.2rem 0.5rem; border-radius: 4px; border: 1px solid var(--surface-border);">
+                                <img id="share-owner-pfp" src="" style="width: 1.15rem; height: 1.15rem; border-radius: 50%; object-fit: cover; display: none;">
+                                <div id="share-owner-pfp-placeholder" style="width: 1.15rem; height: 1.15rem; border-radius: 50%; background: var(--primary); display: flex; align-items: center; justify-content: center; font-size: 0.65rem; font-weight: bold; font-family: monospace; color: white;">U</div>
+                                <span id="share-owner-username" style="font-size: 0.75rem; font-weight: 600; color: var(--text-main);">username</span>
+                            </div>
+                            <p class="file-meta" id="share-created-date" style="margin: 0;">Created on: ...</p>
+                        </div>
+                    </div>
+                    <div style="display: flex; gap: 0.75rem; align-items: center; flex-wrap: wrap;">
+                        <button class="btn" id="btn-download-all" style="display: none;">
+                            <svg style="width: 1.1rem; height: 1.1rem; fill: currentColor;" viewBox="0 0 24 24">
+                                <path d="M19.35 10.04C18.67 6.59 15.64 4 12 4 9.11 4 6.6 5.64 5.35 8.04 2.34 8.36 0 10.91 0 14c0 3.31 2.69 6 6 6h13c2.76 0 5-2.24 5-5 0-2.64-2.05-4.78-4.65-4.96zM17 13l-5 5-5-5h3V9h4v4h3z"/>
+                            </svg>
+                            Download All (ZIP)
+                        </button>
+                        <div class="countdown-timer" id="share-countdown">
+                            <svg viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 14h-2v-2h2v2zm0-4h-2V7h2v5z"/></svg>
+                            <span>Expires in: Calculating...</span>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="breadcrumbs" id="folder-breadcrumbs">
+                    <!-- Dynamic Breadcrumbs -->
+                </div>
+
+                <div class="explorer-grid" id="explorer-grid">
+                    <!-- Dynamic Files and Folders -->
+                </div>
+            </div>
+        </div>
+    </main>
+
+    <!-- PREVIEW MODAL -->
+    <div class="preview-modal" id="preview-modal">
+        <div class="preview-container">
+            <div class="preview-modal-header">
+                <span class="preview-title" id="preview-filename">file.png</span>
+                <button class="close-btn" id="btn-close-preview">
+                    <svg style="width: 1.25rem; height: 1.25rem; fill: currentColor;" viewBox="0 0 24 24">
+                        <path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/>
+                    </svg>
+                </button>
+            </div>
+            <div class="preview-content" id="preview-content-box">
+                <!-- Preview elements injected here dynamically -->
+            </div>
+            <div class="preview-footer">
+                <button class="btn btn-secondary" id="btn-preview-close-footer">Close</button>
+                <a href="#" class="btn" id="btn-preview-download" download>
+                    <svg style="width: 1.1rem; height: 1.1rem; fill: currentColor;" viewBox="0 0 24 24">
+                        <path d="M19.35 10.04C18.67 6.59 15.64 4 12 4 9.11 4 6.6 5.64 5.35 8.04 2.34 8.36 0 10.91 0 14c0 3.31 2.69 6 6 6h13c2.76 0 5-2.24 5-5 0-2.64-2.05-4.78-4.65-4.96zM17 13l-5 5-5-5h3V9h4v4h3z"/>
+                    </svg>
+                    Download
+                </a>
+            </div>
+        </div>
+    </div>
+
+    <!-- AUTH MODAL -->
+    <div class="preview-modal" id="auth-modal">
+        <div class="preview-container" style="max-width: 400px;">
+            <div class="preview-modal-header">
+                <span class="preview-title" id="auth-modal-title">Sign In</span>
+                <button class="close-btn" id="btn-close-auth">
+                    <svg style="width: 1.25rem; height: 1.25rem; fill: currentColor;" viewBox="0 0 24 24">
+                        <path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/>
+                    </svg>
+                </button>
+            </div>
+            <div class="preview-content" style="padding: 1.5rem; flex-direction: column; align-items: stretch; justify-content: flex-start; background: var(--surface-color); gap: 1rem;">
+                <form id="auth-form" style="display: flex; flex-direction: column; gap: 1rem;">
+                    <div style="display: flex; flex-direction: column; gap: 0.4rem;">
+                        <label for="auth-username" style="font-size: 0.8rem; color: var(--text-muted); font-weight: 500;">Username</label>
+                        <input type="text" id="auth-username" required autocomplete="username" style="background: rgba(0,0,0,0.2); border: 1px solid var(--surface-border); border-radius: 4px; padding: 0.5rem 0.75rem; color: var(--text-main); font-family: inherit; font-size: 0.85rem; outline: none;">
+                    </div>
+                    <div style="display: flex; flex-direction: column; gap: 0.4rem;">
+                        <label for="auth-password" style="font-size: 0.8rem; color: var(--text-muted); font-weight: 500;">Password</label>
+                        <input type="password" id="auth-password" required autocomplete="current-password" style="background: rgba(0,0,0,0.2); border: 1px solid var(--surface-border); border-radius: 4px; padding: 0.5rem 0.75rem; color: var(--text-main); font-family: inherit; font-size: 0.85rem; outline: none;">
+                    </div>
+                    <button class="btn" type="submit" id="btn-auth-submit" style="justify-content: center; padding: 0.6rem; font-weight: 600; margin-top: 0.5rem;">
+                        Sign In
+                    </button>
+                </form>
+                <div style="text-align: center; font-size: 0.8rem; color: var(--text-muted); margin-top: 0.5rem;">
+                    <span id="auth-toggle-text">Don't have an account?</span>
+                    <a href="#" id="auth-toggle-link" style="color: var(--primary); text-decoration: none; font-weight: 600; margin-left: 0.25rem;">Create Account</a>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- TOAST CONTAINER -->
+    <div class="toast-container" id="toast-container"></div>
+
+    <script>
+        // Store selected files before upload
+        let selectedFiles = [];
+        let currentShareUUID = null;
+        let currentShareData = null;
+        let currentFolderPath = []; // For navigating folder tree in share viewer
+
+        // DOM elements
+        const viewUpload = document.getElementById('view-upload');
+        const viewShares = document.getElementById('view-shares');
+        const viewShareDetails = document.getElementById('view-share-details');
+        const viewAdmin = document.getElementById('view-admin');
+        const viewProfile = document.getElementById('view-profile');
+        const navUpload = document.getElementById('nav-upload');
+        const navShares = document.getElementById('nav-shares');
+        const navProfile = document.getElementById('nav-profile');
+        const logoLink = document.getElementById('logo-link');
+
+        const uploadBoxTitle = document.getElementById('upload-box-title');
+        const uploadBoxDesc = document.getElementById('upload-box-desc');
+        const uploadBoxBtnGroup = document.getElementById('upload-box-btn-group');
+        const uploadBoxAuthPrompt = document.getElementById('upload-box-auth-prompt');
+        const btnAuthPromptSignin = document.getElementById('btn-auth-prompt-signin');
+        const btnRefreshAdmin = document.getElementById('btn-refresh-admin');
+
+        const dropZone = document.getElementById('drop-zone');
+        const fileSelect = document.getElementById('file-select');
+        const folderSelect = document.getElementById('folder-select');
+        const btnSelectFiles = document.getElementById('btn-select-files');
+        const btnSelectFolder = document.getElementById('btn-select-folder');
+        const preUploadCard = document.getElementById('pre-upload-card');
+        const selectedFilesList = document.getElementById('selected-files-list');
+        const filesCountLabel = document.getElementById('files-count-label');
+        const totalSizeBadge = document.getElementById('total-size-badge');
+        const btnClearFiles = document.getElementById('btn-clear-files');
+        const btnUpload = document.getElementById('btn-upload');
+
+        const uploadProgressCard = document.getElementById('upload-progress-card');
+        const uploadProgressBar = document.getElementById('upload-progress-bar');
+        const progressPercentage = document.getElementById('progress-percentage');
+        const progressSpeed = document.getElementById('progress-speed');
+        const progressEta = document.getElementById('progress-eta');
+
+        const shareResultCard = document.getElementById('share-result-card');
+        const shareLinkUrl = document.getElementById('share-link-url');
+        const btnCopyLink = document.getElementById('btn-copy-link');
+        const btnViewCreatedShare = document.getElementById('btn-view-created-share');
+        const btnNewUpload = document.getElementById('btn-new-upload');
+
+        const btnRefreshShares = document.getElementById('btn-refresh-shares');
+        const sharesListBody = document.getElementById('shares-list-body');
+        const sharesEmptyState = document.getElementById('shares-empty-state');
+        const sharesTable = document.getElementById('shares-table');
+
+        const shareCreatedDate = document.getElementById('share-created-date');
+        const shareCountdown = document.getElementById('share-countdown');
+        const btnDownloadAll = document.getElementById('btn-download-all');
+        const folderBreadcrumbs = document.getElementById('folder-breadcrumbs');
+        const explorerGrid = document.getElementById('explorer-grid');
+
+        const previewModal = document.getElementById('preview-modal');
+        const previewFilename = document.getElementById('preview-filename');
+        const previewContentBox = document.getElementById('preview-content-box');
+        const btnClosePreview = document.getElementById('btn-close-preview');
+        const btnPreviewCloseFooter = document.getElementById('btn-preview-close-footer');
+        const btnPreviewDownload = document.getElementById('btn-preview-download');
+        const toastContainer = document.getElementById('toast-container');
+
+        // SVG Icons dictionary
+        const ICONS = {
+            folder: `<svg viewBox="0 0 24 24"><path d="M10 4H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2h-8l-2-2z"/></svg>`,
+            file: `<svg viewBox="0 0 24 24"><path d="M14 2H6c-1.1 0-1.99.9-1.99 2L4 20c0 1.1.89 2 1.99 2H18c1.1 0 2-.9 2-2V8l-6-6zm2 16H8v-2h8v2zm0-4H8v-2h8v2zm-3-5V3.5L18.5 9H13z"/></svg>`,
+            image: `<svg viewBox="0 0 24 24"><path d="M21 19V5c0-1.1-.9-2-2-2H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2zM8.5 13.5l2.5 3.01L14.5 12l4.5 6H5l3.5-4.5z"/></svg>`,
+            audio: `<svg viewBox="0 0 24 24"><path d="M12 3v10.55c-.59-.34-1.27-.55-2-.55-2.21 0-4 1.79-4 4s1.79 4 4 4 4-1.79 4-4V7h4V3h-6z"/></svg>`,
+            video: `<svg viewBox="0 0 24 24"><path d="M17 10.5V7c0-.55-.45-1-1-1H4c-.55 0-1 .45-1 1v10c0 .55.45 1 1 1h12c.55 0 1-.45 1-1v-3.5l4 4v-11l-4 4z"/></svg>`,
+            code: `<svg viewBox="0 0 24 24"><path d="M9.4 16.6L4.8 12l4.6-4.6L8 6l-6 6 6 6 1.4-1.4zm5.2 0l4.6-4.6-4.6-4.6L16 6l6 6-6 6-1.4-1.4z"/></svg>`,
+            pdf: `<svg viewBox="0 0 24 24"><path d="M20 2H8c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm-8.5 7.5c0 .83-.67 1.5-1.5 1.5H9v2H7.5V7H10c.83 0 1.5.67 1.5 1.5v1zm5 2c0 .83-.67 1.5-1.5 1.5h-2.5V7H15c.83 0 1.5.67 1.5 1.5v3zm4-3H19v1h1.5V11H19v2h-1.5V7h3v1.5zM9 8.5H10v1H9v-1zm5 1.5h1v1.5h-1V10zM2 6v14c0 1.1.9 2 2 2h14v-2H4V6H2z"/></svg>`
+        };
+
+        // --- CRYPTOGRAPHY HELPERS (AES-GCM 256-bit) ---
+        function bufToHex(buffer) {
+            return Array.from(new Uint8Array(buffer))
+                .map(b => b.toString(16).padStart(2, '0'))
+                .join('');
+        }
+
+        function hexToBuf(hexString) {
+            if (!hexString || hexString.length % 2 !== 0) return null;
+            const badBytes = new Uint8Array(hexString.length / 2);
+            for (let i = 0; i < badBytes.length; i++) {
+                badBytes[i] = parseInt(hexString.substr(i * 2, 2), 16);
+            }
+            return badBytes.buffer;
+        }
+
+        async function generateEncryptionKey() {
+            const key = await window.crypto.subtle.generateKey(
+                { name: "AES-GCM", length: 256 },
+                true,
+                ["encrypt", "decrypt"]
+            );
+            const rawKey = await window.crypto.subtle.exportKey("raw", key);
+            return { key, hex: bufToHex(rawKey) };
+        }
+
+        async function importKeyFromHex(hex) {
+            const buf = hexToBuf(hex);
+            if (!buf) return null;
+            try {
+                return await window.crypto.subtle.importKey(
+                    "raw",
+                    buf,
+                    { name: "AES-GCM" },
+                    false,
+                    ["encrypt", "decrypt"]
+                );
+            } catch (e) {
+                return null;
+            }
+        }
+
+        async function encryptData(arrayBuffer, key) {
+            const iv = window.crypto.getRandomValues(new Uint8Array(12));
+            const ciphertext = await window.crypto.subtle.encrypt(
+                { name: "AES-GCM", iv: iv },
+                key,
+                arrayBuffer
+            );
+            const encrypted = new Uint8Array(iv.length + ciphertext.byteLength);
+            encrypted.set(iv, 0);
+            encrypted.set(new Uint8Array(ciphertext), iv.length);
+            return encrypted.buffer;
+        }
+
+        async function decryptData(arrayBuffer, key) {
+            const data = new Uint8Array(arrayBuffer);
+            const iv = data.slice(0, 12);
+            const ciphertext = data.slice(12);
+            return await window.crypto.subtle.decrypt(
+                { name: "AES-GCM", iv: iv },
+                key,
+                ciphertext.buffer
+            );
+        }
+
+        // Navigation Routing
+        function showTab(viewId) {
+            document.querySelectorAll('.tab-content').forEach(view => {
+                view.classList.remove('active');
+            });
+            document.querySelectorAll('.nav-btn').forEach(btn => {
+                btn.classList.remove('active');
+            });
+            
+            document.getElementById(viewId).classList.add('active');
+            if (viewId === 'view-upload') navUpload.classList.add('active');
+            if (viewId === 'view-shares') {
+                navShares.classList.add('active');
+                loadSharesList();
+            }
+            if (viewId === 'view-profile') {
+                navProfile.classList.add('active');
+                loadUserProfileView();
+            }
+            if (viewId === 'view-admin') {
+                loadAdminStats();
+            }
+        }
+
+        navUpload.addEventListener('click', () => {
+            window.history.pushState({}, '', '/');
+            showTab('view-upload');
+        });
+
+        navShares.addEventListener('click', () => {
+            window.history.pushState({}, '', '/shares');
+            showTab('view-shares');
+        });
+
+        navProfile.addEventListener('click', () => {
+            window.history.pushState({}, '', '/profile');
+            showTab('view-profile');
+        });
+
+        logoLink.addEventListener('click', (e) => {
+            e.preventDefault();
+            window.history.pushState({}, '', '/');
+            showTab('view-upload');
+        });
+
+        // App Routing Handler
+        function handleRouting() {
+            const path = window.location.pathname;
+            const shareMatch = path.match(/^\/share\/([a-zA-Z0-9-]+)/);
+            
+            if (shareMatch) {
+                const uuid = shareMatch[1];
+                currentShareUUID = uuid;
+                currentFolderPath = [];
+                showTab('view-share-details');
+                loadShareDetails(uuid);
+            } else if (path === '/shares') {
+                const isLoggedIn = !!localStorage.getItem('dill_session_token');
+                if (isLoggedIn) {
+                    showTab('view-shares');
+                } else {
+                    window.history.replaceState({}, '', '/');
+                    showTab('view-upload');
+                }
+            } else if (path === '/profile') {
+                const isLoggedIn = !!localStorage.getItem('dill_session_token');
+                if (isLoggedIn) {
+                    showTab('view-profile');
+                } else {
+                    window.history.replaceState({}, '', '/');
+                    showTab('view-upload');
+                }
+            } else if (path === '/admin') {
+                showTab('view-admin');
+            } else {
+                showTab('view-upload');
+            }
+        }
+        window.addEventListener('popstate', handleRouting);
+
+        // Toast notification helper
+        function showToast(message, type = 'info') {
+            const toast = document.createElement('div');
+            toast.className = `toast ${type}`;
+            toast.textContent = message;
+            toastContainer.appendChild(toast);
+            setTimeout(() => {
+                toast.style.opacity = '0';
+                toast.style.transform = 'translateY(-20px)';
+                setTimeout(() => toast.remove(), 300);
+            }, 4000);
+        }
+
+        // File size formatter
+        function formatBytes(bytes, decimals = 2) {
+            if (bytes === 0) return '0 B';
+            const k = 1024;
+            const dm = decimals < 0 ? 0 : decimals;
+            const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+            const i = Math.floor(Math.log(bytes) / Math.log(k));
+            return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ' ' + sizes[i];
+        }
+
+        // --- UPLOAD PANEL ---
+        btnSelectFiles.addEventListener('click', (e) => {
+            e.stopPropagation();
+            fileSelect.click();
+        });
+
+        btnSelectFolder.addEventListener('click', (e) => {
+            e.stopPropagation();
+            folderSelect.click();
+        });
+
+        fileSelect.addEventListener('change', handleFileSelection);
+        folderSelect.addEventListener('change', handleFolderSelection);
+
+        // Recursive directory scanner for Drag and Drop
+        async function traverseDirectory(entry, path = "") {
+            if (entry.isFile) {
+                const file = await new Promise((resolve) => entry.file(resolve));
+                return [{ file, relativePath: path + file.name }];
+            } else if (entry.isDirectory) {
+                const reader = entry.createReader();
+                
+                const readAllEntries = async () => {
+                    let allEntries = [];
+                    let read = async () => {
+                        let results = await new Promise(resolve => reader.readEntries(resolve));
+                        if (results.length > 0) {
+                            allEntries = allEntries.concat(results);
+                            await read();
+                        }
+                    };
+                    await read();
+                    return allEntries;
+                };
+
+                const childEntries = await readAllEntries();
+                let files = [];
+                for (const childEntry of childEntries) {
+                    const childFiles = await traverseDirectory(childEntry, path + entry.name + "/");
+                    files = files.concat(childFiles);
+                }
+                return files;
+            }
+            return [];
+        }
+
+        // Drag and drop event handlers
+        dropZone.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            const isLoggedIn = !!localStorage.getItem('dill_session_token');
+            if (isLoggedIn) {
+                dropZone.classList.add('dragover');
+            }
+        });
+
+        dropZone.addEventListener('dragleave', () => {
+            dropZone.classList.remove('dragover');
+        });
+
+        // Clicking dropzone while logged out opens the auth modal
+        dropZone.addEventListener('click', () => {
+            const isLoggedIn = !!localStorage.getItem('dill_session_token');
+            if (!isLoggedIn) {
+                navAuthBtn.click();
+            }
+        });
+
+        dropZone.addEventListener('drop', async (e) => {
+            e.preventDefault();
+            dropZone.classList.remove('dragover');
+            
+            const isLoggedIn = !!localStorage.getItem('dill_session_token');
+            if (!isLoggedIn) {
+                showToast('Please sign in to upload files.', 'info');
+                navAuthBtn.click();
+                return;
+            }
+            
+            const items = e.dataTransfer.items;
+            if (!items) return;
+
+            let scannedFiles = [];
+            for (let i = 0; i < items.length; i++) {
+                const item = items[i];
+                if (item.kind === 'file') {
+                    const entry = item.webkitGetAsEntry();
+                    if (entry) {
+                        const files = await traverseDirectory(entry);
+                        scannedFiles = scannedFiles.concat(files);
+                    }
+                }
+            }
+
+            if (scannedFiles.length > 0) {
+                selectedFiles = selectedFiles.concat(scannedFiles);
+                updateSelectedFilesUI();
+            }
+        });
+
+        function handleFileSelection(e) {
+            const files = Array.from(e.target.files);
+            const formatted = files.map(file => ({ file, relativePath: file.name }));
+            selectedFiles = selectedFiles.concat(formatted);
+            updateSelectedFilesUI();
+            fileSelect.value = ''; // Reset
+        }
+
+        function handleFolderSelection(e) {
+            const files = Array.from(e.target.files);
+            const formatted = files.map(file => ({ 
+                file, 
+                relativePath: file.webkitRelativePath || file.name 
+            }));
+            selectedFiles = selectedFiles.concat(formatted);
+            updateSelectedFilesUI();
+            folderSelect.value = ''; // Reset
+        }
+
+        function getFileIcon(filename) {
+            const ext = filename.split('.').pop().toLowerCase();
+            if (['jpg', 'jpeg', 'png', 'gif', 'svg', 'webp', 'bmp'].includes(ext)) return ICONS.image;
+            if (['mp3', 'wav', 'ogg', 'aac', 'flac', 'm4a'].includes(ext)) return ICONS.audio;
+            if (['mp4', 'webm', 'ogg', 'avi', 'mov', 'mkv'].includes(ext)) return ICONS.video;
+            if (['pdf'].includes(ext)) return ICONS.pdf;
+            if (['txt', 'js', 'html', 'css', 'json', 'md', 'rs', 'py', 'go', 'ts', 'yaml', 'yml', 'toml'].includes(ext)) return ICONS.code;
+            return ICONS.file;
+        }
+
+        function updateSelectedFilesUI() {
+            if (selectedFiles.length === 0) {
+                preUploadCard.style.display = 'none';
+                return;
+            }
+
+            preUploadCard.style.display = 'flex';
+            selectedFilesList.innerHTML = '';
+            
+            let totalSize = 0;
+            selectedFiles.forEach((item, index) => {
+                totalSize += item.file.size;
+                
+                const row = document.createElement('div');
+                row.className = 'file-row';
+                row.innerHTML = `
+                    <div class="file-info">
+                        ${getFileIcon(item.relativePath)}
+                        <div style="min-width: 0;">
+                            <div class="file-name" title="${item.relativePath}">${item.relativePath}</div>
+                            <div class="file-meta">${formatBytes(item.file.size)}</div>
+                        </div>
+                    </div>
+                    <button class="remove-file-btn" data-index="${index}">
+                        <svg viewBox="0 0 24 24" style="width:1rem;height:1rem;fill:currentColor;"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+                    </button>
+                `;
+                selectedFilesList.appendChild(row);
+            });
+
+            filesCountLabel.textContent = `Selected Files (${selectedFiles.length})`;
+            totalSizeBadge.textContent = formatBytes(totalSize);
+
+            document.querySelectorAll('.remove-file-btn').forEach(btn => {
+                btn.addEventListener('click', (e) => {
+                    const index = parseInt(e.currentTarget.getAttribute('data-index'));
+                    selectedFiles.splice(index, 1);
+                    updateSelectedFilesUI();
+                });
+            });
+        }
+
+        btnClearFiles.addEventListener('click', () => {
+            selectedFiles = [];
+            updateSelectedFilesUI();
+        });
+
+        // Handle File Encryption & Upload Process
+        btnUpload.addEventListener('click', async () => {
+            if (selectedFiles.length === 0) return;
+
+            preUploadCard.style.display = 'none';
+            dropZone.style.pointerEvents = 'none';
+            dropZone.style.opacity = '0.5';
+            uploadProgressCard.style.display = 'flex';
+            
+            try {
+                // 1. Generate 256-bit AES-GCM key
+                showToast('Generating encryption key...', 'info');
+                const { key, hex: keyHex } = await generateEncryptionKey();
+
+                // 2. Encrypt file contents & build encrypted metadata
+                showToast('Encrypting files in browser...', 'info');
+                const formData = new FormData();
+                
+                const meta = {
+                    files: []
+                };
+
+                for (let i = 0; i < selectedFiles.length; i++) {
+                    const item = selectedFiles[i];
+                    progressEta.textContent = `Encrypting file ${i+1} of ${selectedFiles.length}...`;
+                    
+                    const fileBuf = await item.file.arrayBuffer();
+                    const encryptedBuf = await encryptData(fileBuf, key);
+                    
+                    const encBlob = new Blob([encryptedBuf], { type: 'application/octet-stream' });
+                    formData.append('files', encBlob, `file_${i}.enc`);
+                    
+                    meta.files.push({
+                        id: i.toString(),
+                        name: item.relativePath,
+                        size: item.file.size,
+                        type: item.file.type || 'application/octet-stream'
+                    });
+                }
+
+                // 3. Encrypt metadata manifest
+                const metaBuf = new TextEncoder().encode(JSON.stringify(meta));
+                const encryptedMetaBuf = await encryptData(metaBuf.buffer, key);
+                const metaBlob = new Blob([encryptedMetaBuf], { type: 'application/octet-stream' });
+                formData.append('files', metaBlob, 'metadata.enc');
+
+                // 4. Send encrypted payloads to server
+                const xhr = new XMLHttpRequest();
+                xhr.open('POST', '/api/upload', true);
+
+                const token = localStorage.getItem('dill_session_token');
+                if (token) {
+                    xhr.setRequestHeader('Authorization', `Bearer ${token}`);
+                }
+
+                let startTime = Date.now();
+
+                xhr.upload.onprogress = (e) => {
+                    if (e.lengthComputable) {
+                        const percent = Math.round((e.loaded / e.total) * 100);
+                        uploadProgressBar.style.width = `${percent}%`;
+                        progressPercentage.textContent = `${percent}%`;
+
+                        const elapsedTime = (Date.now() - startTime) / 1000;
+                        if (elapsedTime > 0) {
+                            const speedBytes = e.loaded / elapsedTime;
+                            progressSpeed.textContent = `${formatBytes(speedBytes)}/s`;
+
+                            const remainingBytes = e.total - e.loaded;
+                            const remainingTime = remainingBytes / speedBytes;
+                            if (remainingTime > 0) {
+                                const mins = Math.floor(remainingTime / 60);
+                                const secs = Math.floor(remainingTime % 60);
+                                progressEta.textContent = mins > 0 ? `ETA: ${mins}m ${secs}s` : `ETA: ${secs}s`;
+                            } else {
+                                progressEta.textContent = 'Finalizing upload...';
+                            }
+                        }
+                    }
+                };
+
+                xhr.onload = () => {
+                    uploadProgressCard.style.display = 'none';
+                    dropZone.style.pointerEvents = 'auto';
+                    dropZone.style.opacity = '1';
+                    
+                    if (xhr.status === 200) {
+                        const response = JSON.parse(xhr.responseText);
+                        showToast('Encrypted upload complete!', 'success');
+                        
+                        // Save share for this user
+                        const newShare = {
+                            uuid: response.uuid,
+                            key: keyHex,
+                            files_count: selectedFiles.length,
+                            total_size: selectedFiles.reduce((acc, f) => acc + f.file.size, 0)
+                        };
+
+                        const isLoggedIn = !!localStorage.getItem('dill_session_token');
+                        if (isLoggedIn) {
+                            // Save to account in S3
+                            progressEta.textContent = 'Syncing share to account...';
+                            fetchAccountShares().then(async (accountShares) => {
+                                accountShares.push(newShare);
+                                await saveAccountShares(accountShares);
+                            }).catch(() => {
+                                showToast('Failed to sync share to account', 'error');
+                            });
+                        } else {
+                            // Save to guest localStorage
+                            const myShares = JSON.parse(localStorage.getItem('my_shares') || '[]');
+                            myShares.push(newShare);
+                            localStorage.setItem('my_shares', JSON.stringify(myShares));
+                        }
+                        
+                        selectedFiles = []; // Reset selected files
+                        displayShareResult(response.uuid, keyHex);
+                    } else {
+                        showToast('Upload failed: ' + xhr.responseText, 'error');
+                        updateSelectedFilesUI();
+                    }
+                };
+
+                xhr.onerror = () => {
+                    uploadProgressCard.style.display = 'none';
+                    dropZone.style.pointerEvents = 'auto';
+                    dropZone.style.opacity = '1';
+                    showToast('Network error during upload.', 'error');
+                    updateSelectedFilesUI();
+                };
+
+                xhr.send(formData);
+
+            } catch (err) {
+                uploadProgressCard.style.display = 'none';
+                dropZone.style.pointerEvents = 'auto';
+                dropZone.style.opacity = '1';
+                showToast('Encryption failed: ' + err.message, 'error');
+                updateSelectedFilesUI();
+            }
+        });
+
+        function displayShareResult(uuid, keyHex) {
+            const origin = window.location.origin;
+            const shareUrl = `${origin}/share/${uuid}#${keyHex}`;
+            
+            shareLinkUrl.value = shareUrl;
+            btnViewCreatedShare.href = `/share/${uuid}#${keyHex}`;
+            
+            shareResultCard.style.display = 'flex';
+            
+            btnViewCreatedShare.onclick = (e) => {
+                e.preventDefault();
+                window.history.pushState({}, '', `/share/${uuid}#${keyHex}`);
+                handleRouting();
+            };
+        }
+
+        btnCopyLink.addEventListener('click', () => {
+            shareLinkUrl.select();
+            document.execCommand('copy');
+            showToast('E2EE share link copied to clipboard!', 'success');
+        });
+
+        btnNewUpload.addEventListener('click', () => {
+            shareResultCard.style.display = 'none';
+            selectedFiles = [];
+            updateSelectedFilesUI();
+        });
+
+
+        // --- ACTIVE SHARES PANEL (Private to browser localStorage or synced account) ---
+        async function loadSharesList() {
+            try {
+                let shares = [];
+                const isLoggedIn = !!localStorage.getItem('dill_session_token');
+                
+                if (isLoggedIn) {
+                    sharesListBody.innerHTML = `
+                        <tr>
+                            <td colspan="6" style="text-align:center;">
+                                <div class="loader" style="margin:1rem auto;"></div>
+                                <span style="font-size:0.85rem; color:var(--text-muted);">Fetching and decrypting synced account shares...</span>
+                            </td>
+                        </tr>
+                    `;
+                    shares = await fetchAccountShares();
+                } else {
+                    shares = JSON.parse(localStorage.getItem('my_shares') || '[]');
+                }
+                
+                sharesListBody.innerHTML = '';
+                
+                if (shares.length === 0) {
+                    sharesTable.style.display = 'none';
+                    sharesEmptyState.style.display = 'block';
+                    return;
+                }
+
+                sharesTable.style.display = 'table';
+                sharesEmptyState.style.display = 'none';
+
+                shares.forEach(share => {
+                    const row = document.createElement('tr');
+                    row.id = `share-row-${share.uuid}`;
+                    const origin = window.location.origin;
+                    const shareUrl = `${origin}/share/${share.uuid}#${share.key}`;
+                    
+                    row.innerHTML = `
+                        <td>
+                            <div class="share-id-cell">
+                                <span style="font-family:monospace; font-size:0.8rem; background:rgba(255,255,255,0.05); padding:0.2rem 0.4rem; border-radius:0.25rem;">
+                                    ${share.uuid.substring(0, 8)}...
+                                </span>
+                                <a href="/share/${share.uuid}#${share.key}" class="share-nav-link" data-uuid="${share.uuid}" data-key="${share.key}" style="color:var(--primary); text-decoration:none; font-weight:500;">
+                                    View Share
+                                </a>
+                            </div>
+                        </td>
+                        <td>${share.files_count} files</td>
+                        <td>${formatBytes(share.total_size)}</td>
+                        <td colspan="2" class="share-status-cell"><span style="color:var(--text-muted);">Verifying...</span></td>
+                        <td>
+                            <div class="share-actions">
+                                <button class="action-btn copy-btn" data-url="${shareUrl}" title="Copy Link">
+                                    <svg viewBox="0 0 24 24"><path d="M16 1H4c-1.1 0-2 .9-2 2v14h2V3h12V1zm3 4H8c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h11c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm0 16H8V7h11v14z"/></svg>
+                                </button>
+                                <button class="action-btn delete delete-btn" data-uuid="${share.uuid}" title="Delete Share">
+                                    <svg viewBox="0 0 24 24"><path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/></svg>
+                                </button>
+                            </div>
+                        </td>
+                    `;
+                    sharesListBody.appendChild(row);
+
+                    // Fetch state asynchronously to verify if it has expired
+                    fetch(`/api/share/${share.uuid}`)
+                        .then(async res => {
+                            const statusCell = row.querySelector('.share-status-cell');
+                            if (res.status === 404) {
+                                statusCell.outerHTML = `
+                                    <td><span style="color:var(--text-muted);">Unknown</span></td>
+                                    <td><span class="badge">Expired / Deleted</span></td>
+                                `;
+                                return;
+                            }
+                            if (!res.ok) throw new Error();
+                            
+                            const details = await res.json();
+                            const expiresAt = new Date(details.expires_at);
+                            const now = new Date();
+                            const diffTime = expiresAt - now;
+                            let expStr = 'Expired';
+                            if (diffTime > 0) {
+                                const diffDays = Math.floor(diffTime / (1000 * 60 * 60 * 24));
+                                const diffHrs = Math.floor((diffTime % (1000 * 60 * 60 * 24)) / (1000 * 60 * 60));
+                                expStr = `${diffDays}d ${diffHrs}h`;
+                            }
+
+                            statusCell.outerHTML = `
+                                <td>${new Date(details.upload_time).toLocaleDateString()}</td>
+                                <td>
+                                    <span class="badge ${diffTime > 0 ? 'success' : ''}">
+                                        ${expStr}
+                                    </span>
+                                </td>
+                            `;
+                        })
+                        .catch(() => {
+                            const statusCell = row.querySelector('.share-status-cell');
+                            if (statusCell) {
+                                statusCell.outerHTML = `<td colspan="2"><span style="color:var(--danger);">Unavailable</span></td>`;
+                            }
+                        });
+                });
+
+                document.querySelectorAll('.share-nav-link').forEach(link => {
+                    link.addEventListener('click', (e) => {
+                        e.preventDefault();
+                        const uuid = e.currentTarget.getAttribute('data-uuid');
+                        const key = e.currentTarget.getAttribute('data-key');
+                        window.history.pushState({}, '', `/share/${uuid}#${key}`);
+                        handleRouting();
+                    });
+                });
+
+                document.querySelectorAll('.copy-btn').forEach(btn => {
+                    btn.addEventListener('click', (e) => {
+                        const url = e.currentTarget.getAttribute('data-url');
+                        navigator.clipboard.writeText(url);
+                        showToast('Link copied to clipboard!', 'success');
+                    });
+                });
+
+                document.querySelectorAll('.delete-btn').forEach(btn => {
+                    btn.addEventListener('click', async (e) => {
+                        const uuid = e.currentTarget.getAttribute('data-uuid');
+                        if (confirm('Are you sure you want to delete this share and all its files?')) {
+                            try {
+                                const headers = {};
+                                const token = localStorage.getItem('dill_session_token');
+                                if (token) {
+                                    headers['Authorization'] = `Bearer ${token}`;
+                                }
+                                const delRes = await fetch(`/api/share/${uuid}`, { 
+                                    method: 'DELETE',
+                                    headers: headers
+                                });
+                                
+                                if (isLoggedIn) {
+                                    const accountShares = await fetchAccountShares();
+                                    const updated = accountShares.filter(s => s.uuid !== uuid);
+                                    await saveAccountShares(updated);
+                                } else {
+                                    const myShares = JSON.parse(localStorage.getItem('my_shares') || '[]');
+                                    const updated = myShares.filter(s => s.uuid !== uuid);
+                                    localStorage.setItem('my_shares', JSON.stringify(updated));
+                                }
+
+                                if (delRes.ok || delRes.status === 404) {
+                                    showToast('Share deleted successfully', 'success');
+                                } else {
+                                    showToast('Delete failed: ' + await delRes.text(), 'error');
+                                }
+                                loadSharesList();
+                            } catch (err) {
+                                showToast('Network error during delete', 'error');
+                            }
+                        }
+                    });
+                });
+
+            } catch (err) {
+                showToast('Failed to load active shares: ' + err.message, 'error');
+            }
+        }
+
+        btnRefreshShares.addEventListener('click', loadSharesList);
+
+
+        // --- SHARE VIEWER (PREVIEW & DECRYPTION MODE) ---
+        let countdownInterval = null;
+
+        async function loadShareDetails(uuid) {
+            try {
+                btnDownloadAll.style.display = 'none';
+                // Get key from hash fragment
+                const keyHex = window.location.hash.substring(1);
+                if (!keyHex) {
+                    explorerGrid.innerHTML = `
+                        <div class="empty-state" style="grid-column: 1/-1;">
+                            <svg viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-6h2v6zm0-8h-2V7h2v2z"/></svg>
+                            <h3>Decryption Key Missing</h3>
+                            <p>This share is encrypted. You need the complete link containing the decryption key to view these files.</p>
+                        </div>
+                    `;
+                    shareCountdown.style.display = 'none';
+                    return;
+                }
+
+                const key = await importKeyFromHex(keyHex);
+                if (!key) {
+                    explorerGrid.innerHTML = `
+                        <div class="empty-state" style="grid-column: 1/-1;">
+                            <svg viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-6h2v6zm0-8h-2V7h2v2z"/></svg>
+                            <h3>Invalid Key</h3>
+                            <p>The encryption key in the URL hash is invalid or corrupted.</p>
+                        </div>
+                    `;
+                    shareCountdown.style.display = 'none';
+                    return;
+                }
+
+                explorerGrid.innerHTML = `
+                    <div class="empty-state" style="grid-column: 1/-1;">
+                        <div class="loader" style="margin:0 auto 1rem auto;"></div>
+                        <p>Fetching and decrypting share directory manifest...</p>
+                    </div>
+                `;
+
+                // 1. Fetch S3 metadata details (upload_time, list of file keys)
+                const res = await fetch(`/api/share/${uuid}`);
+                if (!res.ok) {
+                    if (res.status === 404) {
+                        explorerGrid.innerHTML = `
+                            <div class="empty-state" style="grid-column: 1/-1;">
+                                <svg viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-6h2v6zm0-8h-2V7h2v2z"/></svg>
+                                <h3>Share Not Found</h3>
+                                <p>This share link does not exist or has expired.</p>
+                            </div>
+                        `;
+                        shareCountdown.style.display = 'none';
+                        return;
+                    }
+                    throw new Error(await res.text());
+                }
+
+                const rawDetails = await res.json();
+
+                // 2. Fetch and decrypt metadata.enc file contents
+                const metaRes = await fetch(`/api/share/${uuid}/file/metadata.enc`);
+                if (!metaRes.ok) throw new Error('Failed to download encrypted directory manifest.');
+                
+                const encryptedMetaBuf = await metaRes.arrayBuffer();
+                let decMeta;
+                try {
+                    const decryptedMetaBuf = await decryptData(encryptedMetaBuf, key);
+                    decMeta = JSON.parse(new TextDecoder().decode(decryptedMetaBuf));
+                } catch (e) {
+                    explorerGrid.innerHTML = `
+                        <div class="empty-state" style="grid-column: 1/-1;">
+                            <svg viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-6h2v6zm0-8h-2V7h2v2z"/></svg>
+                            <h3>Decryption Failed</h3>
+                            <p>The decryption key in the link is incorrect. Unable to decrypt folder metadata.</p>
+                        </div>
+                    `;
+                    shareCountdown.style.display = 'none';
+                    return;
+                }
+
+                // 3. Assemble decrypted share data
+                currentShareData = {
+                    uuid: uuid,
+                    upload_time: rawDetails.upload_time,
+                    expires_at: rawDetails.expires_at,
+                    files: decMeta.files // contains [{ id, name, size, type }]
+                };
+
+                // Setup countdown clock
+                shareCreatedDate.textContent = `Uploaded on: ${new Date(currentShareData.upload_time).toLocaleString()}`;
+                shareCountdown.style.display = 'inline-flex';
+
+                // Render owner badge if owner is present
+                const ownerBadge = document.getElementById('share-owner-badge');
+                const ownerPfpImg = document.getElementById('share-owner-pfp');
+                const ownerPfpPl = document.getElementById('share-owner-pfp-placeholder');
+                const ownerUsername = document.getElementById('share-owner-username');
+
+                if (rawDetails.owner) {
+                    ownerUsername.textContent = rawDetails.owner;
+                    ownerBadge.style.display = 'flex';
+                    if (rawDetails.owner_pfp) {
+                        ownerPfpImg.src = rawDetails.owner_pfp;
+                        ownerPfpImg.style.display = 'block';
+                        ownerPfpPl.style.display = 'none';
+                    } else {
+                        ownerPfpImg.style.display = 'none';
+                        ownerPfpPl.style.display = 'flex';
+                        ownerPfpPl.textContent = rawDetails.owner.substring(0, 1).toUpperCase();
+                    }
+                } else {
+                    ownerBadge.style.display = 'none';
+                }
+                btnDownloadAll.style.display = 'inline-flex';
+                
+                if (countdownInterval) clearInterval(countdownInterval);
+                const expiryTime = new Date(currentShareData.expires_at).getTime();
+                
+                const updateCountdown = () => {
+                    const now = new Date().getTime();
+                    const diff = expiryTime - now;
+                    if (diff <= 0) {
+                        shareCountdown.querySelector('span').textContent = 'Expired';
+                        clearInterval(countdownInterval);
+                        return;
+                    }
+
+                    const days = Math.floor(diff / (1000 * 60 * 60 * 24));
+                    const hours = Math.floor((diff % (1000 * 60 * 60 * 24)) / (1000 * 60 * 60));
+                    const mins = Math.floor((diff % (1000 * 60 * 60)) / (1000 * 60));
+                    const secs = Math.floor((diff % (1000 * 60)) / 1000);
+
+                    shareCountdown.querySelector('span').textContent = 
+                        `Expires in: ${days}d ${hours}h ${mins}m ${secs}s`;
+                };
+                
+                updateCountdown();
+                countdownInterval = setInterval(updateCountdown, 1000);
+
+                await renderShareExplorer();
+
+            } catch (err) {
+                showToast('Failed to load share: ' + err.message, 'error');
+            }
+        }
+
+        // Clear active thumbnail blobs to prevent memory leaks
+        function clearActiveThumbnails() {
+            if (window.activeThumbnails) {
+                window.activeThumbnails.forEach(url => URL.revokeObjectURL(url));
+                window.activeThumbnails = [];
+            }
+        }
+
+        // Load and decrypt media thumbnails (images and videos) in the background
+        async function loadThumbnail(file, key, isVideo = false) {
+            const iconDiv = document.getElementById(`icon-${file.id}`);
+            if (!iconDiv) return;
+
+            // Only auto-load thumbnails for files under 100MB to avoid high memory/bandwidth usage
+            if (file.size > 100 * 1024 * 1024) {
+                return;
+            }
+
+            const fileUrl = `/api/share/${currentShareUUID}/file/file_${file.id}.enc`;
+            try {
+                const res = await fetch(fileUrl);
+                if (!res.ok) return;
+
+                const encBuf = await res.arrayBuffer();
+                const decBuf = await decryptData(encBuf, key);
+                const blob = new Blob([decBuf], { type: file.type });
+                const localUrl = URL.createObjectURL(blob);
+
+                if (!window.activeThumbnails) window.activeThumbnails = [];
+                window.activeThumbnails.push(localUrl);
+
+                if (isVideo) {
+                    iconDiv.innerHTML = `
+                        <video src="${localUrl}" style="width:100%; height:100%; object-fit:cover; border-radius:4px;" 
+                            muted playsinline loop preload="auto" 
+                            onmouseenter="this.play().catch(e => {})" 
+                            onmouseleave="this.pause()">
+                        </video>
+                        <div style="position: absolute; bottom: 6px; right: 6px; background: rgba(0,0,0,0.65); color: #fff; padding: 2px 5px; border-radius: 3px; font-size: 0.6rem; font-weight: 700; pointer-events: none; letter-spacing: 0.5px; border: 1px solid rgba(255,255,255,0.1);">
+                            VIDEO
+                        </div>
+                    `;
+                } else {
+                    iconDiv.innerHTML = `<img src="${localUrl}" style="width:100%; height:100%; object-fit:cover; border-radius:4px;" alt="">`;
+                }
+            } catch (err) {
+                // Fail silently, leave the generic SVG icon
+            }
+        }
+
+        // Render directory view in frontend using decrypted files manifest
+        async function renderShareExplorer() {
+            if (!currentShareData) return;
+
+            clearActiveThumbnails();
+            explorerGrid.innerHTML = '';
+            
+            const files = currentShareData.files;
+            const dirs = new Set();
+            const currentLevelFiles = [];
+
+            const prefix = currentFolderPath.length > 0 ? currentFolderPath.join('/') + '/' : '';
+
+            files.forEach(file => {
+                if (file.name.startsWith(prefix)) {
+                    const relativePart = file.name.substring(prefix.length);
+                    const parts = relativePart.split('/');
+                    
+                    if (parts.length > 1) {
+                        dirs.add(parts[0]);
+                    } else if (parts[0]) {
+                        currentLevelFiles.push(file);
+                    }
+                }
+            });
+
+            renderBreadcrumbs();
+
+            // Import key for thumbnail decryption
+            const keyHex = window.location.hash.substring(1);
+            const key = await importKeyFromHex(keyHex);
+
+            // Render Directories
+            Array.from(dirs).sort().forEach(dirName => {
+                const card = document.createElement('div');
+                card.className = 'explorer-item';
+                card.innerHTML = `
+                    <div class="explorer-item-icon">${ICONS.folder}</div>
+                    <div class="explorer-item-name" title="${dirName}">${dirName}</div>
+                    <div class="explorer-item-size">Folder</div>
+                `;
+                card.addEventListener('click', () => {
+                    currentFolderPath.push(dirName);
+                    renderShareExplorer();
+                });
+                explorerGrid.appendChild(card);
+            });
+
+            // Render Files
+            currentLevelFiles.forEach(file => {
+                const card = document.createElement('div');
+                card.className = 'explorer-item';
+                const filename = file.name.split('/').pop();
+                const ext = filename.split('.').pop().toLowerCase();
+                const isImage = ['jpg', 'jpeg', 'png', 'gif', 'svg', 'webp', 'bmp'].includes(ext);
+                const isVideo = ['mp4', 'webm', 'ogg', 'avi', 'mov', 'mkv'].includes(ext);
+                
+                card.innerHTML = `
+                    <div class="explorer-item-icon" id="icon-${file.id}">${getFileIcon(filename)}</div>
+                    <div class="explorer-item-name" title="${filename}">${filename}</div>
+                    <div class="explorer-item-size">${formatBytes(file.size)}</div>
+                `;
+                
+                card.addEventListener('click', () => {
+                    openPreview(file);
+                });
+                
+                explorerGrid.appendChild(card);
+
+                if ((isImage || isVideo) && key) {
+                    loadThumbnail(file, key, isVideo);
+                }
+            });
+
+            if (dirs.size === 0 && currentLevelFiles.length === 0) {
+                explorerGrid.innerHTML = `
+                    <div class="empty-state" style="grid-column: 1/-1;">
+                        <svg viewBox="0 0 24 24"><path d="M20 6h-8l-2-2H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2zm-6 10H6v-2h8v2zm4-4H6v-2h12v2z"/></svg>
+                        <p>This directory is empty.</p>
+                    </div>
+                `;
+            }
+        }
+
+        function renderBreadcrumbs() {
+            folderBreadcrumbs.innerHTML = '';
+            
+            const root = document.createElement('span');
+            root.className = `breadcrumb-item ${currentFolderPath.length === 0 ? 'active' : ''}`;
+            root.textContent = 'Root';
+            root.addEventListener('click', () => {
+                currentFolderPath = [];
+                renderShareExplorer();
+            });
+            folderBreadcrumbs.appendChild(root);
+
+            currentFolderPath.forEach((folder, idx) => {
+                const sep = document.createTextNode(' / ');
+                folderBreadcrumbs.appendChild(sep);
+
+                const item = document.createElement('span');
+                item.className = `breadcrumb-item ${idx === currentFolderPath.length - 1 ? 'active' : ''}`;
+                item.textContent = folder;
+                item.addEventListener('click', () => {
+                    currentFolderPath = currentFolderPath.slice(0, idx + 1);
+                    renderShareExplorer();
+                });
+                folderBreadcrumbs.appendChild(item);
+            });
+        }
+
+        // --- FILE PREVIEW DRAWER (DECRYPT ON-THE-FLY) ---
+        async function openPreview(file) {
+            const filename = file.name.split('/').pop();
+            const ext = filename.split('.').pop().toLowerCase();
+
+            previewFilename.textContent = filename;
+            previewContentBox.innerHTML = `
+                <div class="empty-state">
+                    <div class="loader" style="margin:0 auto 1rem auto;"></div>
+                    <p>Downloading and decrypting file in your browser...</p>
+                </div>
+            `;
+            
+            btnPreviewDownload.style.opacity = '0.5';
+            btnPreviewDownload.style.pointerEvents = 'none';
+            previewModal.classList.add('active');
+
+            const keyHex = window.location.hash.substring(1);
+            const key = await importKeyFromHex(keyHex);
+            
+            const fileUrl = `/api/share/${currentShareUUID}/file/file_${file.id}.enc`;
+
+            // Download Click Handler (decrypted stream downloader)
+            btnPreviewDownload.onclick = async (e) => {
+                e.preventDefault();
+                try {
+                    showToast('Decrypting file contents for download...', 'info');
+                    const res = await fetch(fileUrl);
+                    if (!res.ok) throw new Error('File download failed');
+                    
+                    const encBuf = await res.arrayBuffer();
+                    const decBuf = await decryptData(encBuf, key);
+                    
+                    const blob = new Blob([decBuf], { type: file.type });
+                    const localUrl = URL.createObjectURL(blob);
+                    
+                    const a = document.createElement('a');
+                    a.href = localUrl;
+                    a.download = filename;
+                    document.body.appendChild(a);
+                    a.click();
+                    document.body.removeChild(a);
+                    
+                    setTimeout(() => URL.revokeObjectURL(localUrl), 15000);
+                    showToast('Download started successfully.', 'success');
+                } catch (err) {
+                    showToast('Download failed: ' + err.message, 'error');
+                }
+            };
+
+            try {
+                // Fetch encrypted block from S3
+                const res = await fetch(fileUrl);
+                if (!res.ok) throw new Error('File retrieval failed');
+
+                const encBuf = await res.arrayBuffer();
+                // Decrypt file bytes locally
+                const decBuf = await decryptData(encBuf, key);
+
+                const blob = new Blob([decBuf], { type: file.type });
+                const localUrl = URL.createObjectURL(blob);
+
+                previewContentBox.innerHTML = '';
+                btnPreviewDownload.style.opacity = '1';
+                btnPreviewDownload.style.pointerEvents = 'auto';
+
+                if (['jpg', 'jpeg', 'png', 'gif', 'svg', 'webp', 'bmp'].includes(ext)) {
+                    const img = document.createElement('img');
+                    img.className = 'preview-media';
+                    img.src = localUrl;
+                    img.alt = filename;
+                    // Revoke local blob URL after image loading to save client memory
+                    img.onload = () => URL.revokeObjectURL(localUrl);
+                    previewContentBox.appendChild(img);
+                } 
+                else if (['mp4', 'webm', 'ogg', 'mov', 'mkv'].includes(ext)) {
+                    const video = document.createElement('video');
+                    video.className = 'preview-media';
+                    video.src = localUrl;
+                    video.controls = true;
+                    video.autoplay = true;
+                    previewContentBox.appendChild(video);
+                } 
+                else if (['mp3', 'wav', 'ogg', 'aac', 'flac', 'm4a'].includes(ext)) {
+                    const wrapper = document.createElement('div');
+                    wrapper.className = 'audio-player-wrapper';
+                    
+                    const disc = document.createElement('div');
+                    disc.className = 'audio-disc';
+                    disc.innerHTML = `
+                        <svg viewBox="0 0 24 24" style="width:2rem;height:2rem;fill:white;">
+                            <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 14.5c-2.49 0-4.5-2.01-4.5-4.5S9.51 7.5 12 7.5s4.5 2.01 4.5 4.5-2.01 4.5-4.5 4.5zm0-5.5c-.55 0-1 .45-1 1s.45 1 1 1 1-.45 1-1-.45-1-1-1z"/>
+                        </svg>
+                    `;
+
+                    const audio = document.createElement('audio');
+                    audio.src = localUrl;
+                    audio.controls = true;
+                    
+                    audio.onplay = () => wrapper.classList.add('playing');
+                    audio.onpause = () => wrapper.classList.remove('playing');
+                    audio.onended = () => wrapper.classList.remove('playing');
+
+                    wrapper.appendChild(disc);
+                    wrapper.appendChild(audio);
+                    previewContentBox.appendChild(wrapper);
+                } 
+                else if (['txt', 'js', 'html', 'css', 'json', 'md', 'rs', 'py', 'go', 'ts', 'yaml', 'yml', 'toml'].includes(ext)) {
+                    const text = new TextDecoder().decode(decBuf);
+                    const codeBlock = document.createElement('pre');
+                    codeBlock.className = 'code-preview';
+                    codeBlock.textContent = text;
+                    previewContentBox.appendChild(codeBlock);
+                } 
+                else {
+                    const fallback = document.createElement('div');
+                    fallback.className = 'generic-file-preview';
+                    fallback.innerHTML = `
+                        <div style="font-size: 3rem; color: var(--text-muted);">
+                            ${getFileIcon(filename)}
+                        </div>
+                        <h4>Preview not available for this file type</h4>
+                        <p class="file-meta">Click "Download" to save the decrypted file</p>
+                        <p class="file-meta">Size: ${formatBytes(file.size)}</p>
+                    `;
+                    previewContentBox.appendChild(fallback);
+                }
+            } catch (err) {
+                previewContentBox.innerHTML = `
+                    <div style="color:var(--danger); text-align:center;">
+                        <svg viewBox="0 0 24 24" style="width:3rem;height:3rem;fill:currentColor;margin-bottom:1rem;"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-2h2v2zm0-4h-2V7h2v5z"/></svg>
+                        <h4>Decryption Error</h4>
+                        <p>${err.message}</p>
+                    </div>
+                `;
+            }
+        }
+
+        function closePreview() {
+            previewModal.classList.remove('active');
+            
+            const video = previewContentBox.querySelector('video');
+            if (video) {
+                video.pause();
+                URL.revokeObjectURL(video.src);
+            }
+            const audio = previewContentBox.querySelector('audio');
+            if (audio) {
+                audio.pause();
+                URL.revokeObjectURL(audio.src);
+            }
+            
+            previewContentBox.innerHTML = '';
+        }
+
+        btnClosePreview.addEventListener('click', closePreview);
+        btnPreviewCloseFooter.addEventListener('click', closePreview);
+        previewModal.addEventListener('click', (e) => {
+            if (e.target === previewModal) closePreview();
+        });
+
+        // Download all files in share decrypted inside a ZIP file
+        btnDownloadAll.addEventListener('click', async () => {
+            if (!currentShareData || !currentShareData.files || currentShareData.files.length === 0) return;
+
+            const keyHex = window.location.hash.substring(1);
+            const key = await importKeyFromHex(keyHex);
+            if (!key) {
+                showToast('Decryption key is missing or invalid', 'error');
+                return;
+            }
+
+            // Disable button and change text to loading state
+            btnDownloadAll.disabled = true;
+            btnDownloadAll.style.opacity = '0.6';
+            btnDownloadAll.style.pointerEvents = 'none';
+
+            const totalFiles = currentShareData.files.length;
+            showToast(`Preparing download of ${totalFiles} file(s)...`, 'info');
+
+            try {
+                const zip = new JSZip();
+
+                for (let i = 0; i < totalFiles; i++) {
+                    const file = currentShareData.files[i];
+                    btnDownloadAll.innerHTML = `
+                        <div class="loader" style="width:0.85rem; height:0.85rem; border-width:1px; margin-right:6px; display:inline-block; vertical-align:middle;"></div>
+                        Downloading ${i + 1}/${totalFiles}...
+                    `;
+
+                    const fileUrl = `/api/share/${currentShareUUID}/file/file_${file.id}.enc`;
+                    const res = await fetch(fileUrl);
+                    if (!res.ok) throw new Error(`Failed to fetch file: ${file.name}`);
+
+                    const encBuf = await res.arrayBuffer();
+                    const decBuf = await decryptData(encBuf, key);
+
+                    // Add the decrypted file back to zip preserving file paths (directories)
+                    zip.file(file.name, decBuf);
+                }
+
+                btnDownloadAll.innerHTML = `
+                    <div class="loader" style="width:0.85rem; height:0.85rem; border-width:1px; margin-right:6px; display:inline-block; vertical-align:middle;"></div>
+                    Generating ZIP...
+                `;
+
+                const zipBlob = await zip.generateAsync({ type: 'blob' }, (metadata) => {
+                    if (metadata.percent) {
+                        btnDownloadAll.innerHTML = `
+                            <div class="loader" style="width:0.85rem; height:0.85rem; border-width:1px; margin-right:6px; display:inline-block; vertical-align:middle;"></div>
+                            Zipping ${Math.round(metadata.percent)}%...
+                        `;
+                    }
+                });
+
+                // Trigger file download
+                const localUrl = URL.createObjectURL(zipBlob);
+                const a = document.createElement('a');
+                a.href = localUrl;
+                a.download = `dill-share-${currentShareUUID}.zip`;
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+
+                setTimeout(() => URL.revokeObjectURL(localUrl), 15000);
+                showToast('ZIP archive downloaded successfully!', 'success');
+
+            } catch (err) {
+                showToast('Download all failed: ' + err.message, 'error');
+            } finally {
+                // Restore button state
+                btnDownloadAll.disabled = false;
+                btnDownloadAll.style.opacity = '1';
+                btnDownloadAll.style.pointerEvents = 'auto';
+                btnDownloadAll.innerHTML = `
+                    <svg style="width: 1.1rem; height: 1.1rem; fill: currentColor;" viewBox="0 0 24 24">
+                        <path d="M19.35 10.04C18.67 6.59 15.64 4 12 4 9.11 4 6.6 5.64 5.35 8.04 2.34 8.36 0 10.91 0 14c0 3.31 2.69 6 6 6h13c2.76 0 5-2.24 5-5 0-2.64-2.05-4.78-4.65-4.96zM17 13l-5 5-5-5h3V9h4v4h3z"/>
+                    </svg>
+                    Download All (ZIP)
+                `;
+            }
+        });
+
+        // --- CRYPTOGRAPHY USER ACCOUNT HELPERS ---
+
+        async function deriveUserKeys(username, password) {
+            const encoder = new TextEncoder();
+            const passwordBuffer = encoder.encode(password);
+            const saltBuffer = encoder.encode(username.toLowerCase().trim());
+
+            const baseKey = await window.crypto.subtle.importKey(
+                "raw",
+                passwordBuffer,
+                "PBKDF2",
+                false,
+                ["deriveBits"]
+            );
+
+            const derivedBits = await window.crypto.subtle.deriveBits(
+                {
+                    name: "PBKDF2",
+                    salt: saltBuffer,
+                    iterations: 100000,
+                    hash: "SHA-256"
+                },
+                baseKey,
+                512 // 64 bytes
+            );
+
+            const authKeyBuf = derivedBits.slice(0, 32);
+            const encKeyBuf = derivedBits.slice(32, 64);
+
+            return {
+                authKeyHex: bufToHex(authKeyBuf),
+                encKeyBuf: encKeyBuf
+            };
+        }
+
+        async function fetchAccountShares() {
+            const token = localStorage.getItem('dill_session_token');
+            const encKeyHex = localStorage.getItem('dill_enc_key');
+            if (!token || !encKeyHex) return [];
+
+            try {
+                const res = await fetch('/api/user/shares', {
+                    headers: { 'Authorization': `Bearer ${token}` }
+                });
+                if (!res.ok) {
+                    if (res.status === 401) {
+                        logoutUser();
+                    }
+                    return [];
+                }
+
+                const data = await res.json();
+                if (!data.shares_enc) return [];
+
+                const key = await window.crypto.subtle.importKey(
+                    "raw",
+                    hexToBuf(encKeyHex),
+                    { name: "AES-GCM" },
+                    false,
+                    ["decrypt"]
+                );
+                const decBuf = await decryptData(hexToBuf(data.shares_enc), key);
+                return JSON.parse(new TextDecoder().decode(decBuf));
+            } catch (e) {
+                showToast('Failed to decrypt account shares', 'error');
+                return [];
+            }
+        }
+
+        async function saveAccountShares(shares) {
+            const token = localStorage.getItem('dill_session_token');
+            const encKeyHex = localStorage.getItem('dill_enc_key');
+            if (!token || !encKeyHex) return;
+
+            try {
+                const key = await window.crypto.subtle.importKey(
+                    "raw",
+                    hexToBuf(encKeyHex),
+                    { name: "AES-GCM" },
+                    false,
+                    ["encrypt"]
+                );
+                const rawData = new TextEncoder().encode(JSON.stringify(shares));
+                const encBuf = await encryptData(rawData.buffer, key);
+                const encHex = bufToHex(encBuf);
+
+                const res = await fetch('/api/user/shares', {
+                    method: 'POST',
+                    headers: {
+                        'Authorization': `Bearer ${token}`,
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({ shares_enc: encHex })
+                });
+                if (!res.ok) {
+                    throw new Error(await res.text());
+                }
+            } catch (e) {
+                showToast('Failed to sync shares: ' + e.message, 'error');
+            }
+        }
+
+        function updateHeaderAuthState() {
+            const token = localStorage.getItem('dill_session_token');
+            const username = localStorage.getItem('dill_username');
+            const authBtn = document.getElementById('nav-auth-btn');
+            const profileBadge = document.getElementById('user-profile-badge');
+            const headerUsername = document.getElementById('header-username');
+            const navLinks = document.getElementById('nav-links');
+            const headerPfpImg = document.getElementById('header-pfp');
+            const headerPfpPl = document.getElementById('header-pfp-placeholder');
+
+            if (token && username) {
+                authBtn.style.display = 'none';
+                profileBadge.style.display = 'flex';
+                headerUsername.textContent = username;
+                if (navLinks) navLinks.style.display = 'flex';
+
+                // Display profile picture
+                const storedPfp = localStorage.getItem('dill_pfp');
+                if (storedPfp) {
+                    headerPfpImg.src = storedPfp;
+                    headerPfpImg.style.display = 'block';
+                    headerPfpPl.style.display = 'none';
+                } else {
+                    headerPfpImg.style.display = 'none';
+                    headerPfpPl.style.display = 'flex';
+                    headerPfpPl.textContent = username.substring(0, 1).toUpperCase();
+
+                    // Fetch profile to check if there is a pfp in S3
+                    fetch('/api/user/profile', {
+                        headers: { 'Authorization': `Bearer ${token}` }
+                    }).then(res => {
+                        if (res.ok) return res.json();
+                    }).then(profile => {
+                        if (profile && profile.pfp) {
+                            localStorage.setItem('dill_pfp', profile.pfp);
+                            headerPfpImg.src = profile.pfp;
+                            headerPfpImg.style.display = 'block';
+                            headerPfpPl.style.display = 'none';
+                        }
+                    }).catch(() => {});
+                }
+            } else {
+                authBtn.style.display = 'block';
+                profileBadge.style.display = 'none';
+                if (navLinks) navLinks.style.display = 'none';
+            }
+            updateUploadBoxState();
+        }
+
+        // --- ACCOUNT AUTH LISTENERS ---
+
+        const authModal = document.getElementById('auth-modal');
+        const navAuthBtn = document.getElementById('nav-auth-btn');
+        const btnCloseAuth = document.getElementById('btn-close-auth');
+        const btnLogout = document.getElementById('btn-logout');
+        
+        const authForm = document.getElementById('auth-form');
+        const authUsernameInput = document.getElementById('auth-username');
+        const authPasswordInput = document.getElementById('auth-password');
+        const btnAuthSubmit = document.getElementById('btn-auth-submit');
+        const authModalTitle = document.getElementById('auth-modal-title');
+        const authToggleText = document.getElementById('auth-toggle-text');
+        const authToggleLink = document.getElementById('auth-toggle-link');
+
+        let isRegisterMode = false;
+
+        navAuthBtn.addEventListener('click', () => {
+            isRegisterMode = false;
+            authModalTitle.textContent = 'Sign In';
+            btnAuthSubmit.textContent = 'Sign In';
+            authToggleText.textContent = "Don't have an account?";
+            authToggleLink.textContent = 'Create Account';
+            authUsernameInput.value = '';
+            authPasswordInput.value = '';
+            authModal.classList.add('active');
+        });
+
+        btnCloseAuth.addEventListener('click', () => {
+            authModal.classList.remove('active');
+        });
+
+        authModal.addEventListener('click', (e) => {
+            if (e.target === authModal) authModal.classList.remove('active');
+        });
+
+        authToggleLink.addEventListener('click', (e) => {
+            e.preventDefault();
+            isRegisterMode = !isRegisterMode;
+            if (isRegisterMode) {
+                authModalTitle.textContent = 'Create Account';
+                btnAuthSubmit.textContent = 'Register';
+                authToggleText.textContent = 'Already have an account?';
+                authToggleLink.textContent = 'Sign In';
+            } else {
+                authModalTitle.textContent = 'Sign In';
+                btnAuthSubmit.textContent = 'Sign In';
+                authToggleText.textContent = "Don't have an account?";
+                authToggleLink.textContent = 'Create Account';
+            }
+        });
+
+        authForm.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const username = authUsernameInput.value.trim();
+            const password = authPasswordInput.value;
+
+            if (!username || !password) return;
+
+            btnAuthSubmit.disabled = true;
+            btnAuthSubmit.innerHTML = `<div class="loader" style="width:0.85rem; height:0.85rem; border-width:1px; margin:0 auto; display:inline-block; vertical-align:middle;"></div>`;
+
+            try {
+                const { authKeyHex, encKeyBuf } = await deriveUserKeys(username, password);
+
+                if (isRegisterMode) {
+                    const res = await fetch('/api/register', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ username, auth_key: authKeyHex })
+                    });
+
+                    if (res.ok) {
+                        showToast('Account created! Logging in...', 'success');
+                        isRegisterMode = false;
+                        await performLogin(username, authKeyHex, encKeyBuf);
+                    } else {
+                        throw new Error(await res.text());
+                    }
+                } else {
+                    await performLogin(username, authKeyHex, encKeyBuf);
+                }
+            } catch (err) {
+                showToast(err.message, 'error');
+            } finally {
+                btnAuthSubmit.disabled = false;
+                btnAuthSubmit.textContent = isRegisterMode ? 'Register' : 'Sign In';
+            }
+        });
+
+        async function performLogin(username, authKeyHex, encKeyBuf) {
+            const res = await fetch('/api/login', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ username, auth_key: authKeyHex })
+            });
+
+            if (!res.ok) {
+                throw new Error(await res.text());
+            }
+
+            const data = await res.json();
+            localStorage.setItem('dill_session_token', data.token);
+            localStorage.setItem('dill_username', username);
+            localStorage.setItem('dill_enc_key', bufToHex(encKeyBuf));
+            if (data.pfp) {
+                localStorage.setItem('dill_pfp', data.pfp);
+            } else {
+                localStorage.removeItem('dill_pfp');
+            }
+
+            showToast('Logged in successfully!', 'success');
+            authModal.classList.remove('active');
+            updateHeaderAuthState();
+
+            const activeTab = document.querySelector('.tab-content.active');
+            if (activeTab.id === 'view-shares') {
+                loadSharesList();
+            }
+        }
+
+        function logoutUser() {
+            localStorage.removeItem('dill_session_token');
+            localStorage.removeItem('dill_username');
+            localStorage.removeItem('dill_enc_key');
+            localStorage.removeItem('dill_pfp');
+            showToast('Logged out successfully.', 'info');
+            updateHeaderAuthState();
+            
+            const activeTab = document.querySelector('.tab-content.active');
+            if (activeTab.id === 'view-shares' || activeTab.id === 'view-admin' || activeTab.id === 'view-profile') {
+                window.history.pushState({}, '', '/');
+                showTab('view-upload');
+            }
+        }
+
+        btnLogout.addEventListener('click', logoutUser);
+
+        // --- USER PROFILE & SETTINGS CONTROLLER ---
+        const settingsPfpInput = document.getElementById('settings-pfp-input');
+        const settingsPfpPreview = document.getElementById('settings-pfp-preview');
+        const settingsPfpPlaceholder = document.getElementById('settings-pfp-placeholder');
+        const settingsPasswordForm = document.getElementById('settings-password-form');
+        const btnSettingsPasswordSubmit = document.getElementById('btn-settings-password-submit');
+        const btnDeleteAccount = document.getElementById('btn-delete-account');
+        const headerUsername = document.getElementById('header-username');
+
+        headerUsername.addEventListener('click', () => {
+            window.history.pushState({}, '', '/profile');
+            showTab('view-profile');
+        });
+
+        settingsPfpInput.addEventListener('change', (e) => {
+            const file = e.target.files[0];
+            if (!file) return;
+
+            if (file.size > 5 * 1024 * 1024) {
+                showToast('Please select an image smaller than 5MB.', 'error');
+                settingsPfpInput.value = '';
+                return;
+            }
+
+            const reader = new FileReader();
+            reader.onload = async () => {
+                const base64DataUrl = reader.result;
+                const token = localStorage.getItem('dill_session_token');
+                
+                try {
+                    const res = await fetch('/api/user/profile', {
+                        method: 'POST',
+                        headers: {
+                            'Authorization': `Bearer ${token}`,
+                            'Content-Type': 'application/json'
+                        },
+                        body: JSON.stringify({ pfp: base64DataUrl })
+                    });
+
+                    if (res.ok) {
+                        localStorage.setItem('dill_pfp', base64DataUrl);
+                        settingsPfpPreview.src = base64DataUrl;
+                        settingsPfpPreview.style.display = 'block';
+                        settingsPfpPlaceholder.style.display = 'none';
+                        showToast('Profile picture updated successfully!', 'success');
+                        updateHeaderAuthState();
+                    } else {
+                        showToast('Failed to save profile picture: ' + await res.text(), 'error');
+                    }
+                } catch (err) {
+                    showToast('Network error during upload', 'error');
+                }
+            };
+            reader.readAsDataURL(file);
+        });
+
+        settingsPasswordForm.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const currentPassword = document.getElementById('settings-current-password').value;
+            const newPassword = document.getElementById('settings-new-password').value;
+            const username = localStorage.getItem('dill_username');
+            const token = localStorage.getItem('dill_session_token');
+
+            if (!currentPassword || !newPassword || !username || !token) return;
+
+            btnSettingsPasswordSubmit.disabled = true;
+            btnSettingsPasswordSubmit.innerHTML = `<div class="loader" style="width:0.85rem; height:0.85rem; border-width:1px; margin:0 auto; display:inline-block; vertical-align:middle;"></div>`;
+
+            try {
+                // 1. Derive current and new keys client side
+                const currentKeys = await deriveUserKeys(username, currentPassword);
+                const newKeys = await deriveUserKeys(username, newPassword);
+
+                // 2. Fetch and decrypt all account shares using current key
+                const currentShares = await fetchAccountShares();
+
+                // 3. Re-encrypt all account shares using new key
+                const rawData = new TextEncoder().encode(JSON.stringify(currentShares));
+                const newKey = await window.crypto.subtle.importKey(
+                    "raw",
+                    newKeys.encKeyBuf,
+                    { name: "AES-GCM" },
+                    false,
+                    ["encrypt"]
+                );
+                const encBuf = await encryptData(rawData.buffer, newKey);
+                const encHex = bufToHex(encBuf);
+
+                // 4. Send to backend
+                const res = await fetch('/api/user/change_password', {
+                    method: 'POST',
+                    headers: {
+                        'Authorization': `Bearer ${token}`,
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        current_auth_key: currentKeys.authKeyHex,
+                        new_auth_key: newKeys.authKeyHex,
+                        new_shares_enc: encHex
+                    })
+                });
+
+                if (res.ok) {
+                    localStorage.setItem('dill_enc_key', bufToHex(newKeys.encKeyBuf));
+                    showToast('Password changed successfully!', 'success');
+                    settingsPasswordForm.reset();
+                } else {
+                    showToast('Failed to change password: ' + await res.text(), 'error');
+                }
+            } catch (err) {
+                showToast(err.message, 'error');
+            } finally {
+                btnSettingsPasswordSubmit.disabled = false;
+                btnSettingsPasswordSubmit.textContent = 'Update Password';
+            }
+        });
+
+        btnDeleteAccount.addEventListener('click', async () => {
+            const token = localStorage.getItem('dill_session_token');
+            if (!token) return;
+
+            if (confirm("CRITICAL WARNING: Are you sure you want to permanently delete your account?\nThis will delete your user profile and ALL S3 files uploaded under your shares. This action cannot be undone.")) {
+                btnDeleteAccount.disabled = true;
+                btnDeleteAccount.textContent = 'Deleting Account...';
+
+                try {
+                    const res = await fetch('/api/user/account', {
+                        method: 'DELETE',
+                        headers: { 'Authorization': `Bearer ${token}` }
+                    });
+
+                    if (res.ok) {
+                        showToast('Your account and all shares have been permanently deleted.', 'success');
+                        logoutUser();
+                    } else {
+                        showToast('Failed to delete account: ' + await res.text(), 'error');
+                    }
+                } catch (err) {
+                    showToast('Network error during account deletion', 'error');
+                } finally {
+                    btnDeleteAccount.disabled = false;
+                    btnDeleteAccount.textContent = 'Permanently Delete Account';
+                }
+            }
+        });
+
+        function loadUserProfileView() {
+            const token = localStorage.getItem('dill_session_token');
+            const username = localStorage.getItem('dill_username');
+            if (!token || !username) {
+                window.history.replaceState({}, '', '/');
+                showTab('view-upload');
+                return;
+            }
+
+            document.getElementById('profile-username-title').textContent = username;
+            
+            const currentPfp = localStorage.getItem('dill_pfp');
+            const settingsPfpPreview = document.getElementById('settings-pfp-preview');
+            const settingsPfpPlaceholder = document.getElementById('settings-pfp-placeholder');
+            
+            if (currentPfp) {
+                settingsPfpPreview.src = currentPfp;
+                settingsPfpPreview.style.display = 'block';
+                settingsPfpPlaceholder.style.display = 'none';
+            } else {
+                settingsPfpPreview.style.display = 'none';
+                settingsPfpPlaceholder.style.display = 'flex';
+                settingsPfpPlaceholder.textContent = username.substring(0, 1).toUpperCase();
+            }
+        }
+
+        function updateUploadBoxState() {
+            const isLoggedIn = !!localStorage.getItem('dill_session_token');
+            const uploadBtnGroup = document.getElementById('upload-box-btn-group');
+            const authPrompt = document.getElementById('upload-box-auth-prompt');
+            const uploadTitle = document.getElementById('upload-box-title');
+            const uploadDesc = document.getElementById('upload-box-desc');
+            const dropZoneCard = document.getElementById('drop-zone');
+
+            if (isLoggedIn) {
+                uploadBtnGroup.style.display = 'flex';
+                authPrompt.style.display = 'none';
+                uploadTitle.textContent = 'Drag & Drop Files or Folders';
+                uploadDesc.textContent = 'Files are uploaded securely and self-delete after 90 days.';
+                uploadDesc.style.color = '';
+                uploadDesc.style.fontWeight = '';
+                dropZoneCard.style.cursor = 'pointer';
+            } else {
+                uploadBtnGroup.style.display = 'none';
+                authPrompt.style.display = 'flex';
+                uploadTitle.textContent = 'Account Required';
+                uploadDesc.textContent = 'Please sign in or create an account to start sharing files.';
+                uploadDesc.style.color = 'var(--text-muted)';
+                dropZoneCard.style.cursor = 'pointer';
+            }
+        }
+
+        btnAuthPromptSignin.addEventListener('click', (e) => {
+            e.stopPropagation();
+            navAuthBtn.click();
+        });
+
+        // --- ADMIN PANEL CONTROLLER ---
+
+        btnRefreshAdmin.addEventListener('click', loadAdminStats);
+        
+        const btnLogoutAdmin = document.getElementById('btn-logout-admin');
+        if (btnLogoutAdmin) {
+            btnLogoutAdmin.addEventListener('click', () => {
+                localStorage.removeItem('dill_admin_token');
+                if (window.location.search.includes('token=')) {
+                    window.history.replaceState({}, '', '/admin');
+                }
+                showToast('Logged out of Admin Panel', 'success');
+                loadAdminStats();
+            });
+        }
+        
+        const adminTokenForm = document.getElementById('admin-token-form');
+        if (adminTokenForm) {
+            adminTokenForm.addEventListener('submit', (e) => {
+                e.preventDefault();
+                const tokenInput = document.getElementById('admin-token-input').value.trim();
+                if (tokenInput) {
+                    localStorage.setItem('dill_admin_token', tokenInput);
+                    loadAdminStats();
+                }
+            });
+        }
+
+        async function loadAdminStats() {
+            const params = new URLSearchParams(window.location.search);
+            let token = params.get('token');
+            if (!token) {
+                token = localStorage.getItem('dill_admin_token');
+            }
+            const dashboard = document.getElementById('admin-dashboard');
+            const tokenReq = document.getElementById('admin-token-required');
+            const usersBody = document.getElementById('admin-users-list-body');
+            const btnLogoutAdmin = document.getElementById('btn-logout-admin');
+            const adminLoading = document.getElementById('admin-loading');
+
+            if (!token) {
+                dashboard.style.display = 'none';
+                tokenReq.style.display = 'block';
+                if (adminLoading) adminLoading.style.display = 'none';
+                if (btnLogoutAdmin) btnLogoutAdmin.style.display = 'none';
+                if (btnRefreshAdmin) btnRefreshAdmin.style.display = 'none';
+                return;
+            }
+
+            // Keep dashboard/buttons hidden during validation
+            dashboard.style.display = 'none';
+            tokenReq.style.display = 'none';
+            if (adminLoading) adminLoading.style.display = 'block';
+            if (btnLogoutAdmin) btnLogoutAdmin.style.display = 'none';
+            if (btnRefreshAdmin) btnRefreshAdmin.style.display = 'none';
+            usersBody.innerHTML = '';
+
+            try {
+                const res = await fetch('/api/admin/stats', {
+                    headers: { 'Authorization': `Bearer ${token}` }
+                });
+
+                if (!res.ok) {
+                    if (res.status === 403 || res.status === 401) {
+                        localStorage.removeItem('dill_admin_token');
+                        if (window.location.search.includes('token=')) {
+                            window.history.replaceState({}, '', '/admin');
+                        }
+                        dashboard.style.display = 'none';
+                        if (adminLoading) adminLoading.style.display = 'none';
+                        tokenReq.style.display = 'block';
+                        if (btnLogoutAdmin) btnLogoutAdmin.style.display = 'none';
+                        if (btnRefreshAdmin) btnRefreshAdmin.style.display = 'none';
+                        showToast('Admin panel is disabled or invalid token', 'error');
+                        return;
+                    }
+                    throw new Error(await res.text());
+                }
+
+                const stats = await res.json();
+                
+                // Hide loading and show dashboard now that validation succeeded
+                if (adminLoading) adminLoading.style.display = 'none';
+                dashboard.style.display = 'block';
+                tokenReq.style.display = 'none';
+                if (btnLogoutAdmin) btnLogoutAdmin.style.display = 'inline-flex';
+                if (btnRefreshAdmin) btnRefreshAdmin.style.display = 'inline-flex';
+
+                usersBody.innerHTML = '';
+
+                if (stats.length === 0) {
+                    usersBody.innerHTML = `<tr><td colspan="4" style="text-align:center; color:var(--text-muted); padding:2rem;">No user accounts found.</td></tr>`;
+                    return;
+                }
+
+                stats.forEach(u => {
+                    const row = document.createElement('tr');
+                    row.innerHTML = `
+                        <td>
+                            <span style="font-family:monospace; font-weight:600; color:var(--primary);">${u.username}</span>
+                        </td>
+                        <td>${u.shares.length} shares</td>
+                        <td>${formatBytes(u.total_size)}</td>
+                        <td>
+                            <div class="share-actions">
+                                <button class="action-btn toggle-shares-btn" data-username="${u.username}" style="padding: 0.35rem 0.6rem; font-size:0.75rem; font-weight:600; color:var(--primary);">
+                                    View Shares
+                                </button>
+                                <button class="action-btn delete delete-user-btn" data-username="${u.username}" style="padding: 0.35rem 0.6rem; font-size:0.75rem; font-weight:600;">
+                                    Delete User
+                                </button>
+                            </div>
+                        </td>
+                    `;
+                    usersBody.appendChild(row);
+
+                    // Add nested shares sub-row (initially hidden)
+                    const subRow = document.createElement('tr');
+                    subRow.id = `shares-subrow-${u.username}`;
+                    subRow.style.display = 'none';
+                    
+                    let sharesListHTML = '';
+                    if (u.shares.length === 0) {
+                        sharesListHTML = `<div style="color:var(--text-muted); padding:0.5rem 1rem; font-size:0.8rem;">No active shares.</div>`;
+                    } else {
+                        sharesListHTML = `
+                            <table style="width:100%; border:1px solid var(--surface-border); background:rgba(0,0,0,0.1); border-radius:4px; margin-top:0.5rem;">
+                                <thead>
+                                    <tr>
+                                        <th style="padding:0.5rem; font-size:0.75rem; width:40%;">Share UUID</th>
+                                        <th style="padding:0.5rem; font-size:0.75rem;">Files Count</th>
+                                        <th style="padding:0.5rem; font-size:0.75rem;">Total Size</th>
+                                        <th style="padding:0.5rem; font-size:0.75rem;">Created</th>
+                                        <th style="padding:0.5rem; font-size:0.75rem; text-align:right;">Actions</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    ${u.shares.map(s => `
+                                        <tr>
+                                            <td style="padding:0.5rem; font-size:0.75rem; font-family:monospace; color:var(--text-muted);">${s.uuid}</td>
+                                            <td style="padding:0.5rem; font-size:0.75rem;">${s.files_count}</td>
+                                            <td style="padding:0.5rem; font-size:0.75rem;">${formatBytes(s.total_size)}</td>
+                                            <td style="padding:0.5rem; font-size:0.75rem;">${new Date(s.created_at).toLocaleDateString()}</td>
+                                            <td style="padding:0.5rem; font-size:0.75rem; text-align:right;">
+                                                <button class="action-btn delete delete-share-btn" data-uuid="${s.uuid}" style="padding: 0.2rem 0.4rem; font-size:0.7rem; font-weight:600; display:inline-flex;">
+                                                    Delete
+                                                </button>
+                                            </td>
+                                        </tr>
+                                    `).join('')}
+                                </tbody>
+                            </table>
+                        `;
+                    }
+
+                    subRow.innerHTML = `
+                        <td colspan="4" style="background: rgba(255, 255, 255, 0.005); padding: 0.5rem 1rem 1rem 1rem;">
+                            <div style="border-left: 2px solid var(--primary); padding-left: 1rem;">
+                                <h4 style="font-size:0.8rem; margin-bottom:0.25rem;">Active Shares for ${u.username}</h4>
+                                ${sharesListHTML}
+                            </div>
+                        </td>
+                    `;
+                    usersBody.appendChild(subRow);
+                });
+
+                // Toggle share list sub-row display
+                document.querySelectorAll('.toggle-shares-btn').forEach(btn => {
+                    btn.addEventListener('click', (e) => {
+                        const username = e.currentTarget.getAttribute('data-username');
+                        const subRow = document.getElementById(`shares-subrow-${username}`);
+                        if (subRow.style.display === 'none') {
+                            subRow.style.display = 'table-row';
+                            e.currentTarget.textContent = 'Hide Shares';
+                        } else {
+                            subRow.style.display = 'none';
+                            e.currentTarget.textContent = 'View Shares';
+                        }
+                    });
+                });
+
+                // Delete specific share (Admin)
+                document.querySelectorAll('.delete-share-btn').forEach(btn => {
+                    btn.addEventListener('click', async (e) => {
+                        const uuid = e.currentTarget.getAttribute('data-uuid');
+                        if (confirm(`Are you sure you want to delete share ${uuid} and all its files?`)) {
+                            try {
+                                const res = await fetch(`/api/admin/share/${uuid}`, {
+                                    method: 'DELETE',
+                                    headers: { 'Authorization': `Bearer ${token}` }
+                                });
+                                 if (res.ok) {
+                                    showToast('Share deleted successfully', 'success');
+                                    loadAdminStats();
+                                } else {
+                                    if (res.status === 401 || res.status === 403) {
+                                        loadAdminStats();
+                                    }
+                                    showToast('Delete failed: ' + await res.text(), 'error');
+                                }
+                            } catch (err) {
+                                showToast('Network error during deletion', 'error');
+                            }
+                        }
+                    });
+                });
+
+                // Delete specific user (Admin)
+                document.querySelectorAll('.delete-user-btn').forEach(btn => {
+                    btn.addEventListener('click', async (e) => {
+                        const username = e.currentTarget.getAttribute('data-username');
+                        if (confirm(`CRITICAL WARNING: Are you sure you want to delete user "${username}"?\nThis will permanently delete their account profile AND all S3 files associated with their shares.`)) {
+                            try {
+                                const res = await fetch(`/api/admin/user/${username}`, {
+                                    method: 'DELETE',
+                                    headers: { 'Authorization': `Bearer ${token}` }
+                                });
+                                 if (res.ok) {
+                                    showToast(`User ${username} deleted successfully`, 'success');
+                                    loadAdminStats();
+                                } else {
+                                    if (res.status === 401 || res.status === 403) {
+                                        loadAdminStats();
+                                    }
+                                    showToast('Delete failed: ' + await res.text(), 'error');
+                                }
+                            } catch (err) {
+                                showToast('Network error during deletion', 'error');
+                            }
+                        }
+                    });
+                });
+
+            } catch (err) {
+                if (adminLoading) adminLoading.style.display = 'none';
+                dashboard.style.display = 'block';
+                showToast(err.message, 'error');
+                usersBody.innerHTML = `<tr><td colspan="4" style="text-align:center; color:var(--danger); padding:2rem;">Error: ${err.message}</td></tr>`;
+            }
+        }
+
+        // Initialize Auth view
+        updateHeaderAuthState();
+
+        // Initialize Router
+        handleRouting();
+    </script>
+</body>
+</html>
