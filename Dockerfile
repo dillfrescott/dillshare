@@ -10,7 +10,7 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /usr/src/s3-share
 
 # Copy Cargo configuration files
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml ./
 
 # Create a dummy project to build dependencies first (helps caching layers)
 RUN mkdir src && echo "fn main() {}" > src/main.rs
