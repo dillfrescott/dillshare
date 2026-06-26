@@ -112,6 +112,9 @@ async fn main() {
         .route("/api/user/sessions", get(get_user_sessions))
         .route("/api/user/sessions/:id", delete(revoke_user_session))
         // Admin routes
+        .route("/api/admin/login", post(admin_login))
+        .route("/api/admin/sessions", get(admin_get_sessions))
+        .route("/api/admin/sessions/:id", delete(admin_revoke_session))
         .route("/api/admin/stats", get(admin_get_stats))
         .route("/api/admin/share/:uuid", delete(admin_delete_share))
         .route("/api/admin/user/:username", delete(admin_delete_user))
@@ -915,7 +918,7 @@ async fn admin_get_stats(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    verify_admin(&headers)?;
+    verify_admin(&headers, &state).await?;
 
     let mut response = state.s3_client
         .list_objects_v2()
@@ -980,7 +983,7 @@ async fn admin_delete_share(
     headers: axum::http::HeaderMap,
     Path(uuid): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    verify_admin(&headers)?;
+    verify_admin(&headers, &state).await?;
 
     let owner_key = format!("uploads/{}/owner.txt", uuid);
     let owner_res = state.s3_client.get_object()
@@ -1035,7 +1038,7 @@ async fn admin_delete_user(
     headers: axum::http::HeaderMap,
     Path(username): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    verify_admin(&headers)?;
+    verify_admin(&headers, &state).await?;
 
     let username = username.trim();
     if username.is_empty() {
@@ -1070,7 +1073,40 @@ async fn admin_delete_user(
     Ok(StatusCode::OK)
 }
 
-fn verify_admin(headers: &axum::http::HeaderMap) -> Result<(), (StatusCode, String)> {
+async fn verify_admin_session(token: &str, state: &AppState) -> bool {
+    let (username, _expiry, session_id) = match verify_token_signature(token, &state.jwt_secret) {
+        Some(val) => val,
+        None => return false,
+    };
+    
+    if username != "admin" {
+        return false;
+    }
+    
+    let sessions_key = "admin/sessions.json";
+    let res = state.s3_client.get_object()
+        .bucket(&state.bucket)
+        .key(sessions_key)
+        .send()
+        .await;
+        
+    match res {
+        Ok(output) => {
+            if let Ok(bytes) = output.body.collect().await {
+                let sessions: Vec<UserSession> = match serde_json::from_slice(&bytes.into_bytes()) {
+                    Ok(s) => s,
+                    Err(_) => return false,
+                };
+                sessions.iter().any(|s| s.id == session_id)
+            } else {
+                false
+            }
+        }
+        Err(_) => false,
+    }
+}
+
+async fn verify_admin(headers: &axum::http::HeaderMap, state: &AppState) -> Result<(), (StatusCode, String)> {
     let admin_token_env = std::env::var("ADMIN_TOKEN")
         .map_err(|_| (StatusCode::FORBIDDEN, "Admin panel is disabled".to_string()))?;
     
@@ -1085,11 +1121,15 @@ fn verify_admin(headers: &axum::http::HeaderMap) -> Result<(), (StatusCode, Stri
     }
 
     let token = &auth_str[7..];
-    if token != admin_token_env {
-        return Err((StatusCode::FORBIDDEN, "Invalid admin token".to_string()));
+    if token == admin_token_env {
+        return Ok(());
     }
 
-    Ok(())
+    if verify_admin_session(token, state).await {
+        return Ok(());
+    }
+
+    Err((StatusCode::FORBIDDEN, "Invalid admin token".to_string()))
 }
 
 async fn delete_share_objects(s3_client: &aws_sdk_s3::Client, bucket: &str, uuid: &str) -> Result<(), (StatusCode, String)> {
@@ -1500,7 +1540,7 @@ async fn admin_get_user_sessions(
     Path(username): Path<String>,
     headers: axum::http::HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    verify_admin(&headers)?;
+    verify_admin(&headers, &state).await?;
 
     let sessions_key = format!("users/{}/sessions.json", username);
     let sessions: Vec<UserSession> = match state.s3_client.get_object()
@@ -1543,7 +1583,7 @@ async fn admin_revoke_user_session(
     Path((username, session_id)): Path<(String, String)>,
     headers: axum::http::HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    verify_admin(&headers)?;
+    verify_admin(&headers, &state).await?;
 
     let sessions_key = format!("users/{}/sessions.json", username);
     let mut sessions: Vec<UserSession> = match state.s3_client.get_object()
@@ -1572,6 +1612,181 @@ async fn admin_revoke_user_session(
         state.s3_client.put_object()
             .bucket(&state.bucket)
             .key(&sessions_key)
+            .content_type("application/json")
+            .body(aws_sdk_s3::primitives::ByteStream::from(session_bytes))
+            .send()
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to update sessions: {:?}", e)))?;
+    }
+
+    Ok(StatusCode::OK)
+}
+
+async fn admin_login(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let admin_token_env = std::env::var("ADMIN_TOKEN")
+        .map_err(|_| (StatusCode::FORBIDDEN, "Admin panel is disabled".to_string()))?;
+        
+    let auth_header = headers.get(axum::http::header::AUTHORIZATION)
+        .ok_or_else(|| (StatusCode::UNAUTHORIZED, "Authorization header missing".to_string()))?;
+    
+    let auth_str = auth_header.to_str()
+        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid authorization characters".to_string()))?;
+
+    if !auth_str.starts_with("Bearer ") {
+        return Err((StatusCode::UNAUTHORIZED, "Authorization scheme must be Bearer".to_string()));
+    }
+
+    let token = &auth_str[7..];
+    if token != admin_token_env {
+        return Err((StatusCode::FORBIDDEN, "Invalid admin token".to_string()));
+    }
+    
+    let expiry = chrono::Utc::now().timestamp() + 30 * 24 * 60 * 60; // 30 days
+    let session_id = uuid::Uuid::new_v4().to_string();
+    let session_token = generate_token("admin", &state.jwt_secret, expiry, &session_id);
+    
+    let ip = headers.get("x-forwarded-for")
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("Unknown")
+        .to_string();
+    let user_agent = headers.get(axum::http::header::USER_AGENT)
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("Unknown")
+        .to_string();
+        
+    let new_session = UserSession {
+        id: session_id,
+        created_at: chrono::Utc::now().timestamp(),
+        user_agent,
+        ip,
+        expires_at: expiry,
+    };
+    
+    let sessions_key = "admin/sessions.json";
+    let mut sessions: Vec<UserSession> = match state.s3_client.get_object()
+        .bucket(&state.bucket)
+        .key(sessions_key)
+        .send()
+        .await
+    {
+        Ok(output) => {
+            if let Ok(bytes) = output.body.collect().await {
+                serde_json::from_slice(&bytes.into_bytes()).unwrap_or_default()
+            } else {
+                Vec::new()
+            }
+        }
+        Err(_) => Vec::new(),
+    };
+    
+    let now = chrono::Utc::now().timestamp();
+    sessions.retain(|s| s.expires_at > now);
+    sessions.push(new_session);
+    
+    if let Ok(session_bytes) = serde_json::to_vec(&sessions) {
+        state.s3_client.put_object()
+            .bucket(&state.bucket)
+            .key(sessions_key)
+            .content_type("application/json")
+            .body(aws_sdk_s3::primitives::ByteStream::from(session_bytes))
+            .send()
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to save admin session: {:?}", e)))?;
+    }
+    
+    Ok(axum::Json(serde_json::json!({ "token": session_token })))
+}
+
+async fn admin_get_sessions(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    verify_admin(&headers, &state).await?;
+
+    let sessions_key = "admin/sessions.json";
+    let sessions: Vec<UserSession> = match state.s3_client.get_object()
+        .bucket(&state.bucket)
+        .key(sessions_key)
+        .send()
+        .await
+    {
+        Ok(output) => {
+            if let Ok(bytes) = output.body.collect().await {
+                serde_json::from_slice(&bytes.into_bytes()).unwrap_or_default()
+            } else {
+                Vec::new()
+            }
+        }
+        Err(_) => Vec::new(),
+    };
+
+    let now = chrono::Utc::now().timestamp();
+    let mut response_sessions = Vec::new();
+
+    let current_session_id = if let Some(auth_header) = headers.get(axum::http::header::AUTHORIZATION) {
+        if let Ok(auth_str) = auth_header.to_str() {
+            if auth_str.starts_with("Bearer ") {
+                let token = &auth_str[7..];
+                verify_token_signature(token, &state.jwt_secret)
+                    .map(|(_, _, session_id)| session_id)
+            } else { None }
+        } else { None }
+    } else { None };
+
+    for s in sessions {
+        if s.expires_at > now {
+            let is_current = current_session_id.as_ref() == Some(&s.id);
+            response_sessions.push(serde_json::json!({
+                "id": s.id,
+                "created_at": s.created_at,
+                "user_agent": s.user_agent,
+                "ip": s.ip,
+                "expires_at": s.expires_at,
+                "is_current": is_current,
+            }));
+        }
+    }
+
+    Ok(axum::Json(response_sessions))
+}
+
+async fn admin_revoke_session(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    headers: axum::http::HeaderMap,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    verify_admin(&headers, &state).await?;
+
+    let sessions_key = "admin/sessions.json";
+    let mut sessions: Vec<UserSession> = match state.s3_client.get_object()
+        .bucket(&state.bucket)
+        .key(sessions_key)
+        .send()
+        .await
+    {
+        Ok(output) => {
+            if let Ok(bytes) = output.body.collect().await {
+                serde_json::from_slice(&bytes.into_bytes()).unwrap_or_default()
+            } else {
+                Vec::new()
+            }
+        }
+        Err(_) => Vec::new(),
+    };
+
+    let original_len = sessions.len();
+    sessions.retain(|s| s.id != session_id);
+
+    if sessions.len() < original_len {
+        let session_bytes = serde_json::to_vec(&sessions)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+        state.s3_client.put_object()
+            .bucket(&state.bucket)
+            .key(sessions_key)
             .content_type("application/json")
             .body(aws_sdk_s3::primitives::ByteStream::from(session_bytes))
             .send()

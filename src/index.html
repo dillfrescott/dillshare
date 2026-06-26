@@ -1134,20 +1134,53 @@
                     <span style="font-size:0.85rem; color:var(--text-muted);">Verifying administrator access...</span>
                 </div>
 
-                <div class="shares-table-wrapper" id="admin-dashboard" style="display: none;">
-                    <table id="admin-table">
-                        <thead>
-                            <tr>
-                                <th>User</th>
-                                <th>Active Shares</th>
-                                <th>Storage Used</th>
-                                <th>Actions</th>
-                            </tr>
-                        </thead>
-                        <tbody id="admin-users-list-body">
-                            <!-- Dynamic Content -->
-                        </tbody>
-                    </table>
+                <div id="admin-dashboard" style="display: none;">
+                    <div class="admin-tabs" id="admin-tabs-nav" style="display: flex; gap: 1rem; margin-top: 1rem; margin-bottom: 1.5rem; border-bottom: 1px solid var(--surface-border); padding-bottom: 0.5rem;">
+                        <button class="admin-tab-btn active" id="admin-tab-users" style="background: none; border: none; color: var(--primary); font-weight: 600; cursor: pointer; padding: 0.5rem; border-bottom: 2px solid var(--primary); font-family: inherit; font-size: 0.9rem; transition: all 0.2s; outline: none;">Users & Storage</button>
+                        <button class="admin-tab-btn" id="admin-tab-sessions" style="background: none; border: none; color: var(--text-muted); font-weight: 500; cursor: pointer; padding: 0.5rem; font-family: inherit; font-size: 0.9rem; transition: all 0.2s; outline: none;">Admin Sessions</button>
+                    </div>
+
+                    <!-- Users & Storage View -->
+                    <div id="admin-users-view">
+                        <div class="shares-table-wrapper">
+                            <table id="admin-table">
+                                <thead>
+                                    <tr>
+                                        <th>User</th>
+                                        <th>Active Shares</th>
+                                        <th>Storage Used</th>
+                                        <th>Actions</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="admin-users-list-body">
+                                    <!-- Dynamic Content -->
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+
+                    <!-- Admin Sessions View -->
+                    <div id="admin-sessions-view" style="display: none;">
+                        <p style="font-size: 0.85rem; color: var(--text-muted); margin-bottom: 1rem; margin-top: 0.5rem;">
+                            These are the active administrator sessions. You can revoke any session to log it out immediately.
+                        </p>
+                        <div class="shares-table-wrapper">
+                            <table style="width: 100%; border-collapse: collapse; text-align: left;" id="admin-sessions-table">
+                                <thead>
+                                    <tr>
+                                        <th>Device / User Agent</th>
+                                        <th>IP Address</th>
+                                        <th>Created</th>
+                                        <th>Expires</th>
+                                        <th>Action</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="admin-sessions-list-body">
+                                    <!-- Dynamic admin sessions list -->
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
                 </div>
             </div>
         </div>
@@ -3193,28 +3226,106 @@
 
         // --- ADMIN PANEL CONTROLLER ---
 
-        btnRefreshAdmin.addEventListener('click', loadAdminStats);
+        btnRefreshAdmin.addEventListener('click', () => {
+            const usersTab = document.getElementById('admin-tab-users');
+            if (usersTab && usersTab.classList.contains('active')) {
+                loadAdminStats();
+            } else {
+                loadAdminSessions();
+            }
+        });
         
         const btnLogoutAdmin = document.getElementById('btn-logout-admin');
+        const tabUsers = document.getElementById('admin-tab-users');
+        const tabSessions = document.getElementById('admin-tab-sessions');
+        const viewUsers = document.getElementById('admin-users-view');
+        const viewAdminSessions = document.getElementById('admin-sessions-view');
+
         if (btnLogoutAdmin) {
             btnLogoutAdmin.addEventListener('click', () => {
                 localStorage.removeItem('dill_admin_token');
                 if (window.location.search.includes('token=')) {
                     window.history.replaceState({}, '', '/admin');
                 }
+                // Reset active tab to users
+                if (tabUsers && tabSessions && viewUsers && viewAdminSessions) {
+                    tabUsers.classList.add('active');
+                    tabUsers.style.color = 'var(--primary)';
+                    tabUsers.style.borderBottom = '2px solid var(--primary)';
+                    tabUsers.style.fontWeight = '600';
+
+                    tabSessions.classList.remove('active');
+                    tabSessions.style.color = 'var(--text-muted)';
+                    tabSessions.style.borderBottom = 'none';
+                    tabSessions.style.fontWeight = '500';
+
+                    viewUsers.style.display = 'block';
+                    viewAdminSessions.style.display = 'none';
+                }
                 showToast('Logged out of Admin Panel', 'success');
                 loadAdminStats();
+            });
+        }
+
+        // Tab switching logic for Admin Panel
+        if (tabUsers && tabSessions && viewUsers && viewAdminSessions) {
+            tabUsers.addEventListener('click', () => {
+                tabUsers.classList.add('active');
+                tabUsers.style.color = 'var(--primary)';
+                tabUsers.style.borderBottom = '2px solid var(--primary)';
+                tabUsers.style.fontWeight = '600';
+
+                tabSessions.classList.remove('active');
+                tabSessions.style.color = 'var(--text-muted)';
+                tabSessions.style.borderBottom = 'none';
+                tabSessions.style.fontWeight = '500';
+
+                viewUsers.style.display = 'block';
+                viewAdminSessions.style.display = 'none';
+                loadAdminStats();
+            });
+
+            tabSessions.addEventListener('click', () => {
+                tabSessions.classList.add('active');
+                tabSessions.style.color = 'var(--primary)';
+                tabSessions.style.borderBottom = '2px solid var(--primary)';
+                tabSessions.style.fontWeight = '600';
+
+                tabUsers.classList.remove('active');
+                tabUsers.style.color = 'var(--text-muted)';
+                tabUsers.style.borderBottom = 'none';
+                tabUsers.style.fontWeight = '500';
+
+                viewUsers.style.display = 'none';
+                viewAdminSessions.style.display = 'block';
+                loadAdminSessions();
             });
         }
         
         const adminTokenForm = document.getElementById('admin-token-form');
         if (adminTokenForm) {
-            adminTokenForm.addEventListener('submit', (e) => {
+            adminTokenForm.addEventListener('submit', async (e) => {
                 e.preventDefault();
                 const tokenInput = document.getElementById('admin-token-input').value.trim();
                 if (tokenInput) {
-                    localStorage.setItem('dill_admin_token', tokenInput);
-                    loadAdminStats();
+                    try {
+                        const res = await fetch('/api/admin/login', {
+                            method: 'POST',
+                            headers: { 'Authorization': `Bearer ${tokenInput}` }
+                        });
+                        if (res.ok) {
+                            const data = await res.json();
+                            localStorage.setItem('dill_admin_token', data.token);
+                            showToast('Admin logged in successfully', 'success');
+                            loadAdminStats();
+                        } else {
+                            localStorage.setItem('dill_admin_token', tokenInput);
+                            loadAdminStats();
+                        }
+                    } catch (err) {
+                        localStorage.setItem('dill_admin_token', tokenInput);
+                        loadAdminStats();
+                    }
                 }
             });
         }
@@ -3562,6 +3673,136 @@
                 dashboard.style.display = 'block';
                 showToast(err.message, 'error');
                 usersBody.innerHTML = `<tr><td colspan="4" style="text-align:center; color:var(--danger); padding:2rem;">Error: ${err.message}</td></tr>`;
+            }
+        }
+
+        async function loadAdminSessions() {
+            const token = localStorage.getItem('dill_admin_token');
+            const adminSessionsBody = document.getElementById('admin-sessions-list-body');
+            if (!token) return;
+
+            adminSessionsBody.innerHTML = `
+                <tr>
+                    <td colspan="5" style="text-align:center; padding: 2rem 0;">
+                        <div class="loader" style="margin:1rem auto;"></div>
+                        <span style="font-size:0.85rem; color:var(--text-muted);">Loading admin sessions...</span>
+                    </td>
+                </tr>
+            `;
+
+            try {
+                const res = await fetch('/api/admin/sessions', {
+                    headers: { 'Authorization': `Bearer ${token}` }
+                });
+
+                if (!res.ok) {
+                    throw new Error(await res.text());
+                }
+
+                const sessions = await res.json();
+                adminSessionsBody.innerHTML = '';
+
+                if (sessions.length === 0) {
+                    adminSessionsBody.innerHTML = `
+                        <tr>
+                            <td colspan="5" style="text-align:center; color:var(--text-muted); padding:2rem 0;">
+                                No active admin sessions found.
+                            </td>
+                        </tr>
+                    `;
+                    return;
+                }
+
+                // Sort: current session first, then by created_at desc
+                sessions.sort((a, b) => {
+                    if (a.is_current && !b.is_current) return -1;
+                    if (!a.is_current && b.is_current) return 1;
+                    return b.created_at - a.created_at;
+                });
+
+                sessions.forEach(session => {
+                    const row = document.createElement('tr');
+                    
+                    const deviceName = parseUserAgent(session.user_agent);
+                    const ipStr = session.ip;
+                    
+                    const createdDate = new Date(session.created_at * 1000).toLocaleString();
+                    const expiresDate = new Date(session.expires_at * 1000).toLocaleString();
+                    
+                    const currentBadge = session.is_current 
+                        ? `<span class="badge success" style="margin-left:0.5rem; font-size:0.7rem; font-family:sans-serif; text-transform:uppercase;">Current</span>` 
+                        : '';
+                    
+                    const revokeBtnText = session.is_current ? 'Log Out' : 'Revoke';
+                    const buttonClass = session.is_current ? 'btn btn-secondary' : 'btn btn-danger';
+                    
+                    row.innerHTML = `
+                        <td style="padding: 1rem 0.85rem; border-bottom: 1px solid var(--surface-border);">
+                            <div style="display:flex; flex-direction:column;">
+                                <span style="font-weight:500; display:flex; align-items:center;">
+                                    ${deviceName} ${currentBadge}
+                                </span>
+                                <span style="font-size:0.75rem; color:var(--text-muted); font-family:monospace; margin-top:0.2rem; word-break:break-all;">
+                                    ${session.user_agent}
+                                </span>
+                            </div>
+                        </td>
+                        <td style="padding: 1rem 0.85rem; font-family:monospace; border-bottom: 1px solid var(--surface-border);">${ipStr}</td>
+                        <td style="padding: 1rem 0.85rem; border-bottom: 1px solid var(--surface-border); font-size:0.8rem;">${createdDate}</td>
+                        <td style="padding: 1rem 0.85rem; border-bottom: 1px solid var(--surface-border); font-size:0.8rem;">${expiresDate}</td>
+                        <td style="padding: 1rem 0.85rem; text-align:right; border-bottom: 1px solid var(--surface-border);">
+                            <button class="${buttonClass} btn-revoke-admin-session" data-id="${session.id}" data-current="${session.is_current}" style="padding: 0.3rem 0.6rem; font-size: 0.75rem; font-weight: 600;">
+                                ${revokeBtnText}
+                            </button>
+                        </td>
+                    `;
+                    adminSessionsBody.appendChild(row);
+                });
+
+                // Attach event listeners to revoke buttons
+                document.querySelectorAll('.btn-revoke-admin-session').forEach(btn => {
+                    btn.addEventListener('click', async (e) => {
+                        const id = e.currentTarget.getAttribute('data-id');
+                        const isCurrent = e.currentTarget.getAttribute('data-current') === 'true';
+                        
+                        const confirmMsg = isCurrent 
+                            ? 'Are you sure you want to log out of your current admin session?'
+                            : 'Are you sure you want to revoke this admin session? That browser will be logged out immediately.';
+                            
+                        if (confirm(confirmMsg)) {
+                            try {
+                                const revRes = await fetch(`/api/admin/sessions/${id}`, {
+                                    method: 'DELETE',
+                                    headers: { 'Authorization': `Bearer ${token}` }
+                                });
+                                
+                                if (revRes.ok) {
+                                    showToast(isCurrent ? 'Logged out successfully' : 'Admin session revoked successfully', 'success');
+                                    if (isCurrent) {
+                                        localStorage.removeItem('dill_admin_token');
+                                        window.history.replaceState({}, '', '/admin');
+                                        loadAdminStats();
+                                    } else {
+                                        loadAdminSessions();
+                                    }
+                                } else {
+                                    showToast('Failed to revoke admin session: ' + await revRes.text(), 'error');
+                                }
+                            } catch (err) {
+                                showToast('Network error while revoking admin session', 'error');
+                            }
+                        }
+                    });
+                });
+
+            } catch (err) {
+                adminSessionsBody.innerHTML = `
+                    <tr>
+                        <td colspan="5" style="text-align:center; color:var(--danger); padding:2rem 0;">
+                            Failed to load admin sessions: ${err.message}
+                        </td>
+                    </tr>
+                `;
             }
         }
 
