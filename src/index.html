@@ -794,6 +794,13 @@
             animation: spin 0.8s linear infinite;
         }
 
+        /* Loaders inside buttons use white so they stay visible on colored button backgrounds */
+        .btn .loader,
+        .btn-danger .loader {
+            border-color: rgba(255, 255, 255, 0.25);
+            border-top-color: #ffffff;
+        }
+
         .badge {
             display: inline-block;
             padding: 0.2rem 0.4rem;
