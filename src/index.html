@@ -420,6 +420,9 @@
             border-radius: 4px;
             font-size: 0.8rem;
             font-weight: 600;
+            font-variant-numeric: tabular-nums;
+            min-width: 15.5rem;
+            justify-content: center;
         }
 
         .countdown-timer svg {
@@ -1502,24 +1505,28 @@
         }
 
         // --- STREAMING PREVIEW SERVICE WORKER ---
-        // Registers /sw.js once and provides a promise that resolves when the
-        // worker is active and ready to receive decryption keys. Used by the
-        // media preview path so <video>/<audio> can start playing immediately
-        // while the file is still being fetched and decrypted in 4 MB chunks.
-        let swRegistrationPromise = null;
-        let swReadyResolve = null;
-        const swReadyPromise = new Promise((resolve) => { swReadyResolve = resolve; });
+        // Registers /sw.js once. A page is only intercepted by a SW once the SW
+        // controls it, which happens when clients.claim() fires controllerchange
+        // on the current page. We resolve a single shared promise once that
+        // occurs (or never, if the SW can't claim this page - in which case
+        // preview falls back to buffered decryption with a progress bar).
+        let swControllerPromise = null;
         const pendingStreamInits = new Map(); // streamPath -> {resolve, reject}
 
         navigator.serviceWorker.addEventListener('message', (event) => {
             const d = event.data;
             if (!d) return;
-            if (d.type === 'DILL_SW_ACTIVE' && swReadyResolve) {
-                const r = swReadyResolve;
-                swReadyResolve = null;
-                r();
+            if (d.type === 'DILL_SW_ACTIVE') {
+                console.log('[dill-sw] Got DILL_SW_ACTIVE. controller =', !!navigator.serviceWorker.controller);
+                // The SW just activated and claimed clients. Force a controller
+                // re-check for any in-flight ensureStreamingSW() waiters.
+                if (navigator.serviceWorker.controller) {
+                    window.dispatchEvent(new Event('dill-sw-controller-ready'));
+                }
+                return;
             }
             if (d.type === 'DILL_PREVIEW_READY' && pendingStreamInits.has(d.streamPath)) {
+                console.log('[dill-sw] Preview ready for', d.streamPath);
                 const { resolve, reject } = pendingStreamInits.get(d.streamPath);
                 pendingStreamInits.delete(d.streamPath);
                 if (d.error) reject(new Error(d.error));
@@ -1527,38 +1534,94 @@
             }
         });
 
-        async function ensureStreamingSW() {
-            if (!('serviceWorker' in navigator)) return false;
-            if (!swRegistrationPromise) {
-                swRegistrationPromise = navigator.serviceWorker.register('/sw.js', { scope: '/' }).then(async (reg) => {
-                    // Wait for active controller
-                    if (navigator.serviceWorker.controller) {
-                        swReadyResolve && swReadyResolve();
-                        return reg;
-                    }
-                    await new Promise((resolve) => {
-                        const handler = () => { navigator.serviceWorker.removeEventListener('controllerchange', handler); resolve(); };
-                        navigator.serviceWorker.addEventListener('controllerchange', handler);
-                    });
-                    return reg;
-                });
+        // Resolves true once a service worker actively controls this page, or
+        // false if it can't within a generous timeout (20s). The result is
+        // cached so subsequent previews reuse it without re-awaiting.
+        function ensureStreamingSW() {
+            if (swControllerPromise) return swControllerPromise;
+            if (!('serviceWorker' in navigator)) {
+                swControllerPromise = Promise.resolve(false);
+                return swControllerPromise;
             }
-            await swRegistrationPromise;
-            await swReadyPromise;
-            return true;
+            swControllerPromise = (async () => {
+                try {
+                    const reg = await navigator.serviceWorker.register('/sw.js', { scope: '/' });
+                    console.log('[dill-sw] registered. controller =', !!navigator.serviceWorker.controller, 'scope =', reg.scope);
+                } catch (e) { console.error('[dill-sw] register failed:', e); return false; }
+                if (navigator.serviceWorker.controller) {
+                    console.log('[dill-sw] already controlled');
+                    return true;
+                }
+                // Wait for the SW to claim this page. Three signals, whichever
+                // fires first: controllerchange, the SW's DILL_SW_ACTIVE message
+                // (relayed via a custom event), or a polled re-check after ready.
+                return new Promise((resolve) => {
+                    let settled = false;
+                    const check = () => {
+                        if (settled) return;
+                        if (navigator.serviceWorker.controller) {
+                            console.log('[dill-sw] controller appeared via', check._src || 'poll');
+                            settled = true;
+                            cleanup();
+                            resolve(true);
+                        }
+                    };
+                    const onControllerChange = () => { check._src = 'controllerchange'; check(); };
+                    const onSwReadyEvent = () => { check._src = 'DILL_SW_ACTIVE'; check(); };
+                    navigator.serviceWorker.addEventListener('controllerchange', onControllerChange);
+                    window.addEventListener('dill-sw-controller-ready', onSwReadyEvent);
+                    navigator.serviceWorker.ready.then((reg) => {
+                        console.log('[dill-sw] ready resolved. controller =', !!navigator.serviceWorker.controller);
+                        for (let i = 0; i < 10; i++) setTimeout(check, 200 * (i + 1));
+                    });
+                    const cleanup = () => {
+                        navigator.serviceWorker.removeEventListener('controllerchange', onControllerChange);
+                        window.removeEventListener('dill-sw-controller-ready', onSwReadyEvent);
+                        clearTimeout(timer);
+                    };
+                    const timer = setTimeout(() => {
+                        console.log('[dill-sw] timed out waiting for controller. controller =', !!navigator.serviceWorker.controller);
+                        cleanup();
+                        resolve(false);
+                    }, 20000);
+                });
+            })();
+            return swControllerPromise;
         }
 
         // Send decryption metadata for a given stream path to the SW and
         // resolve once the SW acknowledges it is ready to serve that path.
+        // Times out after 5s so preview falls back instead of hanging.
         async function initPreviewStream(streamPath, key, fileMeta, contentType) {
-            await ensureStreamingSW();
-            const rawKey = await window.crypto.subtle.exportKey('raw', key);
+            const ok = await ensureStreamingSW();
+            console.log('[dill-sw] initPreviewStream: ensureStreamingSW =', ok, 'controller =', !!navigator.serviceWorker.controller);
+            if (!ok || !navigator.serviceWorker.controller) {
+                throw new Error('Service worker unavailable');
+            }
+            // The page's AES-GCM key is imported non-extractable, so we can't
+            // export it. Instead, re-derive the raw key bytes from the hex in
+            // the URL fragment and send those to the SW (which imports its own
+            // copy).
+            const keyHex = window.location.hash.substring(1);
+            const rawKeyBytes = hexToBuf(keyHex);
+            if (!rawKeyBytes) throw new Error('Decryption key missing');
             return new Promise((resolve, reject) => {
-                pendingStreamInits.set(streamPath, { resolve, reject });
+                const timer = setTimeout(() => {
+                    if (pendingStreamInits.has(streamPath)) {
+                        pendingStreamInits.delete(streamPath);
+                        console.error('[dill-sw] initPreviewStream: timed out waiting for READY');
+                        reject(new Error('Service worker init timed out'));
+                    }
+                }, 5000);
+                pendingStreamInits.set(streamPath, {
+                    resolve: () => { clearTimeout(timer); console.log('[dill-sw] initPreviewStream: got READY'); resolve(); },
+                    reject: (e) => { clearTimeout(timer); console.error('[dill-sw] initPreviewStream: got error', e); reject(e); }
+                });
+                console.log('[dill-sw] initPreviewStream: posting INIT for', streamPath);
                 navigator.serviceWorker.controller.postMessage({
                     type: 'DILL_PREVIEW_INIT',
                     streamPath,
-                    keyRaw: new Uint8Array(rawKey),
+                    keyRaw: new Uint8Array(rawKeyBytes),
                     size: fileMeta.size,
                     chunked: !!(fileMeta && fileMeta.chunked),
                     contentType: contentType || 'application/octet-stream',
@@ -2601,8 +2664,8 @@
                     const mins = Math.floor((diff % (1000 * 60 * 60)) / (1000 * 60));
                     const secs = Math.floor((diff % (1000 * 60)) / 1000);
 
-                    shareCountdown.querySelector('span').textContent = 
-                        `Expires in: ${days}d ${hours}h ${mins}m ${secs}s`;
+                    shareCountdown.querySelector('span').textContent =
+                        `Expires in: ${days}d ${String(hours).padStart(2,'0')}h ${String(mins).padStart(2,'0')}m ${String(secs).padStart(2,'0')}s`;
                 };
                 
                 updateCountdown();
@@ -2806,7 +2869,7 @@
             const previewProgressBar = document.getElementById('preview-progress-bar');
             const previewProgressLabel = document.getElementById('preview-progress-label');
             const totalBytes = (file && typeof file.size === 'number') ? file.size : 0;
-            const onPreviewProgress = ({ bytesDecrypted, totalBytes: tb }) => {
+            let onPreviewProgress = ({ bytesDecrypted, totalBytes: tb }) => {
                 const denom = tb || totalBytes;
                 if (denom > 0) {
                     const pct = Math.min(100, Math.round((bytesDecrypted / denom) * 100));
@@ -2843,11 +2906,13 @@
             // is unavailable (private mode / unsupported browser).
             if (isStreamingMedia) {
                 let streamUrl = null;
+                console.log('[dill-sw] opening streaming preview for', ext, 'isVideo=', isVideo, 'isAudio=', isAudio, 'file=', file);
                 try {
                     const streamPath = `/preview-stream/${currentShareUUID}/${file.id}`;
                     const contentType = file.type || mimeForExt(ext);
                     await initPreviewStream(streamPath, key, file, contentType);
                     streamUrl = streamPath;
+                    console.log('[dill-sw] stream initialized, setting media src to', streamUrl);
 
                     previewContentBox.innerHTML = '';
                     btnPreviewDownload.style.opacity = '1';
@@ -2884,8 +2949,30 @@
                     }
                     return;
                 } catch (err) {
-                    // Fall through to the buffered preview path below.
-                    if (streamUrl) console.warn('Streaming preview unavailable, buffering instead:', err);
+                    // Fall through to the buffered preview path below. Show a
+                    // proper progress bar so the wait is visible instead of
+                    // the (now-stale) "Starting secure stream..." text.
+                    console.error('[dill-sw] streaming preview FAILED, falling back to buffered:', err);
+                    previewContentBox.innerHTML = `
+                        <div class="empty-state" style="width:100%;">
+                            <div class="loader" style="margin:0 auto 1rem auto;"></div>
+                            <p>Downloading and decrypting file in your browser...</p>
+                            <div class="progress-bar-container" style="margin-top:1rem; width:80%; margin-left:auto; margin-right:auto;">
+                                <div class="progress-bar" id="preview-progress-bar"></div>
+                            </div>
+                            <p id="preview-progress-label" style="font-size:0.8rem; color:var(--text-muted); margin-top:0.5rem;">0%</p>
+                        </div>
+                    `;
+                    const pb = document.getElementById('preview-progress-bar');
+                    const pl = document.getElementById('preview-progress-label');
+                    onPreviewProgress = ({ bytesDecrypted, totalBytes: tb }) => {
+                        const denom = tb || totalBytes;
+                        if (denom > 0) {
+                            const pct = Math.min(100, Math.round((bytesDecrypted / denom) * 100));
+                            if (pb) pb.style.width = pct + '%';
+                            if (pl) pl.textContent = pct + '%';
+                        }
+                    };
                 }
             }
 
@@ -3030,62 +3117,6 @@
                     `;
                 };
 
-                // Fast path: File System Access API directory picker (Chrome/Edge).
-                // Streams each decrypted file directly to disk with no in-memory
-                // buffering and no ZIP compression overhead, so it is dramatically
-                // faster and uses flat memory for large shares.
-                const canStreamToDir = typeof window.showDirectoryPicker === 'function';
-                if (canStreamToDir) {
-                    let rootDir = null;
-                    try {
-                        rootDir = await window.showDirectoryPicker({ mode: 'readwrite' });
-                    } catch (e) {
-                        if (e && e.name === 'AbortError') {
-                            throw new Error('Download cancelled');
-                        }
-                        rootDir = null; // blocked / denied; fall through to ZIP
-                    }
-
-                    if (rootDir) {
-                        for (let i = 0; i < totalFiles; i++) {
-                            const file = currentShareData.files[i];
-                            renderOverall(i, totalPlainSize > 0 ? Math.min(100, Math.round((processedPlainSize / totalPlainSize) * 100)) : 0);
-
-                            const fileUrl = `/api/share/${currentShareUUID}/file/file_${file.id}.enc`;
-                            const filePlainSize = (typeof file.size === 'number') ? file.size : 0;
-
-                            // Resolve (creating) any nested subdirectories from file.name
-                            const parts = file.name.split('/').filter(Boolean);
-                            const leafName = parts.pop();
-                            let dirHandle = rootDir;
-                            for (const seg of parts) {
-                                dirHandle = await dirHandle.getDirectoryHandle(seg, { create: true });
-                            }
-                            const fh = await dirHandle.getFileHandle(leafName, { create: true });
-                            const sink = await fh.createWritable();
-
-                            try {
-                                await decryptAndDeliver(fileUrl, key, file, sink, true, ({ bytesDecrypted, totalBytes: tb }) => {
-                                    const denom = tb || filePlainSize;
-                                    if (denom > 0 && totalPlainSize > 0) {
-                                        const overall = Math.min(100, Math.round(((processedPlainSize + Math.min(bytesDecrypted, filePlainSize)) / totalPlainSize) * 100));
-                                        renderOverall(i, overall);
-                                    }
-                                });
-                            } catch (e) {
-                                try { await sink.close(); } catch (_) {}
-                                throw e;
-                            }
-                            processedPlainSize += filePlainSize;
-                        }
-                        renderOverall(totalFiles - 1, 100);
-                        showToast('Files downloaded to selected folder.', 'success');
-                        return;
-                    }
-                }
-
-                // Fallback path: ZIP archive in-memory (Safari/Firefox or when
-                // directory picker is unavailable / declined).
                 const zip = new JSZip();
                 for (let i = 0; i < totalFiles; i++) {
                     const file = currentShareData.files[i];
@@ -4495,6 +4526,34 @@
 
         // Initialize Auth view
         updateHeaderAuthState();
+
+        // Eagerly kick off service worker registration so it can activate and
+        // control this page. A page loaded before its SW was active is not
+        // controlled (navigator.serviceWorker.controller is null), which means
+        // the SW cannot intercept media-element range requests and streaming
+        // preview won't work. Once the SW is active (ready resolves) but this
+        // page still isn't controlled, do a one-time reload: the reload
+        // navigation is intercepted by the now-active SW, so the reloaded page
+        // IS controlled and streaming works. A sessionStorage guard prevents
+        // any reload loop.
+        if ('serviceWorker' in navigator) {
+            navigator.serviceWorker.register('/sw.js', { scope: '/' }).then(async () => {
+                if (navigator.serviceWorker.controller) {
+                    // Controlled on a fresh load (SW was already active from a
+                    // prior session). Clear the guard if a previous reload set it.
+                    sessionStorage.removeItem('dill_sw_reloaded');
+                    return;
+                }
+                await navigator.serviceWorker.ready; // SW is now active
+                if (navigator.serviceWorker.controller) {
+                    sessionStorage.removeItem('dill_sw_reloaded');
+                    return;
+                }
+                if (sessionStorage.getItem('dill_sw_reloaded') === '1') return; // already tried, don't loop
+                sessionStorage.setItem('dill_sw_reloaded', '1');
+                window.location.reload();
+            }).catch(() => {});
+        }
 
         // Initialize Router
         handleRouting();

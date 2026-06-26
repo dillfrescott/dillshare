@@ -45,7 +45,10 @@ function ctSizeFor(totalPlain, chunked) {
     return total;
 }
 
-// Plain byte range [start, end) -> set of ciphertext byte ranges to fetch.
+// Plain byte range [start, end) -> set of chunk descriptors to fetch+decrypt.
+// AES-GCM cannot decrypt a partial ciphertext: each chunk's full block
+// (IV(12) + ct(plainLen + 16)) must be fetched and decrypted as a unit, then
+// the requested plaintext sub-slice is extracted from the decrypted result.
 function plainRangeToCtRanges(start, end, totalPlain) {
     const firstChunk = Math.floor(start / CHUNK_SIZE);
     const lastChunk = Math.floor((end - 1) / CHUNK_SIZE);
@@ -54,16 +57,23 @@ function plainRangeToCtRanges(start, end, totalPlain) {
     let rem = totalPlain;
     for (let i = 0; i <= lastChunk; i++) {
         const thisPlain = Math.min(CHUNK_SIZE, rem);
-        const ctLen = 12 + thisPlain + 16;
+        const blockLen = 12 + thisPlain + 16; // IV + ct + tag
         if (i >= firstChunk) {
             const plainStartInChunk = (i === firstChunk) ? (start - i * CHUNK_SIZE) : 0;
             const plainEndInChunk = (i === lastChunk) ? (end - i * CHUNK_SIZE) : thisPlain;
-            // ciphertext layout within this chunk: IV(12) then ct(plainLen+16)
-            const ctStart = cursor + 12 + plainStartInChunk;
-            const ctEnd = cursor + 12 + plainEndInChunk; // exclusive
-            ranges.push({ chunkIndex: i, plainStartInChunk, plainEndInChunk, ctStart, ctEnd, ivStart: cursor, ivLen: 12 });
+            // Fetch the entire chunk block so the GCM tag is included.
+            ranges.push({
+                chunkIndex: i,
+                plainStartInChunk,
+                plainEndInChunk,
+                fetchStart: cursor,                 // start of IV
+                fetchEnd: cursor + blockLen,        // end of tag (exclusive)
+                ivStart: cursor,
+                ctStart: cursor + 12,
+                ctLen: thisPlain + 16,
+            });
         }
-        cursor += ctLen;
+        cursor += blockLen;
         rem -= thisPlain;
     }
     return ranges;
@@ -85,6 +95,7 @@ self.addEventListener('message', async (event) => {
     const d = event.data;
     if (!d) return;
     if (d.type === 'DILL_PREVIEW_INIT') {
+        console.log('[dill-sw] INIT received for', d.streamPath, 'chunked=', d.chunked, 'size=', d.size);
         try {
             const key = await importKeyFromRaw(d.keyRaw);
             const entry = {
@@ -97,32 +108,49 @@ self.addEventListener('message', async (event) => {
                 cached: null, // only used for legacy single-block format
             };
             files.set(d.streamPath, entry);
+            console.log('[dill-sw] INIT ok, replying READY');
             if (event.source) event.source.postMessage({ type: 'DILL_PREVIEW_READY', streamPath: d.streamPath });
         } catch (e) {
+            console.error('[dill-sw] INIT error:', e);
             if (event.source) event.source.postMessage({ type: 'DILL_PREVIEW_READY', streamPath: d.streamPath, error: String(e) });
         }
         return;
     }
 });
 
+self.addEventListener('install', (event) => {
+    // Activate immediately instead of waiting for all tabs to be closed.
+    self.skipWaiting();
+});
+
 self.addEventListener('activate', (event) => {
-    event.waitUntil((async () => {
-        // Take control of all open clients immediately.
-        await self.clients.claim();
-        const all = await self.clients.matchAll({ includeUncontrolled: true });
-        for (const c of all) c.postMessage({ type: 'DILL_SW_ACTIVE' });
-    })());
+    // Take control of all open clients immediately so the current page's
+    // media-element range requests get intercepted without a reload.
+    event.waitUntil(
+        self.clients.claim().then(() => {
+            return self.clients.matchAll({ includeUncontrolled: true, type: 'window' });
+        }).then((clients) => {
+            for (const c of clients) {
+                c.postMessage({ type: 'DILL_SW_ACTIVE' });
+            }
+        }).catch((e) => {
+            console.error('sw activate error:', e);
+        })
+    );
 });
 
 self.addEventListener('fetch', (event) => {
     const url = new URL(event.request.url);
     if (!url.pathname.startsWith(STREAM_PREFIX)) return;
+    console.log('[dill-sw] fetch intercept:', event.request.method, url.pathname, 'range=', event.request.headers.get('Range'));
     event.respondWith(handleStream(event.request, url.pathname));
 });
 
 async function handleStream(request, streamPath) {
+    console.log('[dill-sw] handleStream', streamPath, 'has meta:', files.has(streamPath));
     const meta = files.get(streamPath);
     if (!meta) {
+        console.error('[dill-sw] handleStream: no meta for', streamPath);
         return new Response('Preview stream not initialized', { status: 503 });
     }
 
@@ -191,36 +219,53 @@ async function respondChunkedRange(meta, start, end, isRange) {
     if (isRange) {
         headers['Content-Range'] = `bytes ${start}-${end - 1}/${meta.size}`;
     }
+    console.log('[dill-sw] respondChunkedRange:', start, '-', end, 'len', totalLength, 'status', status, 'chunks', ranges.length, 'ct', meta.contentType);
 
     // Stream decrypted chunk slices to the media element as they are produced,
     // so playback can begin after the first chunk arrives instead of waiting
     // for the entire requested range to be decrypted.
     let aborted = false;
+    let chunkIndex = 0;
     const stream = new ReadableStream({
         async start(controller) {
             try {
                 for (const r of ranges) {
                     if (aborted) break;
-                    // Fetch IV + the ct slice needed for this chunk in one range request.
-                    const fetchStart = r.ivStart;
-                    const fetchEnd = r.ctEnd; // exclusive
+                    // A closed/errored stream has desiredSize === null; stop
+                    // processing once the consumer (media element) cancels so we
+                    // never enqueue into a closed stream.
+                    if (controller.desiredSize === null) break;
+                    // Fetch the entire chunk block (IV + ct + tag) in one range
+                    // request. AES-GCM requires the full ciphertext+tag to
+                    // verify, so we can't fetch a partial slice of a chunk.
                     const res = await fetch(meta.url, {
-                        headers: { Range: `bytes=${fetchStart}-${fetchEnd - 1}` },
+                        headers: { Range: `bytes=${r.fetchStart}-${r.fetchEnd - 1}` },
                     });
                     if (!res.ok && res.status !== 206) {
                         throw new Error('Upstream fetch failed: ' + res.status);
                     }
                     const buf = new Uint8Array(await res.arrayBuffer());
+                    // fetchStart == ivStart, so buf[0:12] is the IV and
+                    // buf[12:12+ctLen] is ct+tag.
                     const iv = buf.subarray(0, 12);
-                    const ct = buf.subarray(12, buf.length); // exactly the ct slice we requested
+                    const ct = buf.subarray(12, 12 + r.ctLen);
                     const pt = await decryptChunk(iv, ct, meta.key);
+                    if (aborted || controller.desiredSize === null) break;
                     // Yield only the requested plaintext sub-slice of this chunk.
                     const piece = pt.subarray(r.plainStartInChunk, r.plainEndInChunk);
-                    if (piece.length > 0) controller.enqueue(piece);
+                    if (piece.length > 0) {
+                        try { controller.enqueue(piece); }
+                        catch (_) { break; } // stream closed by consumer mid-enqueue
+                    }
+                    console.log('[dill-sw] enqueued chunk', chunkIndex++, 'len', piece.length);
                 }
-                controller.close();
+                if (!aborted && controller.desiredSize !== null) {
+                    controller.close();
+                    console.log('[dill-sw] stream closed, all chunks sent');
+                }
             } catch (err) {
-                controller.error(err);
+                console.error('[dill-sw] stream error:', err);
+                try { controller.error(err); } catch (_) {}
             }
         },
         cancel() { aborted = true; }
