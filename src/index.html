@@ -2777,7 +2777,7 @@
             };
         }
 
-        async function fetchAccountShares(overrideKeyBuf = null) {
+        async function fetchAccountShares(overrideKeyBuf = null, silent = false) {
             const token = localStorage.getItem('dill_session_token');
             const encKeyHex = localStorage.getItem('dill_enc_key');
             if (!token) return [];
@@ -2808,7 +2808,9 @@
                 const decBuf = await decryptData(hexToBuf(data.shares_enc), key);
                 return JSON.parse(new TextDecoder().decode(decBuf));
             } catch (e) {
-                showToast('Failed to decrypt account shares: ' + e.message, 'error');
+                if (!silent) {
+                    showToast('Failed to decrypt account shares: ' + e.message, 'error');
+                }
                 throw e;
             }
         }
@@ -3137,7 +3139,7 @@
                 const newKeys = await deriveUserKeys(username, newPassword);
 
                 // 2. Fetch and decrypt all account shares using current key (checks password validity client-side)
-                const currentShares = await fetchAccountShares(currentKeys.encKeyBuf);
+                const currentShares = await fetchAccountShares(currentKeys.encKeyBuf, true);
 
                 // 3. Re-encrypt all account shares using new key
                 const rawData = new TextEncoder().encode(JSON.stringify(currentShares));
@@ -3178,7 +3180,7 @@
                     showToast('Failed to change password: ' + await res.text(), 'error');
                 }
             } catch (err) {
-                showToast(err.message, 'error');
+                showToast('Current password is incorrect, or decryption failed. Please try again.', 'error');
             } finally {
                 btnSettingsPasswordSubmit.disabled = false;
                 btnSettingsPasswordSubmit.textContent = 'Update Password';
