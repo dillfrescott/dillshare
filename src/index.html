@@ -1682,6 +1682,97 @@
             );
         }
 
+        // --- THUMBNAIL GENERATION ---
+        // Produce a small (<=320px on the long edge) JPEG thumbnail ArrayBuffer
+        // for an image or video File, entirely client-side. Returns null if the
+        // file type cannot be thumbnailed. Used at upload time so the viewer can
+        // later fetch only the tiny encrypted thumb instead of the whole file.
+        const THUMB_MAX_DIM = 320;
+        const THUMB_QUALITY = 0.72;
+
+        function drawScaledToCanvas(imgOrVideo) {
+            const w = imgOrVideo.videoWidth || imgOrVideo.naturalWidth || 0;
+            const h = imgOrVideo.videoHeight || imgOrVideo.naturalHeight || 0;
+            if (!w || !h) return null;
+            const scale = Math.min(THUMB_MAX_DIM / w, THUMB_MAX_DIM / h, 1);
+            const cw = Math.max(1, Math.round(w * scale));
+            const ch = Math.max(1, Math.round(h * scale));
+            const canvas = document.createElement('canvas');
+            canvas.width = cw;
+            canvas.height = ch;
+            const ctx = canvas.getContext('2d');
+            ctx.drawImage(imgOrVideo, 0, 0, cw, ch);
+            return canvas;
+        }
+
+        function canvasToJpegArrayBuffer(canvas) {
+            return new Promise((resolve) => {
+                canvas.toBlob((b) => {
+                    if (!b) { resolve(null); return; }
+                    b.arrayBuffer().then(resolve);
+                }, 'image/jpeg', THUMB_QUALITY);
+            });
+        }
+
+        async function generateImageThumbnail(file) {
+            const url = URL.createObjectURL(file);
+            try {
+                const img = new Image();
+                await new Promise((resolve, reject) => {
+                    img.onload = resolve;
+                    img.onerror = reject;
+                    img.src = url;
+                });
+                const canvas = drawScaledToCanvas(img);
+                if (!canvas) return null;
+                return await canvasToJpegArrayBuffer(canvas);
+            } catch (_) {
+                return null;
+            } finally {
+                URL.revokeObjectURL(url);
+            }
+        }
+
+        async function generateVideoThumbnail(file) {
+            const url = URL.createObjectURL(file);
+            try {
+                const video = document.createElement('video');
+                video.muted = true;
+                video.preload = 'metadata';
+                video.src = url;
+                await new Promise((resolve, reject) => {
+                    video.onloadeddata = resolve;
+                    video.onerror = reject;
+                });
+                // Seek to ~1s (or 10% of duration) to land on a non-black frame.
+                const t = video.duration && isFinite(video.duration)
+                    ? Math.min(1, video.duration * 0.1)
+                    : 0.1;
+                await new Promise((resolve) => {
+                    const onSeeked = () => { video.removeEventListener('seeked', onSeeked); resolve(); };
+                    video.addEventListener('seeked', onSeeked);
+                    video.currentTime = t;
+                });
+                const canvas = drawScaledToCanvas(video);
+                if (!canvas) return null;
+                return await canvasToJpegArrayBuffer(canvas);
+            } catch (_) {
+                return null;
+            } finally {
+                URL.revokeObjectURL(url);
+            }
+        }
+
+        // Returns an ArrayBuffer (JPEG thumbnail) or null for unsupported types.
+        async function generateThumbnail(file) {
+            const ext = file.name.split('.').pop().toLowerCase();
+            const isImage = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp'].includes(ext);
+            const isVideo = ['mp4', 'webm', 'ogg', 'ogv', 'mov', 'mkv'].includes(ext);
+            if (isImage) return await generateImageThumbnail(file);
+            if (isVideo) return await generateVideoThumbnail(file);
+            return null;
+        }
+
         // --- CHUNKED AES-GCM (enables streaming download/decrypt for large files) ---
         // Format per chunk: IV(12 bytes) || ciphertext+tag(plaintext_len + 16 bytes)
         // All chunks concatenated. Plaintext chunk size is fixed (CHUNK_SIZE) except the
@@ -2262,13 +2353,30 @@
                     
                     const encBlob = new Blob([encryptedBuf], { type: 'application/octet-stream' });
                     formData.append('files', encBlob, `file_${i}.enc`);
+
+                    // Generate a small thumbnail (image/video) so the viewer can
+                    // later fetch only this tiny encrypted object instead of the
+                    // whole file. Best-effort: failures just omit the thumbnail.
+                    let hasThumb = false;
+                    try {
+                        const thumbBuf = await generateThumbnail(item.file);
+                        if (thumbBuf && thumbBuf.byteLength > 0) {
+                            const encThumbBuf = await encryptData(thumbBuf, key);
+                            const encThumbBlob = new Blob([encThumbBuf], { type: 'application/octet-stream' });
+                            formData.append('files', encThumbBlob, `file_${i}.thumb.enc`);
+                            hasThumb = true;
+                        }
+                    } catch (e) {
+                        console.warn('[dill] thumbnail generation failed for', item.relativePath, e);
+                    }
                     
                     meta.files.push({
                         id: i.toString(),
                         name: item.relativePath,
                         size: item.file.size,
                         type: item.file.type || 'application/octet-stream',
-                        chunked: true
+                        chunked: true,
+                        thumb: hasThumb
                     });
                 }
 
@@ -2742,20 +2850,24 @@
             }
         }
 
-        // Load and decrypt media thumbnails (images and videos) in the background
+        // Load and decrypt a pre-generated encrypted thumbnail (file_<id>.thumb.enc)
+        // — a tiny standalone object, so RAM/bandwidth stay flat regardless of the
+        // original file size. `file.thumb` (set in metadata at upload time) gates
+        // the fetch; older shares without that field fall back to the SVG icon.
+        // `isVideo` only controls the badge overlay; the thumbnail itself is
+        // always a JPEG (video first frame captured at upload time).
         async function loadThumbnail(file, key, isVideo = false) {
             const iconDiv = document.getElementById(`icon-${file.id}`);
             if (!iconDiv) return;
+            if (!file.thumb) return;
 
-            // Only auto-load thumbnails for files under 100MB to avoid high memory/bandwidth usage
-            if (file.size > 100 * 1024 * 1024) {
-                return;
-            }
-
-            const fileUrl = `/api/share/${currentShareUUID}/file/file_${file.id}.enc`;
+            const thumbUrl = `/api/share/${currentShareUUID}/file/file_${file.id}.thumb.enc`;
             try {
-                const decBuf = await decryptFileToArrayBuffer(fileUrl, key, file);
-                const blob = new Blob([decBuf], { type: file.type });
+                const res = await fetch(thumbUrl);
+                if (!res.ok) return;
+                const encBuf = await res.arrayBuffer();
+                const decBuf = await decryptData(encBuf, key);
+                const blob = new Blob([decBuf], { type: 'image/jpeg' });
                 const localUrl = URL.createObjectURL(blob);
 
                 if (!window.activeThumbnails) window.activeThumbnails = [];
@@ -2763,11 +2875,7 @@
 
                 if (isVideo) {
                     iconDiv.innerHTML = `
-                        <video src="${localUrl}" style="width:100%; height:100%; object-fit:cover; border-radius:4px;" 
-                            muted playsinline loop preload="auto" 
-                            onmouseenter="this.play().catch(e => {})" 
-                            onmouseleave="this.pause()">
-                        </video>
+                        <img src="${localUrl}" style="width:100%; height:100%; object-fit:cover; border-radius:4px;" alt="">
                         <div style="position: absolute; bottom: 6px; right: 6px; background: rgba(0,0,0,0.65); color: #fff; padding: 2px 5px; border-radius: 3px; font-size: 0.6rem; font-weight: 700; pointer-events: none; letter-spacing: 0.5px; border: 1px solid rgba(255,255,255,0.1);">
                             VIDEO
                         </div>
