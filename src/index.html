@@ -1783,22 +1783,25 @@
         async function encryptDataChunked(arrayBuffer, key) {
             const data = new Uint8Array(arrayBuffer);
             const total = data.length;
-            const parts = [];
+            const chunkPromises = [];
             let offset = 0;
             while (offset < total) {
                 const plain = data.subarray(offset, offset + ENCRYPT_CHUNK_SIZE);
-                const iv = window.crypto.getRandomValues(new Uint8Array(12));
-                const ct = await window.crypto.subtle.encrypt(
-                    { name: "AES-GCM", iv: iv },
-                    key,
-                    plain
-                );
-                const block = new Uint8Array(12 + ct.byteLength);
-                block.set(iv, 0);
-                block.set(new Uint8Array(ct), 12);
-                parts.push(block);
                 offset += ENCRYPT_CHUNK_SIZE;
+                const iv = window.crypto.getRandomValues(new Uint8Array(12));
+                chunkPromises.push((async () => {
+                    const ct = await window.crypto.subtle.encrypt(
+                        { name: "AES-GCM", iv: iv },
+                        key,
+                        plain
+                    );
+                    const block = new Uint8Array(12 + ct.byteLength);
+                    block.set(iv, 0);
+                    block.set(new Uint8Array(ct), 12);
+                    return block;
+                })());
             }
+            const parts = await Promise.all(chunkPromises);
             const totalLen = parts.reduce((a, c) => a + c.length, 0);
             const out = new Uint8Array(totalLen);
             let o = 0;
@@ -2342,41 +2345,41 @@
                     files: []
                 };
 
-                for (let i = 0; i < selectedFiles.length; i++) {
-                    const item = selectedFiles[i];
-                    progressEta.textContent = `Encrypting file ${i+1} of ${selectedFiles.length}...`;
-                    
+                progressEta.textContent = `Encrypting ${selectedFiles.length} file(s)...`;
+                const filePromises = selectedFiles.map(async (item, i) => {
                     const fileBuf = await item.file.arrayBuffer();
-                    // Use chunked encryption for all files so large files can be
-                    // streamed during download. Small files produce a single chunk.
                     const encryptedBuf = await encryptDataChunked(fileBuf, key);
-                    
                     const encBlob = new Blob([encryptedBuf], { type: 'application/octet-stream' });
-                    formData.append('files', encBlob, `file_${i}.enc`);
 
-                    // Generate a small thumbnail (image/video) so the viewer can
-                    // later fetch only this tiny encrypted object instead of the
-                    // whole file. Best-effort: failures just omit the thumbnail.
                     let hasThumb = false;
+                    let encThumbBlob = null;
                     try {
                         const thumbBuf = await generateThumbnail(item.file);
                         if (thumbBuf && thumbBuf.byteLength > 0) {
                             const encThumbBuf = await encryptData(thumbBuf, key);
-                            const encThumbBlob = new Blob([encThumbBuf], { type: 'application/octet-stream' });
-                            formData.append('files', encThumbBlob, `file_${i}.thumb.enc`);
+                            encThumbBlob = new Blob([encThumbBuf], { type: 'application/octet-stream' });
                             hasThumb = true;
                         }
                     } catch (e) {
                         console.warn('[dill] thumbnail generation failed for', item.relativePath, e);
                     }
-                    
+
+                    return { index: i, item, encBlob, encThumbBlob, hasThumb };
+                });
+
+                const processedFiles = await Promise.all(filePromises);
+                for (const pf of processedFiles) {
+                    formData.append('files', pf.encBlob, `file_${pf.index}.enc`);
+                    if (pf.hasThumb && pf.encThumbBlob) {
+                        formData.append('files', pf.encThumbBlob, `file_${pf.index}.thumb.enc`);
+                    }
                     meta.files.push({
-                        id: i.toString(),
-                        name: item.relativePath,
-                        size: item.file.size,
-                        type: item.file.type || 'application/octet-stream',
+                        id: pf.index.toString(),
+                        name: pf.item.relativePath,
+                        size: pf.item.file.size,
+                        type: pf.item.file.type || 'application/octet-stream',
                         chunked: true,
-                        thumb: hasThumb
+                        thumb: pf.hasThumb
                     });
                 }
 
