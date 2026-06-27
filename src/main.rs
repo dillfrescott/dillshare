@@ -104,6 +104,15 @@ async fn main() {
         .route("/api/share/:uuid/file/*filename", get(download_file))
         // Service worker for streaming decrypted media preview
         .route("/sw.js", get(serve_service_worker))
+        // Self-hosted vendored frontend assets (embedded at compile time so the
+        // binary runs fully offline with no CDN dependency for jszip, fflate,
+        // streamsaver or the Plus Jakarta Sans webfont).
+        .route("/assets/streamsaver.js", get(serve_asset_streamsaver))
+        .route("/assets/streamsaver-sw.js", get(serve_asset_streamsaver_sw))
+        .route("/assets/streamsaver-mitm.html", get(serve_asset_streamsaver_mitm_html))
+        .route("/assets/jszip.js", get(serve_asset_jszip))
+        .route("/assets/fflate.js", get(serve_asset_fflate))
+        .route("/assets/fonts-inline.css", get(serve_asset_fonts_inline_css))
         // Authentication routes
         .route("/api/register", post(register_user))
         .route("/api/login", post(login_user))
@@ -163,6 +172,46 @@ async fn serve_service_worker() -> impl IntoResponse {
         .header("service-worker-allowed", "/")
         .body(Body::from(include_str!("sw.js")))
         .unwrap()
+}
+
+// --- Embedded vendored frontend assets ---
+//
+// Every asset is embedded via include_str!/include_bytes! so the compiled
+// binary is completely self-contained and runs offline without reaching out to
+// any CDN. Long cache (1y immutable) since the bytes never change for a given
+// binary build.
+
+fn text_response(bytes: &'static str, content_type: &'static str) -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(axum::http::header::CACHE_CONTROL, "public, max-age=31536000, immutable")
+        .header(CONTENT_TYPE, content_type)
+        .body(Body::from(bytes))
+        .unwrap()
+}
+
+async fn serve_asset_streamsaver() -> impl IntoResponse {
+    text_response(include_str!("vendor/streamsaver.min.js"), "application/javascript; charset=utf-8")
+}
+
+async fn serve_asset_streamsaver_sw() -> impl IntoResponse {
+    text_response(include_str!("vendor/streamsaver_sw.js"), "application/javascript; charset=utf-8")
+}
+
+async fn serve_asset_streamsaver_mitm_html() -> impl IntoResponse {
+    text_response(include_str!("vendor/mitm.html"), "text/html; charset=utf-8")
+}
+
+async fn serve_asset_jszip() -> impl IntoResponse {
+    text_response(include_str!("vendor/jszip.min.js"), "application/javascript; charset=utf-8")
+}
+
+async fn serve_asset_fflate() -> impl IntoResponse {
+    text_response(include_str!("vendor/fflate.umd.js"), "application/javascript; charset=utf-8")
+}
+
+async fn serve_asset_fonts_inline_css() -> impl IntoResponse {
+    text_response(include_str!("vendor/fonts_inline.css"), "text/css; charset=utf-8")
 }
 
 // Multipart file uploader - requires authentication

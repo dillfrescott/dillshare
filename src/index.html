@@ -5,10 +5,18 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Dill Share - Secure File Sharing</title>
     <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect width='24' height='24' rx='5' fill='%234caf50'/%3E%3Cpath d='M19.35 10.04C18.67 6.59 15.64 4 12 4 9.11 4 6.6 5.64 5.35 8.04 2.34 8.36 0 10.91 0 14c0 3.31 2.69 6 6 6h13c2.76 0 5-2.24 5-5 0-2.64-2.05-4.78-4.65-4.96zM19 18H6c-2.21 0-4-1.79-4-4 0-2.05 1.53-3.76 3.56-3.97l1.07-.11.5-.95C8.08 7.14 9.94 6 12 6c2.62 0 4.88 1.86 5.39 4.43l.3 1.5 1.53.11c1.56.1 2.78 1.41 2.78 2.96 0 1.65-1.35 3-3 3zm-5.55-8h-2.9v3H7.5l4.5 4.5 4.5-4.5h-3.05z' fill='white' transform='matrix(0.6 0 0 0.6 4.8 4.8)'/%3E%3C/svg%3E">
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700&display=swap" rel="stylesheet">
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js" referrerpolicy="no-referrer"></script>
+    <link rel="stylesheet" href="/assets/fonts-inline.css">
+    <script src="/assets/jszip.js"></script>
+    <script src="/assets/fflate.js"></script>
+    <script src="/assets/streamsaver.js"></script>
+    <script>
+        // Point StreamSaver.js at our self-hosted MITM page + service worker so
+        // downloads are fully same-origin and the binary needs no CDN. Must be
+        // set before createWriteStream() is called.
+        if (window.streamSaver) {
+            streamSaver.mitm = '/assets/streamsaver-mitm.html';
+        }
+    </script>
     <style>
         :root {
             --bg-color: #0c0d12;
@@ -1766,36 +1774,79 @@
             }
         }
 
-        // Core decrypt-and-deliver routine. If `sink` (a FileSystemWritableFileStream)
-        // is supplied, decrypted bytes are streamed straight to it; otherwise they are
-        // buffered into plaintextChunks and (if `ownSink` is true) delivered via an
-        // anchor download at the end. onProgress is invoked per chunk.
+        // Core decrypt-and-deliver routine. If `sink` (a FileSystemWritableFileStream
+        // or WritableStreamDefaultWriter from StreamSaver.js) is supplied, decrypted
+        // bytes are streamed straight to it; otherwise they are buffered into
+        // plaintextChunks and (if `ownSink` is true) delivered via an anchor download
+        // at the end. onProgress is invoked per chunk.
         async function decryptAndDeliver(url, key, fileMeta, sink, ownSink, onProgress) {
-            const res = await fetch(url);
+            // Tie an AbortController to the fetch so that if the disk sink rejects
+            // (e.g. user cancels the StreamSaver download in the browser UI), we
+            // also tear down the upstream network read instead of letting it
+            // silently keep pulling bytes — which previously caused the page
+            // progress counter to keep climbing after the user had already hit
+            // cancel.
+            const ac = new AbortController();
+            const res = await fetch(url, { signal: ac.signal });
             if (!res.ok) throw new Error('File download failed');
 
             const isChunked = fileMeta && fileMeta.chunked === true;
             const plaintextChunks = sink ? null : [];
+            let errored = false;
+            // Counter tracks bytes that have actually landed in the sink, NOT
+            // bytes pulled from the network / decrypted. This is what makes the
+            // on-screen counter honest w.r.t. what's been persisted to disk.
+            let written = 0;
+            const report = (delta) => {
+                written += delta;
+                if (onProgress) onProgress({ bytesReceived: written, bytesDecrypted: written, totalBytes: isChunked ? fileMeta.size : (fileMeta && fileMeta.size) || written });
+            };
             try {
                 if (isChunked) {
                     const totalSize = fileMeta.size;
                     const reader = res.body.getReader();
-                    for await (const pt of streamDecryptChunked(reader, key, totalSize, onProgress)) {
-                        if (sink) await sink.write(pt);
-                        else plaintextChunks.push(pt);
+                    // NOTE: onProgress is intentionally NOT passed to the generator
+                    // here. Decryption alone is not a meaningful "downloaded"
+                    // signal; we only advance the counter after sink.write() /
+                    // buffer push succeeds below.
+                    for await (const pt of streamDecryptChunked(reader, key, totalSize)) {
+                        if (sink) {
+                            try { await sink.write(pt); }
+                            catch (e) {
+                                // Writer rejected (user cancelled / disk error).
+                                // Stop pulling from the network so progress halts.
+                                ac.abort();
+                                throw e;
+                            }
+                        } else {
+                            plaintextChunks.push(pt);
+                        }
+                        report(pt.length);
                     }
                     reader.releaseLock?.();
                 } else {
                     // Legacy single-block format: buffer then decrypt.
                     const ab = await res.arrayBuffer();
-                    if (onProgress) onProgress({ bytesReceived: ab.byteLength, bytesDecrypted: 0, totalBytes: ab.byteLength });
                     const pt = new Uint8Array(await decryptData(ab, key));
-                    if (onProgress) onProgress({ bytesReceived: ab.byteLength, bytesDecrypted: pt.length, totalBytes: ab.byteLength });
-                    if (sink) await sink.write(pt);
-                    else plaintextChunks.push(pt);
+                    if (sink) {
+                        try { await sink.write(pt); }
+                        catch (e) { ac.abort(); throw e; }
+                    } else {
+                        plaintextChunks.push(pt);
+                    }
+                    report(pt.length);
                 }
+            } catch (e) {
+                errored = true;
+                // Abort the stream on error so the user doesn't get a corrupt
+                // partial file (relevant for StreamSaver.js downloads).
+                ac.abort();
+                if (ownSink && sink) {
+                    try { if (sink.abort) await sink.abort(); else await sink.close(); } catch (_) {}
+                }
+                throw e;
             } finally {
-                if (ownSink && sink) await sink.close();
+                if (ownSink && sink && !errored) await sink.close();
             }
 
             if (ownSink && !sink) {
@@ -1814,21 +1865,22 @@
             return true;
         }
 
-        // Stream a decrypted file directly to disk via the File System Access API when
-        // available (Chrome/Edge). Falls back to an in-memory Blob + anchor download
-        // elsewhere (Safari/Firefox). Returns true if the download was delivered.
+        // Stream a decrypted file directly to disk via StreamSaver.js (shows a
+        // normal browser download bar) or falls back to an in-memory Blob +
+        // anchor download. Returns true if the download was delivered.
         async function downloadDecryptedFile(url, key, fileMeta, suggestedName, onProgress) {
-            const useFSA = typeof window.showSaveFilePicker === 'function';
             let sink = null;
-            if (useFSA) {
+            // StreamSaver.js streams to disk via a service worker and shows a
+            // normal browser download progress bar — no "save as" dialog.
+            if (typeof streamSaver !== 'undefined') {
                 try {
-                    const handle = await window.showSaveFilePicker({
-                        suggestedName: suggestedName
+                    const fileStream = streamSaver.createWriteStream(suggestedName, {
+                        size: fileMeta && typeof fileMeta.size === 'number' ? fileMeta.size : undefined
                     });
-                    sink = await handle.createWritable();
+                    sink = fileStream.getWriter();
                 } catch (e) {
-                    if (e && e.name === 'AbortError') return false; // user cancelled
-                    sink = null; // unsupported / blocked, fall back
+                    console.warn('StreamSaver failed, using blob download:', e);
+                    sink = null;
                 }
             }
             // Patch fileMeta to carry the suggested name for the anchor fallback.
@@ -2882,12 +2934,12 @@
             btnPreviewDownload.onclick = async (e) => {
                 e.preventDefault();
                 try {
-                    showToast('Streaming decrypted file to disk...', 'info');
                     const ok = await downloadDecryptedFile(fileUrl, key, file, filename, ({ bytesDecrypted, totalBytes: tb }) => {
                         const denom = tb || totalBytes;
                         if (denom > 0) {
                             const pct = Math.min(100, Math.round((bytesDecrypted / denom) * 100));
-                            showToast(`Decrypting ${pct}%...`, 'info');
+                            if (previewProgressBar) previewProgressBar.style.width = pct + '%';
+                            if (previewProgressLabel) previewProgressLabel.textContent = pct + '%';
                         }
                     });
                     if (ok) showToast('Download started successfully.', 'success');
@@ -3083,7 +3135,10 @@
             if (e.target === previewModal) closePreview();
         });
 
-        // Download all files in share decrypted inside a ZIP file
+        // Download all files in share decrypted inside a streaming ZIP.
+        // Uses fflate's streaming Zip API so that decrypted chunks flow directly
+        // into the ZIP output → disk sink, keeping memory usage flat regardless
+        // of total share size. Falls back to in-memory blob only as last resort.
         btnDownloadAll.addEventListener('click', async () => {
             if (!currentShareData || !currentShareData.files || currentShareData.files.length === 0) return;
 
@@ -3100,6 +3155,7 @@
             btnDownloadAll.style.pointerEvents = 'none';
 
             const totalFiles = currentShareData.files.length;
+            const zipFileName = `dill-share-${currentShareUUID}.zip`;
             showToast(`Preparing download of ${totalFiles} file(s)...`, 'info');
 
             try {
@@ -3117,53 +3173,137 @@
                     `;
                 };
 
-                const zip = new JSZip();
+                // --- Acquire a streaming disk sink for the ZIP output. ---
+                // StreamSaver.js triggers a normal browser download bar without
+                // any "save as" dialog.
+                let sink = null;
+
+                if (typeof streamSaver !== 'undefined') {
+                    try {
+                        const fileStream = streamSaver.createWriteStream(zipFileName);
+                        sink = fileStream.getWriter();
+                    } catch (e) {
+                        console.warn('StreamSaver.js failed, will buffer in memory:', e);
+                    }
+                }
+
+                // Collect chunks in memory only when no streaming sink is available.
+                const blobParts = sink ? null : [];
+
+                // --- Set up fflate streaming ZIP ---
+                const zip = new fflate.Zip();
+                // Queue write promises so we can await them before closing the sink.
+                let writeChain = Promise.resolve();
+                let zipErr = null;
+                zip.ondata = (err, chunk, final) => {
+                    if (err) { zipErr = err; return; }
+                    if (sink) {
+                        writeChain = writeChain.then(() => sink.write(chunk));
+                    } else {
+                        blobParts.push(chunk);
+                    }
+                };
+
+                // Process each file: fetch → stream-decrypt → push chunks into
+                // fflate ZipPassThrough entry → ZIP output flows to disk sink.
+                //
+                // A per-file AbortController lets us kill the upstream fetch the
+                // moment the disk sink rejects (user pressed cancel in the
+                // browser download bar), so the on-screen counter stops climbing
+                // instead of racing ahead of reality.
                 for (let i = 0; i < totalFiles; i++) {
                     const file = currentShareData.files[i];
+                    const filePlainSize = (typeof file.size === 'number') ? file.size : 0;
                     renderOverall(i, totalPlainSize > 0 ? Math.min(100, Math.round((processedPlainSize / totalPlainSize) * 100)) : 0);
 
                     const fileUrl = `/api/share/${currentShareUUID}/file/file_${file.id}.enc`;
-                    // Decrypt (chunked-aware) into memory for ZIP packaging.
-                    // ZIP itself must hold the bytes, so this path is inherently
-                    // buffered; chunked decrypt at least avoids buffering ciphertext.
-                    const filePlainSize = (typeof file.size === 'number') ? file.size : 0;
-                    const decBuf = await decryptFileToArrayBuffer(fileUrl, key, file, ({ bytesDecrypted, totalBytes: tb }) => {
-                        const denom = tb || filePlainSize;
-                        if (denom > 0 && totalPlainSize > 0) {
-                            const overall = Math.min(100, Math.round(((processedPlainSize + Math.min(bytesDecrypted, filePlainSize)) / totalPlainSize) * 100));
-                            renderOverall(i, overall);
-                        }
-                    });
-                    processedPlainSize += filePlainSize;
 
-                    // Add the decrypted file back to zip preserving file paths (directories)
-                    zip.file(file.name, decBuf);
+                    // Create a pass-through (STORE, no re-compression) ZIP entry.
+                    // Encrypted data is already incompressible, so STORE is both
+                    // faster and avoids extra memory overhead from deflate.
+                    const entry = new fflate.ZipPassThrough(file.name);
+                    zip.add(entry);
+
+                    const isChunked = file && file.chunked === true;
+                    const ac = new AbortController();
+                    let fileWritten = 0;
+
+                    try {
+                        if (isChunked) {
+                            // Stream-decrypt chunked file: each decrypted plaintext
+                            // chunk is pushed straight into the ZIP entry.
+                            const res = await fetch(fileUrl, { signal: ac.signal });
+                            if (!res.ok) throw new Error(`Failed to fetch file: ${file.name}`);
+                            const reader = res.body.getReader();
+                            // NOTE: do NOT pass onProgress to streamDecryptChunked
+                            // here — progress must reflect bytes that have actually
+                            // been handed to the ZIP/sink, not merely decrypted.
+                            for await (const pt of streamDecryptChunked(reader, key, filePlainSize)) {
+                                entry.push(pt, false);
+                                fileWritten += pt.length;
+                                // Drain through the writeChain so a rejected sink
+                                // (cancel) surfaces immediately rather than after
+                                // the entire archive is queued. This is what keeps
+                                // the counter from overrunning on cancel.
+                                await writeChain;
+                                if (zipErr) throw zipErr;
+                                if (totalPlainSize > 0) {
+                                    const overall = Math.min(100, Math.round(((processedPlainSize + fileWritten) / totalPlainSize) * 100));
+                                    renderOverall(i, overall);
+                                }
+                            }
+                            reader.releaseLock?.();
+                        } else {
+                            // Legacy single-block file: buffer ciphertext, decrypt, push.
+                            const res = await fetch(fileUrl, { signal: ac.signal });
+                            if (!res.ok) throw new Error(`Failed to fetch file: ${file.name}`);
+                            const ab = await res.arrayBuffer();
+                            const pt = new Uint8Array(await decryptData(ab, key));
+                            entry.push(pt, false);
+                            fileWritten += pt.length;
+                            await writeChain;
+                            if (zipErr) throw zipErr;
+                            if (totalPlainSize > 0) {
+                                const overall = Math.min(100, Math.round(((processedPlainSize + fileWritten) / totalPlainSize) * 100));
+                                renderOverall(i, overall);
+                            }
+                        }
+                    } catch (e) {
+                        ac.abort();
+                        if (sink) { try { await sink.abort(); } catch (_) {} }
+                        throw e;
+                    }
+
+                    // Signal that this file entry is complete.
+                    entry.push(new Uint8Array(0), true);
+                    processedPlainSize += filePlainSize;
                 }
 
-                btnDownloadAll.innerHTML = `
-                    <div class="loader" style="width:0.85rem; height:0.85rem; border-width:1px; margin-right:6px; display:inline-block; vertical-align:middle;"></div>
-                    Generating ZIP...
-                `;
+                // Finalize the ZIP archive (writes central directory).
+                zip.end();
 
-                const zipBlob = await zip.generateAsync({ type: 'blob' }, (metadata) => {
-                    if (metadata.percent) {
-                        btnDownloadAll.innerHTML = `
-                            <div class="loader" style="width:0.85rem; height:0.85rem; border-width:1px; margin-right:6px; display:inline-block; vertical-align:middle;"></div>
-                            Zipping ${Math.round(metadata.percent)}%...
-                        `;
-                    }
-                });
+                // Wait for all queued sink writes to complete.
+                await writeChain;
+                if (zipErr) throw zipErr;
 
-                // Trigger file download
-                const localUrl = URL.createObjectURL(zipBlob);
-                const a = document.createElement('a');
-                a.href = localUrl;
-                a.download = `dill-share-${currentShareUUID}.zip`;
-                document.body.appendChild(a);
-                a.click();
-                document.body.removeChild(a);
+                // Close the disk sink.
+                if (sink) {
+                    await sink.close();
+                }
 
-                setTimeout(() => URL.revokeObjectURL(localUrl), 15000);
+                // If no streaming sink was available, trigger a blob download.
+                if (!sink && blobParts) {
+                    const zipBlob = new Blob(blobParts, { type: 'application/zip' });
+                    const localUrl = URL.createObjectURL(zipBlob);
+                    const a = document.createElement('a');
+                    a.href = localUrl;
+                    a.download = zipFileName;
+                    document.body.appendChild(a);
+                    a.click();
+                    document.body.removeChild(a);
+                    setTimeout(() => URL.revokeObjectURL(localUrl), 15000);
+                }
+
                 showToast('ZIP archive downloaded successfully!', 'success');
 
             } catch (err) {
