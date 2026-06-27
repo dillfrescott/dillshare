@@ -218,7 +218,7 @@ async fn serve_asset_fonts_inline_css() -> impl IntoResponse {
 async fn upload_files(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
-    mut multipart: Multipart,
+    multipart: Multipart,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let token = extract_token(&headers)?;
     let (username, _) = verify_session(&token, &state)
@@ -226,6 +226,39 @@ async fn upload_files(
         .ok_or_else(|| (StatusCode::UNAUTHORIZED, "Invalid or expired session".to_string()))?;
 
     let uuid = uuid::Uuid::new_v4().to_string();
+
+    let result: Result<axum::Json<serde_json::Value>, (StatusCode, String)> =
+        upload_files_inner(&state, &username, &uuid, multipart).await;
+
+    match result {
+        Ok(json) => Ok(json),
+        Err(err) => {
+            // Upload failed or aborted — remove anything already written for this share.
+            let prefix = format!("uploads/{}/", uuid);
+            tracing::warn!(
+                "Upload {} failed ({:?}); cleaning up S3 prefix '{}'",
+                uuid,
+                err,
+                prefix
+            );
+            if let Err(cleanup_err) = delete_s3_prefix(&state.s3_client, &state.bucket, &prefix).await {
+                tracing::error!(
+                    "Failed to clean up aborted upload {}: {:?}",
+                    uuid,
+                    cleanup_err
+                );
+            }
+            Err(err)
+        }
+    }
+}
+
+async fn upload_files_inner(
+    state: &AppState,
+    username: &str,
+    uuid: &str,
+    mut multipart: Multipart,
+) -> Result<axum::Json<serde_json::Value>, (StatusCode, String)> {
     let mut uploaded_files = Vec::new();
     let mut total_size = 0;
 
