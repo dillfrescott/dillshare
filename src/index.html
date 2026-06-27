@@ -745,6 +745,24 @@
             border-color: rgba(211, 47, 47, 0.2);
         }
 
+        .action-btn:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+        }
+
+        .action-btn .loader {
+            width: 0.95rem;
+            height: 0.95rem;
+            border-width: 2px;
+            border-color: rgba(255, 255, 255, 0.15);
+            border-top-color: var(--primary);
+        }
+
+        .action-btn.delete .loader {
+            border-color: rgba(211, 47, 47, 0.2);
+            border-top-color: var(--danger);
+        }
+
         .action-btn svg {
             width: 0.95rem;
             height: 0.95rem;
@@ -2657,6 +2675,10 @@
                     btn.addEventListener('click', async (e) => {
                         const uuid = e.currentTarget.getAttribute('data-uuid');
                         if (confirm('Are you sure you want to delete this share and all its files?')) {
+                            const targetBtn = e.currentTarget;
+                            const origHTML = targetBtn.innerHTML;
+                            targetBtn.disabled = true;
+                            targetBtn.innerHTML = '<div class="loader"></div>';
                             try {
                                 const headers = {};
                                 const token = localStorage.getItem('dill_session_token');
@@ -2682,10 +2704,14 @@
                                     showToast('Share deleted successfully', 'success');
                                 } else {
                                     showToast('Delete failed: ' + await delRes.text(), 'error');
+                                    targetBtn.disabled = false;
+                                    targetBtn.innerHTML = origHTML;
                                 }
                                 loadSharesList();
                             } catch (err) {
                                 showToast('Network error during delete', 'error');
+                                targetBtn.disabled = false;
+                                targetBtn.innerHTML = origHTML;
                             }
                         }
                     });
@@ -4363,12 +4389,16 @@
                                     </table>
                                 `;
 
-                                // Attach event listeners to admin revoke session buttons
+                                 // Attach event listeners to admin revoke session buttons
                                 container.querySelectorAll('.admin-revoke-session-btn').forEach(revokeBtn => {
                                     revokeBtn.addEventListener('click', async (evt) => {
                                         const uName = evt.currentTarget.getAttribute('data-username');
                                         const sId = evt.currentTarget.getAttribute('data-session-id');
                                         if (confirm(`Are you sure you want to revoke this session for user ${uName}?`)) {
+                                            const targetBtn = evt.currentTarget;
+                                            const origHTML = targetBtn.innerHTML;
+                                            targetBtn.disabled = true;
+                                            targetBtn.innerHTML = '<div class="loader"></div>';
                                             try {
                                                 const delSessRes = await fetch(`/api/admin/user/${uName}/sessions/${sId}`, {
                                                     method: 'DELETE',
@@ -4382,9 +4412,13 @@
                                                     btn.click(); // open it and reload
                                                 } else {
                                                     showToast('Failed to revoke session: ' + await delSessRes.text(), 'error');
+                                                    targetBtn.disabled = false;
+                                                    targetBtn.innerHTML = origHTML;
                                                 }
                                             } catch (err) {
                                                 showToast('Network error during session revocation', 'error');
+                                                targetBtn.disabled = false;
+                                                targetBtn.innerHTML = origHTML;
                                             }
                                         }
                                     });
@@ -4405,6 +4439,10 @@
                     btn.addEventListener('click', async (e) => {
                         const uuid = e.currentTarget.getAttribute('data-uuid');
                         if (confirm(`Are you sure you want to delete share ${uuid} and all its files?`)) {
+                            const targetBtn = e.currentTarget;
+                            const origHTML = targetBtn.innerHTML;
+                            targetBtn.disabled = true;
+                            targetBtn.innerHTML = '<div class="loader"></div>';
                             try {
                                 const res = await fetch(`/api/admin/share/${uuid}`, {
                                     method: 'DELETE',
@@ -4418,9 +4456,13 @@
                                         loadAdminStats();
                                     }
                                     showToast('Delete failed: ' + await res.text(), 'error');
+                                    targetBtn.disabled = false;
+                                    targetBtn.innerHTML = origHTML;
                                 }
                             } catch (err) {
                                 showToast('Network error during deletion', 'error');
+                                targetBtn.disabled = false;
+                                targetBtn.innerHTML = origHTML;
                             }
                         }
                     });
@@ -4431,6 +4473,10 @@
                     btn.addEventListener('click', async (e) => {
                         const username = e.currentTarget.getAttribute('data-username');
                         if (confirm(`CRITICAL WARNING: Are you sure you want to delete user "${username}"?\nThis will permanently delete their account profile AND all S3 files associated with their shares.`)) {
+                            const targetBtn = e.currentTarget;
+                            const origHTML = targetBtn.innerHTML;
+                            targetBtn.disabled = true;
+                            targetBtn.innerHTML = '<div class="loader"></div>';
                             try {
                                 const res = await fetch(`/api/admin/user/${username}`, {
                                     method: 'DELETE',
@@ -4444,9 +4490,13 @@
                                         loadAdminStats();
                                     }
                                     showToast('Delete failed: ' + await res.text(), 'error');
+                                    targetBtn.disabled = false;
+                                    targetBtn.innerHTML = origHTML;
                                 }
                             } catch (err) {
                                 showToast('Network error during deletion', 'error');
+                                targetBtn.disabled = false;
+                                targetBtn.innerHTML = origHTML;
                             }
                         }
                     });
