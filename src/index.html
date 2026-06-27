@@ -1374,6 +1374,10 @@
                         <label for="auth-password" style="font-size: 0.8rem; color: var(--text-muted); font-weight: 500;">Password</label>
                         <input type="password" id="auth-password" required autocomplete="current-password" style="background: rgba(0,0,0,0.2); border: 1px solid var(--surface-border); border-radius: 4px; padding: 0.5rem 0.75rem; color: var(--text-main); font-family: inherit; font-size: 0.85rem; outline: none;">
                     </div>
+                    <div id="auth-confirm-password-wrap" style="display: none; flex-direction: column; gap: 0.4rem;">
+                        <label for="auth-confirm-password" style="font-size: 0.8rem; color: var(--text-muted); font-weight: 500;">Confirm Password</label>
+                        <input type="password" id="auth-confirm-password" autocomplete="new-password" style="background: rgba(0,0,0,0.2); border: 1px solid var(--surface-border); border-radius: 4px; padding: 0.5rem 0.75rem; color: var(--text-main); font-family: inherit; font-size: 0.85rem; outline: none;">
+                    </div>
                     <button class="btn" type="submit" id="btn-auth-submit" style="justify-content: center; padding: 0.6rem; font-weight: 600; margin-top: 0.5rem;">
                         Sign In
                     </button>
@@ -3487,6 +3491,8 @@
         const authForm = document.getElementById('auth-form');
         const authUsernameInput = document.getElementById('auth-username');
         const authPasswordInput = document.getElementById('auth-password');
+        const authConfirmPasswordInput = document.getElementById('auth-confirm-password');
+        const authConfirmPasswordWrap = document.getElementById('auth-confirm-password-wrap');
         const btnAuthSubmit = document.getElementById('btn-auth-submit');
         const authModalTitle = document.getElementById('auth-modal-title');
         const authToggleText = document.getElementById('auth-toggle-text');
@@ -3502,6 +3508,8 @@
             authToggleLink.textContent = 'Create Account';
             authUsernameInput.value = '';
             authPasswordInput.value = '';
+            authConfirmPasswordInput.value = '';
+            authConfirmPasswordWrap.style.display = 'none';
             authModal.classList.add('active');
         });
 
@@ -3521,11 +3529,14 @@
                 btnAuthSubmit.textContent = 'Register';
                 authToggleText.textContent = 'Already have an account?';
                 authToggleLink.textContent = 'Sign In';
+                authConfirmPasswordWrap.style.display = 'flex';
             } else {
                 authModalTitle.textContent = 'Sign In';
                 btnAuthSubmit.textContent = 'Sign In';
                 authToggleText.textContent = "Don't have an account?";
                 authToggleLink.textContent = 'Create Account';
+                authConfirmPasswordWrap.style.display = 'none';
+                authConfirmPasswordInput.value = '';
             }
         });
 
@@ -3535,6 +3546,11 @@
             const password = authPasswordInput.value;
 
             if (!username || !password) return;
+
+            if (isRegisterMode && password !== authConfirmPasswordInput.value) {
+                showToast('Passwords do not match', 'error');
+                return;
+            }
 
             btnAuthSubmit.disabled = true;
             btnAuthSubmit.innerHTML = `<div class="loader" style="width:0.85rem; height:0.85rem; border-width:1px; margin:0 auto; display:inline-block; vertical-align:middle;"></div>`;
