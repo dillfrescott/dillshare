@@ -1164,11 +1164,10 @@ async fn admin_delete_user(
     }
 
     let user_profile_key = format!("users/{}.json", username);
-    let user_shares_enc_key = format!("users/{}/shares.enc", username);
+    let user_folder_prefix = format!("users/{}/", username);
 
     let _ = state.s3_client.delete_object().bucket(&state.bucket).key(&user_profile_key).send().await;
-    let _ = state.s3_client.delete_object().bucket(&state.bucket).key(&user_shares_enc_key).send().await;
-    let _ = state.s3_client.delete_object().bucket(&state.bucket).key(&public_shares_key).send().await;
+    let _ = delete_s3_prefix(&state.s3_client, &state.bucket, &user_folder_prefix).await;
 
     Ok(StatusCode::OK)
 }
@@ -1232,13 +1231,11 @@ async fn verify_admin(headers: &axum::http::HeaderMap, state: &AppState) -> Resu
     Err((StatusCode::FORBIDDEN, "Invalid admin token".to_string()))
 }
 
-async fn delete_share_objects(s3_client: &aws_sdk_s3::Client, bucket: &str, uuid: &str) -> Result<(), (StatusCode, String)> {
-    let prefix = format!("uploads/{}/", uuid);
-
+async fn delete_s3_prefix(s3_client: &aws_sdk_s3::Client, bucket: &str, prefix: &str) -> Result<(), (StatusCode, String)> {
     let mut response = s3_client
         .list_objects_v2()
         .bucket(bucket)
-        .prefix(&prefix)
+        .prefix(prefix)
         .into_paginator()
         .send();
 
@@ -1277,6 +1274,11 @@ async fn delete_share_objects(s3_client: &aws_sdk_s3::Client, bucket: &str, uuid
     }
 
     Ok(())
+}
+
+async fn delete_share_objects(s3_client: &aws_sdk_s3::Client, bucket: &str, uuid: &str) -> Result<(), (StatusCode, String)> {
+    let prefix = format!("uploads/{}/", uuid);
+    delete_s3_prefix(s3_client, bucket, &prefix).await
 }
 
 async fn get_user_profile(
@@ -1514,13 +1516,10 @@ async fn user_delete_account(
     }
 
     let user_profile_key = format!("users/{}.json", username);
-    let user_shares_enc_key = format!("users/{}/shares.enc", username);
-    let sessions_key = format!("users/{}/sessions.json", username);
+    let user_folder_prefix = format!("users/{}/", username);
 
     let _ = state.s3_client.delete_object().bucket(&state.bucket).key(&user_profile_key).send().await;
-    let _ = state.s3_client.delete_object().bucket(&state.bucket).key(&user_shares_enc_key).send().await;
-    let _ = state.s3_client.delete_object().bucket(&state.bucket).key(&public_shares_key).send().await;
-    let _ = state.s3_client.delete_object().bucket(&state.bucket).key(&sessions_key).send().await;
+    let _ = delete_s3_prefix(&state.s3_client, &state.bucket, &user_folder_prefix).await;
 
     Ok(StatusCode::OK)
 }
