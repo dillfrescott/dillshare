@@ -129,6 +129,10 @@ self.addEventListener('message', async (event) => {
     if (d.type === 'DILL_PREVIEW_INIT') {
         console.log('[dill-sw] INIT received for', d.streamPath, 'chunked=', d.chunked, 'size=', d.size);
         try {
+            if (files.size >= 5) {
+                const firstKey = files.keys().next().value;
+                files.delete(firstKey);
+            }
             const key = await importKeyFromRaw(d.keyRaw);
             const entry = {
                 key,
@@ -138,6 +142,7 @@ self.addEventListener('message', async (event) => {
                 contentType: d.contentType || 'application/octet-stream',
                 url: d.url,
                 cached: null, // only used for legacy single-block format
+                chunkCache: new Map(), // Map<chunkIndex, Promise<Uint8Array>>
             };
             files.set(d.streamPath, entry);
             console.log('[dill-sw] INIT ok, replying READY');
@@ -261,6 +266,44 @@ function headHeaders(meta, total) {
     return h;
 }
 
+async function getDecryptedChunk(meta, r, signal) {
+    if (!meta.chunkCache) {
+        meta.chunkCache = new Map();
+    }
+    const idx = r.chunkIndex;
+    if (meta.chunkCache.has(idx)) {
+        try {
+            return await meta.chunkCache.get(idx);
+        } catch (e) {
+            meta.chunkCache.delete(idx);
+        }
+    }
+
+    const promise = (async () => {
+        const fetchOpts = {
+            headers: { Range: `bytes=${r.fetchStart}-${r.fetchEnd - 1}` }
+        };
+        if (signal) fetchOpts.signal = signal;
+        const res = await fetch(meta.url, fetchOpts);
+        if (!res.ok && res.status !== 206) {
+            throw new Error('Upstream fetch failed: ' + res.status);
+        }
+        const buf = new Uint8Array(await res.arrayBuffer());
+        const iv = buf.subarray(0, 12);
+        const ct = buf.subarray(12, 12 + r.ctLen);
+        return await decryptChunk(iv, ct, meta.key);
+    })();
+
+    meta.chunkCache.set(idx, promise);
+
+    try {
+        return await promise;
+    } catch (err) {
+        meta.chunkCache.delete(idx);
+        throw err;
+    }
+}
+
 async function respondChunkedRange(meta, start, end, isRange) {
     const ranges = plainRangeToCtRanges(start, end, meta.size);
     const totalLength = end - start;
@@ -277,36 +320,20 @@ async function respondChunkedRange(meta, start, end, isRange) {
     console.log('[dill-sw] respondChunkedRange:', start, '-', end, 'len', totalLength, 'status', status, 'chunks', ranges.length, 'ct', meta.contentType);
 
     // Stream decrypted chunk slices to the media element as they are produced,
-    // so playback can begin after the first chunk arrives instead of waiting
-    // for the entire requested range to be decrypted.
+    // using in-memory cached chunks for instant seeking and playback resume.
     let aborted = false;
+    const streamAc = new AbortController();
     let chunkIndex = 0;
     const stream = new ReadableStream({
         async start(controller) {
             try {
                 for (const r of ranges) {
                     if (aborted) break;
-                    // A closed/errored stream has desiredSize === null; stop
-                    // processing once the consumer (media element) cancels so we
-                    // never enqueue into a closed stream.
                     if (controller.desiredSize === null) break;
-                    // Fetch the entire chunk block (IV + ct + tag) in one range
-                    // request. AES-GCM requires the full ciphertext+tag to
-                    // verify, so we can't fetch a partial slice of a chunk.
-                    const res = await fetch(meta.url, {
-                        headers: { Range: `bytes=${r.fetchStart}-${r.fetchEnd - 1}` },
-                    });
-                    if (!res.ok && res.status !== 206) {
-                        throw new Error('Upstream fetch failed: ' + res.status);
-                    }
-                    const buf = new Uint8Array(await res.arrayBuffer());
-                    // fetchStart == ivStart, so buf[0:12] is the IV and
-                    // buf[12:12+ctLen] is ct+tag.
-                    const iv = buf.subarray(0, 12);
-                    const ct = buf.subarray(12, 12 + r.ctLen);
-                    const pt = await decryptChunk(iv, ct, meta.key);
+
+                    const pt = await getDecryptedChunk(meta, r, streamAc.signal);
                     if (aborted || controller.desiredSize === null) break;
-                    // Yield only the requested plaintext sub-slice of this chunk.
+
                     const piece = pt.subarray(r.plainStartInChunk, r.plainEndInChunk);
                     if (piece.length > 0) {
                         try { controller.enqueue(piece); }
@@ -319,11 +346,16 @@ async function respondChunkedRange(meta, start, end, isRange) {
                     console.log('[dill-sw] stream closed, all chunks sent');
                 }
             } catch (err) {
-                console.error('[dill-sw] stream error:', err);
+                if (err.name !== 'AbortError') {
+                    console.error('[dill-sw] stream error:', err);
+                }
                 try { controller.error(err); } catch (_) {}
             }
         },
-        cancel() { aborted = true; }
+        cancel() {
+            aborted = true;
+            try { streamAc.abort(); } catch (_) {}
+        }
     });
 
     return new Response(stream, { status, headers });
