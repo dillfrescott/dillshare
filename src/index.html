@@ -2885,45 +2885,53 @@
         function configureMarked() {
             if (markedConfigured || typeof marked === 'undefined') return;
             markedConfigured = true;
+            const escapeHtml = str => str.replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
             marked.use({
                 renderer: {
-                    paragraph(text) {
-                        return `<p class="md-p">${text}</p>\n`;
+                    paragraph(token) {
+                        return `<p class="md-p">${this.parser.parseInline(token.tokens)}</p>\n`;
                     },
-                    heading(text, level) {
-                        return `<h${level} class="md-h${level}">${text}</h${level}>\n`;
+                    heading(token) {
+                        return `<h${token.depth} class="md-h${token.depth}">${this.parser.parseInline(token.tokens)}</h${token.depth}>\n`;
                     },
-                    list(body, ordered, start) {
-                        const type = ordered ? 'ol' : 'ul';
-                        const startAtt = (ordered && start !== 1) ? ` start="${start}"` : '';
+                    list(token) {
+                        const type = token.ordered ? 'ol' : 'ul';
+                        const startAtt = (token.ordered && token.start !== 1) ? ` start="${token.start}"` : '';
+                        let body = '';
+                        for (let i = 0; i < token.items.length; i++) {
+                            body += this.listitem(token.items[i]);
+                        }
                         return `<${type}${startAtt} class="md-list">\n${body}</${type}>\n`;
                     },
-                    blockquote(quote) {
-                        return `<blockquote class="md-quote">\n${quote}</blockquote>\n`;
+                    blockquote(token) {
+                        return `<blockquote class="md-quote">\n${this.parser.parse(token.tokens)}</blockquote>\n`;
                     },
                     hr() {
                         return `<hr class="md-hr">\n`;
                     },
-                    link(href, title, text) {
+                    link(token) {
+                        const href = token.href;
+                        const title = token.title;
+                        const text = this.parser.parseInline(token.tokens);
                         if (href === null) return text;
                         let out = `<a href="${href}" class="md-link" target="_blank" rel="noopener noreferrer"`;
                         if (title) out += ` title="${title}"`;
                         out += `>${text}</a>`;
                         return out;
                     },
-                    codespan(text) {
-                        return `<code class="md-inline-code">${text}</code>`;
+                    codespan(token) {
+                        return `<code class="md-inline-code">${escapeHtml(token.text)}</code>`;
                     },
-                    code(code, infostring, escaped) {
-                        const lang = (infostring || '').match(/\S*/)[0];
-                        const escapeHtml = str => str.replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
-                        const content = escaped ? code : escapeHtml(code);
+                    code(token) {
+                        const lang = (token.lang || token.infostring || '').match(/\S*/)[0];
+                        const content = token.escaped ? token.text : escapeHtml(token.text);
                         const codeAttr = lang ? ` class="language-${escapeHtml(lang)}"` : '';
                         return `<pre class="md-code-block"><code${codeAttr}>${content}</code></pre>\n`;
                     }
                 }
             });
         }
+
 
         function renderMarkdown(text) {
             if (!text) return '';
