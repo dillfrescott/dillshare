@@ -120,6 +120,7 @@ async fn main() {
         .route("/assets/streamsaver-mitm.html", get(serve_asset_streamsaver_mitm_html))
         .route("/assets/jszip.js", get(serve_asset_jszip))
         .route("/assets/fflate.js", get(serve_asset_fflate))
+        .route("/assets/marked.js", get(serve_asset_marked))
         .route("/assets/fonts-inline.css", get(serve_asset_fonts_inline_css))
         // Authentication routes
         .route("/api/register", post(register_user))
@@ -220,6 +221,10 @@ async fn serve_asset_fflate() -> impl IntoResponse {
 
 async fn serve_asset_fonts_inline_css() -> impl IntoResponse {
     text_response(include_str!("vendor/fonts_inline.css"), "text/css; charset=utf-8")
+}
+
+async fn serve_asset_marked() -> impl IntoResponse {
+    text_response(include_str!("vendor/marked.min.js"), "application/javascript; charset=utf-8")
 }
 
 // Multipart file uploader - requires authentication
@@ -863,19 +868,7 @@ async fn get_share(
         Err(_) => String::new(),
     };
 
-    let mut owner_pfp = None;
-    if !owner.is_empty() {
-        let user_key = format!("users/{}.json", owner);
-        if let Ok(res) = state.s3_client.get_object().bucket(&state.bucket).key(&user_key).send().await {
-            if let Ok(bytes) = res.body.collect().await {
-                if let Ok(user_json) = serde_json::from_slice::<serde_json::Value>(&bytes.into_bytes()) {
-                    if let Some(pfp) = user_json.get("pfp").and_then(|v| v.as_str()) {
-                        owner_pfp = Some(pfp.to_string());
-                    }
-                }
-            }
-        }
-    }
+    let owner_pfp = None;
 
     let expires_at = latest_upload_time + chrono::Duration::days(90);
 
@@ -1360,11 +1353,12 @@ async fn login_user(
             .await;
     }
 
-    let pfp = user_json.get("pfp").and_then(|v| v.as_str()).unwrap_or("");
+    let pfp_enc = fetch_user_pfp_enc(&state, username).await;
 
     Ok(axum::Json(serde_json::json!({
         "token": token,
-        "pfp": pfp
+        "pfp_enc": pfp_enc,
+        "pfp": pfp_enc
     })))
 }
 
@@ -1812,6 +1806,26 @@ async fn delete_share_objects(s3_client: &aws_sdk_s3::Client, bucket: &str, uuid
     delete_s3_prefix(s3_client, bucket, &prefix).await
 }
 
+async fn fetch_user_pfp_enc(state: &AppState, username: &str) -> String {
+    let pfp_key = format!("users/{}/pfp.enc", username);
+    match state.s3_client.get_object()
+        .bucket(&state.bucket)
+        .key(&pfp_key)
+        .send()
+        .await
+    {
+        Ok(output) => {
+            if let Ok(bytes) = output.body.collect().await {
+                let vec = bytes.into_bytes().to_vec();
+                vec.iter().map(|b| format!("{:02x}", b)).collect::<String>()
+            } else {
+                String::new()
+            }
+        }
+        Err(_) => String::new(),
+    }
+}
+
 async fn get_user_profile(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
@@ -1821,31 +1835,20 @@ async fn get_user_profile(
         .await
         .ok_or_else(|| (StatusCode::UNAUTHORIZED, "Invalid or expired session".to_string()))?;
 
-    let user_key = format!("users/{}.json", username);
-    let res = state.s3_client.get_object()
-        .bucket(&state.bucket)
-        .key(&user_key)
-        .send()
-        .await
-        .map_err(|_| (StatusCode::NOT_FOUND, "User not found".to_string()))?;
-
-    let bytes = res.body.collect().await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .into_bytes();
-
-    let user_json: serde_json::Value = serde_json::from_slice(&bytes)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    let pfp = user_json.get("pfp").and_then(|v| v.as_str()).unwrap_or("");
+    let pfp_enc = fetch_user_pfp_enc(&state, &username).await;
 
     Ok(axum::Json(serde_json::json!({
         "username": username,
-        "pfp": pfp
+        "pfp_enc": pfp_enc,
+        "pfp": pfp_enc
     })))
 }
 
 #[derive(serde::Deserialize)]
 struct SaveProfileRequest {
+    #[serde(default)]
+    pfp_enc: String,
+    #[serde(default)]
     pfp: String,
 }
 
@@ -1859,41 +1862,66 @@ async fn save_user_profile(
         .await
         .ok_or_else(|| (StatusCode::UNAUTHORIZED, "Invalid or expired session".to_string()))?;
 
+    // Clean up legacy base64 pfp from users/{username}.json if present
     let user_key = format!("users/{}.json", username);
-    
-    let res = state.s3_client.get_object()
-        .bucket(&state.bucket)
-        .key(&user_key)
-        .send()
-        .await
-        .map_err(|_| (StatusCode::NOT_FOUND, "User profile not found".to_string()))?;
-
-    let bytes = res.body.collect().await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .into_bytes();
-
-    let mut user_json: serde_json::Value = serde_json::from_slice(&bytes)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    if payload.pfp.len() > 8_000_000 {
-        return Err((StatusCode::BAD_REQUEST, "Profile picture too large (max 5MB)".to_string()));
+    if let Ok(res) = state.s3_client.get_object().bucket(&state.bucket).key(&user_key).send().await {
+        if let Ok(bytes) = res.body.collect().await {
+            if let Ok(mut user_json) = serde_json::from_slice::<serde_json::Value>(&bytes.into_bytes()) {
+                if let Some(obj) = user_json.as_object_mut() {
+                    if obj.remove("pfp").is_some() {
+                        if let Ok(user_bytes) = serde_json::to_vec(&user_json) {
+                            let _ = state.s3_client.put_object()
+                                .bucket(&state.bucket)
+                                .key(&user_key)
+                                .content_type("application/json")
+                                .body(aws_sdk_s3::primitives::ByteStream::from(user_bytes))
+                                .send()
+                                .await;
+                        }
+                    }
+                }
+            }
+        }
     }
 
-    if let Some(obj) = user_json.as_object_mut() {
-        obj.insert("pfp".to_string(), serde_json::Value::String(payload.pfp));
+    let hex_data = if !payload.pfp_enc.is_empty() {
+        payload.pfp_enc
+    } else {
+        payload.pfp
+    };
+
+    let pfp_key = format!("users/{}/pfp.enc", username);
+
+    if hex_data.trim().is_empty() {
+        let _ = state.s3_client.delete_object()
+            .bucket(&state.bucket)
+            .key(&pfp_key)
+            .send()
+            .await;
+    } else {
+        let mut bytes = Vec::new();
+        let hex_str = hex_data.trim();
+        for i in (0..hex_str.len()).step_by(2) {
+            if i + 2 > hex_str.len() { break; }
+            let byte_str = &hex_str[i..i+2];
+            let byte = u8::from_str_radix(byte_str, 16)
+                .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid encrypted payload hex encoding".to_string()))?;
+            bytes.push(byte);
+        }
+
+        if bytes.len() > 12_000_000 {
+            return Err((StatusCode::BAD_REQUEST, "Profile picture too large".to_string()));
+        }
+
+        state.s3_client.put_object()
+            .bucket(&state.bucket)
+            .key(&pfp_key)
+            .content_type("application/octet-stream")
+            .body(aws_sdk_s3::primitives::ByteStream::from(bytes))
+            .send()
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to update profile picture: {:?}", e)))?;
     }
-
-    let user_bytes = serde_json::to_vec(&user_json)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    state.s3_client.put_object()
-        .bucket(&state.bucket)
-        .key(&user_key)
-        .content_type("application/json")
-        .body(aws_sdk_s3::primitives::ByteStream::from(user_bytes))
-        .send()
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to update profile: {:?}", e)))?;
 
     Ok(StatusCode::OK)
 }
@@ -1903,6 +1931,8 @@ struct ChangePasswordRequest {
     current_auth_key: String,
     new_auth_key: String,
     new_shares_enc: String,
+    #[serde(default)]
+    new_pfp_enc: Option<String>,
 }
 
 async fn user_change_password(
@@ -1984,6 +2014,34 @@ async fn user_change_password(
         .send()
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to save new shares: {:?}", e)))?;
+
+    if let Some(ref new_pfp) = payload.new_pfp_enc {
+        let pfp_key = format!("users/{}/pfp.enc", username);
+        if new_pfp.trim().is_empty() {
+            let _ = state.s3_client.delete_object()
+                .bucket(&state.bucket)
+                .key(&pfp_key)
+                .send()
+                .await;
+        } else {
+            let mut bytes = Vec::new();
+            let hex_str = new_pfp.trim();
+            for i in (0..hex_str.len()).step_by(2) {
+                if i + 2 > hex_str.len() { break; }
+                let byte_str = &hex_str[i..i+2];
+                if let Ok(byte) = u8::from_str_radix(byte_str, 16) {
+                    bytes.push(byte);
+                }
+            }
+            let _ = state.s3_client.put_object()
+                .bucket(&state.bucket)
+                .key(&pfp_key)
+                .content_type("application/octet-stream")
+                .body(aws_sdk_s3::primitives::ByteStream::from(bytes))
+                .send()
+                .await;
+        }
+    }
 
     // Revoke all OTHER sessions of this user upon password change (forces relogin on other devices)
     let sessions_key = format!("users/{}/sessions.json", username);

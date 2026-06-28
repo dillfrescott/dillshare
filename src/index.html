@@ -8,6 +8,7 @@
     <link rel="stylesheet" href="/assets/fonts-inline.css">
     <script src="/assets/jszip.js"></script>
     <script src="/assets/fflate.js"></script>
+    <script src="/assets/marked.js"></script>
     <script src="/assets/streamsaver.js"></script>
     <script>
         // Point StreamSaver.js at our self-hosted MITM page + service worker so
@@ -458,6 +459,78 @@
             width: 0.9rem;
             height: 0.9rem;
             fill: currentColor;
+        }
+
+        /* Encrypted Note Markdown Styling */
+        .md-p {
+            margin: 0 0 0.6rem 0;
+        }
+        .md-p:last-child {
+            margin-bottom: 0;
+        }
+        .md-h1, .md-h2, .md-h3, .md-h4, .md-h5, .md-h6 {
+            color: var(--text-main);
+            margin: 0.8rem 0 0.4rem 0;
+            font-weight: 600;
+            line-height: 1.3;
+        }
+        .md-h1:first-child, .md-h2:first-child, .md-h3:first-child,
+        .md-h4:first-child, .md-h5:first-child, .md-h6:first-child {
+            margin-top: 0;
+        }
+        .md-h1 { font-size: 1.3rem; border-bottom: 1px solid var(--surface-border); padding-bottom: 0.3rem; }
+        .md-h2 { font-size: 1.15rem; border-bottom: 1px solid var(--surface-border); padding-bottom: 0.2rem; }
+        .md-h3 { font-size: 1.05rem; }
+        .md-h4 { font-size: 0.95rem; }
+        .md-h5, .md-h6 { font-size: 0.85rem; }
+        .md-list {
+            margin: 0 0 0.6rem 0;
+            padding-left: 1.3rem;
+        }
+        .md-list:last-child {
+            margin-bottom: 0;
+        }
+        .md-list li {
+            margin-bottom: 0.2rem;
+        }
+        .md-quote {
+            border-left: 3px solid var(--primary);
+            padding-left: 0.75rem;
+            color: var(--text-muted);
+            margin: 0.6rem 0;
+            font-style: italic;
+            background: rgba(255, 255, 255, 0.02);
+            border-radius: 0 4px 4px 0;
+        }
+        .md-hr {
+            border: none;
+            border-top: 1px solid var(--surface-border);
+            margin: 0.8rem 0;
+        }
+        .md-link {
+            color: var(--primary);
+            text-decoration: underline;
+            word-break: break-all;
+        }
+        .md-inline-code {
+            background: rgba(255, 255, 255, 0.1);
+            padding: 0.15rem 0.35rem;
+            border-radius: 4px;
+            font-family: monospace;
+            font-size: 0.85em;
+            color: #e2e8f0;
+        }
+        .md-code-block {
+            background: rgba(0, 0, 0, 0.3);
+            padding: 0.65rem 0.85rem;
+            border-radius: 6px;
+            overflow-x: auto;
+            margin: 0.6rem 0;
+            font-family: monospace;
+            font-size: 0.85rem;
+            border: 1px solid var(--surface-border);
+            color: #f1f5f9;
+            line-height: 1.4;
         }
 
         .breadcrumbs {
@@ -1153,7 +1226,16 @@
                 <div class="files-list" id="selected-files-list">
                     <!-- Dynamic Rows -->
                 </div>
-                <div class="btn-group" style="justify-content: flex-end;">
+                <div style="margin-top: 1rem; padding-top: 1rem; border-top: 1px solid var(--surface-border);">
+                    <div style="display: flex; justify-content: space-between; font-size: 0.85rem; font-weight: 600; color: var(--text-main); margin-bottom: 0.35rem;">
+                        <span>Share Message (Optional, Encrypted, Markdown Supported)</span>
+                        <span id="message-char-count" style="color: var(--text-muted); font-weight: normal;">0 / 4000</span>
+                    </div>
+                    <textarea id="share-message-input" maxlength="4000" rows="3" class="input-field" 
+                              placeholder="Add a private note or markdown message for recipients (max 4000 chars)..." 
+                              style="width: 100%; resize: vertical; box-sizing: border-box; font-family: inherit; background: var(--surface-color); border: 1px solid var(--surface-border); border-radius: 6px; padding: 0.6rem 0.75rem; color: var(--text-main); font-size: 0.85rem; outline: none;"></textarea>
+                </div>
+                <div class="btn-group" style="justify-content: flex-end; margin-top: 1rem;">
                     <button class="btn btn-secondary" id="btn-clear-files">Clear</button>
                     <button class="btn" id="btn-upload">
                         <svg style="width:1.1rem;height:1.1rem;fill:currentColor;" viewBox="0 0 24 24"><path d="M5 20h14v-2H5v2zm0-10h4v6h6v-6h4l-7-7-7 7z"/></svg>
@@ -1424,6 +1506,15 @@
                             <span>Expires in: Calculating...</span>
                         </div>
                     </div>
+                </div>
+
+                <!-- Decrypted Share Message Card -->
+                <div id="share-message-card" style="display: none; margin-top: 1rem; margin-bottom: 1.25rem; padding: 0.85rem 1rem; border-radius: 6px; background: var(--surface-color); border: 1px solid var(--surface-border);">
+                    <div style="font-size: 0.75rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-muted); margin-bottom: 0.4rem; display: flex; align-items: center; gap: 0.35rem;">
+                        <svg style="width:0.85rem;height:0.85rem;fill:currentColor;" viewBox="0 0 24 24"><path d="M18 8h-1V6c0-2.76-2.24-5-5-5S7 3.24 7 6v2H6c-1.1 0-2 .9-2 2v10c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V10c0-1.1-.9-2-2-2zm-6 9c-1.1 0-2-.9-2-2s.9-2 2-2 2 .9 2 2-.9 2-2 2zm3.1-9H8.9V6c0-1.71 1.39-3.1 3.1-3.1 1.71 0 3.1 1.39 3.1 3.1v2z"/></svg>
+                        Encrypted Note
+                    </div>
+                    <div id="share-message-text" style="font-size: 0.9rem; line-height: 1.5; word-break: break-word; color: var(--text-main);"></div>
                 </div>
 
                 <div class="breadcrumbs" id="folder-breadcrumbs">
@@ -1822,6 +1913,44 @@
                 key,
                 ciphertext.buffer
             );
+        }
+
+        async function encryptPfp(base64DataUrl, encKeyBufOverride = null) {
+            if (!base64DataUrl) return "";
+            const encKeyHex = localStorage.getItem('dill_enc_key');
+            const keyBuf = encKeyBufOverride || (encKeyHex ? hexToBuf(encKeyHex) : null);
+            if (!keyBuf) throw new Error("Encryption key not available");
+            const key = await window.crypto.subtle.importKey(
+                "raw",
+                keyBuf,
+                { name: "AES-GCM" },
+                false,
+                ["encrypt"]
+            );
+            const rawData = new TextEncoder().encode(base64DataUrl);
+            const encBuf = await encryptData(rawData.buffer, key);
+            return bufToHex(encBuf);
+        }
+
+        async function decryptPfp(pfpEncHex, encKeyBufOverride = null) {
+            if (!pfpEncHex) return null;
+            try {
+                const encKeyHex = localStorage.getItem('dill_enc_key');
+                const keyBuf = encKeyBufOverride || (encKeyHex ? hexToBuf(encKeyHex) : null);
+                if (!keyBuf) return null;
+                const key = await window.crypto.subtle.importKey(
+                    "raw",
+                    keyBuf,
+                    { name: "AES-GCM" },
+                    false,
+                    ["decrypt"]
+                );
+                const decBuf = await decryptData(hexToBuf(pfpEncHex), key);
+                return new TextDecoder().decode(decBuf);
+            } catch (e) {
+                console.error("Failed to decrypt profile picture", e);
+                return null;
+            }
         }
 
         // --- THUMBNAIL GENERATION ---
@@ -2751,6 +2880,65 @@
             return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ' ' + sizes[i];
         }
 
+        // Vendored Marked.js Markdown renderer
+        let markedConfigured = false;
+        function configureMarked() {
+            if (markedConfigured || typeof marked === 'undefined') return;
+            markedConfigured = true;
+            marked.use({
+                renderer: {
+                    paragraph(text) {
+                        return `<p class="md-p">${text}</p>\n`;
+                    },
+                    heading(text, level) {
+                        return `<h${level} class="md-h${level}">${text}</h${level}>\n`;
+                    },
+                    list(body, ordered, start) {
+                        const type = ordered ? 'ol' : 'ul';
+                        const startAtt = (ordered && start !== 1) ? ` start="${start}"` : '';
+                        return `<${type}${startAtt} class="md-list">\n${body}</${type}>\n`;
+                    },
+                    blockquote(quote) {
+                        return `<blockquote class="md-quote">\n${quote}</blockquote>\n`;
+                    },
+                    hr() {
+                        return `<hr class="md-hr">\n`;
+                    },
+                    link(href, title, text) {
+                        if (href === null) return text;
+                        let out = `<a href="${href}" class="md-link" target="_blank" rel="noopener noreferrer"`;
+                        if (title) out += ` title="${title}"`;
+                        out += `>${text}</a>`;
+                        return out;
+                    },
+                    codespan(text) {
+                        return `<code class="md-inline-code">${text}</code>`;
+                    },
+                    code(code, infostring, escaped) {
+                        const lang = (infostring || '').match(/\S*/)[0];
+                        const escapeHtml = str => str.replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
+                        const content = escaped ? code : escapeHtml(code);
+                        const codeAttr = lang ? ` class="language-${escapeHtml(lang)}"` : '';
+                        return `<pre class="md-code-block"><code${codeAttr}>${content}</code></pre>\n`;
+                    }
+                }
+            });
+        }
+
+        function renderMarkdown(text) {
+            if (!text) return '';
+            if (typeof marked !== 'undefined' && marked.parse) {
+                configureMarked();
+                try {
+                    return marked.parse(String(text));
+                } catch (e) {
+                    console.error('Markdown rendering error:', e);
+                    return String(text);
+                }
+            }
+            return String(text);
+        }
+
         // --- UPLOAD PANEL ---
         btnSelectFiles.addEventListener('click', (e) => {
             e.stopPropagation();
@@ -2921,8 +3109,20 @@
             });
         }
 
+        const shareMsgInput = document.getElementById('share-message-input');
+        const msgCharCount = document.getElementById('message-char-count');
+        if (shareMsgInput && msgCharCount) {
+            shareMsgInput.addEventListener('input', () => {
+                msgCharCount.textContent = `${shareMsgInput.value.length} / 4000`;
+            });
+        }
+
         btnClearFiles.addEventListener('click', () => {
             selectedFiles = [];
+            if (shareMsgInput) {
+                shareMsgInput.value = '';
+                if (msgCharCount) msgCharCount.textContent = '0 / 4000';
+            }
             updateSelectedFilesUI();
         });
 
@@ -3112,6 +3312,12 @@
         btnUpload.addEventListener('click', async () => {
             if (selectedFiles.length === 0) return;
 
+            const shareMsgVal = shareMsgInput ? shareMsgInput.value.trim() : '';
+            if (shareMsgVal.length > 4000) {
+                showToast('Share message cannot exceed 4000 characters.', 'error');
+                return;
+            }
+
             preUploadCard.style.display = 'none';
             dropZone.style.pointerEvents = 'none';
             dropZone.style.opacity = '0.5';
@@ -3155,7 +3361,11 @@
                     }, 30000);
                 }
 
-                const meta = { files: [] };
+                const meta = { 
+                    files: [],
+                    message: shareMsgVal || null,
+                    owner_pfp: localStorage.getItem('dill_pfp') || null
+                };
                 let bytesEncryptedTotal = 0;
                 let encStartTime = Date.now();
 
@@ -3444,6 +3654,10 @@
                     dropZone.style.pointerEvents = 'auto';
                     dropZone.style.opacity = '1';
                     selectedFiles = [];
+                    if (shareMsgInput) {
+                        shareMsgInput.value = '';
+                        if (msgCharCount) msgCharCount.textContent = '0 / 4000';
+                    }
                     displayShareResult(response.uuid, keyHex);
 
                 } else {
@@ -3535,6 +3749,10 @@
                     dropZone.style.pointerEvents = 'auto';
                     dropZone.style.opacity = '1';
                     selectedFiles = [];
+                    if (shareMsgInput) {
+                        shareMsgInput.value = '';
+                        if (msgCharCount) msgCharCount.textContent = '0 / 4000';
+                    }
                     displayShareResult(response.uuid, keyHex);
                 }
 
@@ -3874,12 +4092,26 @@
                     uuid: uuid,
                     upload_time: rawDetails.upload_time,
                     expires_at: rawDetails.expires_at,
-                    files: decMeta.files // contains [{ id, name, size, type }]
+                    files: decMeta.files, // contains [{ id, name, size, type }]
+                    message: decMeta.message || null,
+                    owner_pfp: decMeta.owner_pfp || null
                 };
 
                 // Setup countdown clock
                 shareCreatedDate.textContent = `Uploaded on: ${new Date(currentShareData.upload_time).toLocaleString()}`;
                 shareCountdown.style.display = 'inline-flex';
+
+                // Render decrypted share message if present
+                const shareMsgCard = document.getElementById('share-message-card');
+                const shareMsgText = document.getElementById('share-message-text');
+                if (shareMsgCard && shareMsgText) {
+                    if (currentShareData.message && currentShareData.message.trim()) {
+                        shareMsgText.innerHTML = renderMarkdown(currentShareData.message.trim());
+                        shareMsgCard.style.display = 'block';
+                    } else {
+                        shareMsgCard.style.display = 'none';
+                    }
+                }
 
                 // Render owner badge if owner is present
                 const ownerBadge = document.getElementById('share-owner-badge');
@@ -3890,8 +4122,9 @@
                 if (rawDetails.owner) {
                     ownerUsername.textContent = rawDetails.owner;
                     ownerBadge.style.display = 'flex';
-                    if (rawDetails.owner_pfp) {
-                        ownerPfpImg.src = rawDetails.owner_pfp;
+                    const pfpToUse = currentShareData.owner_pfp || rawDetails.owner_pfp;
+                    if (pfpToUse) {
+                        ownerPfpImg.src = pfpToUse;
                         ownerPfpImg.style.display = 'block';
                         ownerPfpPl.style.display = 'none';
                     } else {
@@ -4729,12 +4962,16 @@
                         headers: { 'Authorization': `Bearer ${token}` }
                     }).then(res => {
                         if (res.ok) return res.json();
-                    }).then(profile => {
-                        if (profile && profile.pfp) {
-                            localStorage.setItem('dill_pfp', profile.pfp);
-                            headerPfpImg.src = profile.pfp;
-                            headerPfpImg.style.display = 'block';
-                            headerPfpPl.style.display = 'none';
+                    }).then(async profile => {
+                        const pfpEncHex = profile ? (profile.pfp_enc || profile.pfp) : null;
+                        if (pfpEncHex) {
+                            const decryptedPfp = await decryptPfp(pfpEncHex);
+                            if (decryptedPfp) {
+                                localStorage.setItem('dill_pfp', decryptedPfp);
+                                headerPfpImg.src = decryptedPfp;
+                                headerPfpImg.style.display = 'block';
+                                headerPfpPl.style.display = 'none';
+                            }
                         }
                     }).catch(() => {});
                 }
@@ -4863,8 +5100,14 @@
             localStorage.setItem('dill_session_token', data.token);
             localStorage.setItem('dill_username', username);
             localStorage.setItem('dill_enc_key', bufToHex(encKeyBuf));
-            if (data.pfp) {
-                localStorage.setItem('dill_pfp', data.pfp);
+            const pfpEncHex = data.pfp_enc || data.pfp;
+            if (pfpEncHex) {
+                const decryptedPfp = await decryptPfp(pfpEncHex, encKeyBuf);
+                if (decryptedPfp) {
+                    localStorage.setItem('dill_pfp', decryptedPfp);
+                } else {
+                    localStorage.removeItem('dill_pfp');
+                }
             } else {
                 localStorage.removeItem('dill_pfp');
             }
@@ -4906,6 +5149,29 @@
             showToast('Logged out successfully.', 'info');
             updateHeaderAuthState();
             
+            // Hide share result card & purge all DOM attributes/listeners on logout
+            if (typeof shareResultCard !== 'undefined' && shareResultCard) {
+                shareResultCard.style.display = 'none';
+            }
+            if (typeof shareLinkUrl !== 'undefined' && shareLinkUrl) {
+                shareLinkUrl.value = '';
+                shareLinkUrl.removeAttribute('value');
+            }
+            if (typeof btnViewCreatedShare !== 'undefined' && btnViewCreatedShare) {
+                btnViewCreatedShare.href = '#';
+                btnViewCreatedShare.onclick = null;
+            }
+            selectedFiles = [];
+            const shareMsgInput = document.getElementById('share-message-input');
+            const msgCharCount = document.getElementById('message-char-count');
+            if (shareMsgInput) {
+                shareMsgInput.value = '';
+                if (msgCharCount) msgCharCount.textContent = '0 / 4000';
+            }
+            if (typeof updateSelectedFilesUI === 'function') {
+                updateSelectedFilesUI();
+            }
+
             const activeTab = document.querySelector('.tab-content.active');
             if (activeTab && (activeTab.id === 'view-shares' || activeTab.id === 'view-admin' || activeTab.id === 'view-profile' || activeTab.id === 'view-sessions')) {
                 window.history.pushState({}, '', '/');
@@ -4945,13 +5211,14 @@
                 const token = localStorage.getItem('dill_session_token');
                 
                 try {
+                    const pfpEncHex = await encryptPfp(base64DataUrl);
                     const res = await fetch('/api/user/profile', {
                         method: 'POST',
                         headers: {
                             'Authorization': `Bearer ${token}`,
                             'Content-Type': 'application/json'
                         },
-                        body: JSON.stringify({ pfp: base64DataUrl })
+                        body: JSON.stringify({ pfp_enc: pfpEncHex })
                     });
 
                     if (res.ok) {
@@ -5014,6 +5281,12 @@
                 const encBuf = await encryptData(rawData.buffer, newKey);
                 const encHex = bufToHex(encBuf);
 
+                const currentPfp = localStorage.getItem('dill_pfp');
+                let newPfpEnc = null;
+                if (currentPfp) {
+                    newPfpEnc = await encryptPfp(currentPfp, newKeys.encKeyBuf);
+                }
+
                 // 4. Send to backend
                 const res = await fetch('/api/user/change_password', {
                     method: 'POST',
@@ -5024,7 +5297,8 @@
                     body: JSON.stringify({
                         current_auth_key: currentKeys.authKeyHex,
                         new_auth_key: newKeys.authKeyHex,
-                        new_shares_enc: encHex
+                        new_shares_enc: encHex,
+                        new_pfp_enc: newPfpEnc
                     })
                 });
 
