@@ -352,8 +352,28 @@
         .progress-stats {
             display: flex;
             justify-content: space-between;
+            align-items: center;
+            width: 100%;
+            gap: 0.5rem;
             font-size: 0.8rem;
             color: var(--text-muted);
+        }
+
+        .progress-stats span {
+            flex: 1;
+            white-space: nowrap;
+        }
+
+        .progress-stats span:nth-child(1) {
+            text-align: left;
+        }
+
+        .progress-stats span:nth-child(2) {
+            text-align: center;
+        }
+
+        .progress-stats span:nth-child(3) {
+            text-align: right;
         }
 
         /* Share Link Output Card */
