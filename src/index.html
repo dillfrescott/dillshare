@@ -3048,6 +3048,7 @@
                 return;
             }
 
+            shareResultCard.style.display = 'none';
             preUploadCard.style.display = 'flex';
             selectedFilesList.innerHTML = '';
             
@@ -3294,6 +3295,7 @@
             }
 
             preUploadCard.style.display = 'none';
+            shareResultCard.style.display = 'none';
             dropZone.style.pointerEvents = 'none';
             dropZone.style.opacity = '0.5';
             uploadProgressCard.style.display = 'flex';
