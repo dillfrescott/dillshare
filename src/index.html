@@ -2450,83 +2450,150 @@
                 if (uploadProgressTitle) uploadProgressTitle.textContent = `Encrypting ${selectedFiles.length} file(s)...`;
 
                 if (isSessionUpload && uuid) {
-                    // Sequential file-by-file processing (low memory footprint for large files)
+                    // Batched concurrent uploading (high speed & bounded memory)
+                    const BATCH_MAX_FILES = 20;
+                    const BATCH_MAX_BYTES = 16 * 1024 * 1024; // 16MB per batch threshold
+                    const CONCURRENCY = 4;
+
+                    const batches = [];
+                    let currentBatch = [];
+                    let currentBatchBytes = 0;
+
                     for (let i = 0; i < selectedFiles.length; i++) {
                         const item = selectedFiles[i];
-                        if (uploadProgressTitle) {
-                            uploadProgressTitle.textContent = `Encrypting file ${i + 1} of ${selectedFiles.length}...`;
+                        const itemSize = item.file.size;
+                        if (currentBatch.length > 0 && (currentBatch.length >= BATCH_MAX_FILES || currentBatchBytes + itemSize > BATCH_MAX_BYTES)) {
+                            batches.push(currentBatch);
+                            currentBatch = [];
+                            currentBatchBytes = 0;
+                        }
+                        currentBatch.push(i);
+                        currentBatchBytes += itemSize;
+                    }
+                    if (currentBatch.length > 0) {
+                        batches.push(currentBatch);
+                    }
+
+                    const metaFiles = new Array(selectedFiles.length);
+                    let filesProcessedCount = 0;
+                    let bytesEncryptedTotal = 0;
+
+                    const batchLoadedBytes = new Array(batches.length).fill(0);
+                    const batchTotalBytes = new Array(batches.length).fill(0);
+                    let uploadStartTime = Date.now();
+
+                    function updateUploadProgressUI() {
+                        let totalLoaded = 0;
+                        let totalExpected = 0;
+                        for (let b = 0; b < batches.length; b++) {
+                            totalLoaded += batchLoadedBytes[b];
+                            totalExpected += batchTotalBytes[b];
                         }
 
-                        const encBlob = await encryptFileChunked(item.file, key, (chunkSize) => {
-                            bytesEncryptedTotal += chunkSize;
-                            const progressRatio = totalUnencryptedSize > 0 ? (bytesEncryptedTotal / totalUnencryptedSize) : 1;
-                            const pct = Math.round(progressRatio * 100);
-                            uploadProgressBar.style.width = `${Math.round(progressRatio * 50)}%`;
-                            progressPercentage.textContent = `${pct}% (Encrypted)`;
+                        let overallRatio = totalExpected > 0 ? (totalLoaded / totalExpected) : (filesProcessedCount / selectedFiles.length);
+                        if (overallRatio > 1) overallRatio = 1;
+                        const overallPct = Math.round(overallRatio * 100);
+                        uploadProgressBar.style.width = `${overallPct}%`;
+                        progressPercentage.textContent = `${overallPct}% (Uploaded)`;
 
-                            const elapsed = (Date.now() - encStartTime) / 1000;
-                            if (elapsed > 0) {
-                                const speed = bytesEncryptedTotal / elapsed;
-                                progressSpeed.textContent = `${formatBytes(speed)}/s`;
-                                const remBytes = totalUnencryptedSize - bytesEncryptedTotal;
+                        const elapsed = (Date.now() - uploadStartTime) / 1000;
+                        if (elapsed > 0 && totalLoaded > 0) {
+                            const speed = totalLoaded / elapsed;
+                            progressSpeed.textContent = `${formatBytes(speed)}/s`;
+                            if (totalExpected > totalLoaded) {
+                                const remBytes = totalExpected - totalLoaded;
                                 const remSecs = remBytes / speed;
                                 const mins = Math.floor(remSecs / 60);
                                 const secs = Math.floor(remSecs % 60);
-                                progressEta.textContent = mins > 0 ? `Encrypting ${item.file.name} • ETA ${mins}m ${secs}s` : `Encrypting ${item.file.name} • ETA ${secs}s`;
+                                progressEta.textContent = mins > 0 ? `ETA ${mins}m ${secs}s` : `ETA ${secs}s`;
+                            } else {
+                                progressEta.textContent = 'Finalizing upload...';
                             }
-                        });
-
-                        let hasThumb = false;
-                        let encThumbBlob = null;
-                        try {
-                            const thumbBuf = await generateThumbnail(item.file);
-                            if (thumbBuf && thumbBuf.byteLength > 0) {
-                                const encThumbBuf = await encryptData(thumbBuf, key);
-                                encThumbBlob = new Blob([encThumbBuf], { type: 'application/octet-stream' });
-                                hasThumb = true;
-                            }
-                        } catch (e) {
-                            console.warn('[dill] thumbnail generation failed for', item.relativePath, e);
                         }
-
-                        meta.files.push({
-                            id: i.toString(),
-                            name: item.relativePath,
-                            size: item.file.size,
-                            type: item.file.type || 'application/octet-stream',
-                            chunked: true,
-                            thumb: hasThumb
-                        });
-
-                        // Upload this encrypted file immediately
                         if (uploadProgressTitle) {
-                            uploadProgressTitle.textContent = `Uploading file ${i + 1} of ${selectedFiles.length}...`;
+                            uploadProgressTitle.textContent = `Uploading files (${filesProcessedCount}/${selectedFiles.length})...`;
                         }
-                        const fileFormData = new FormData();
-                        fileFormData.append('files', encBlob, `file_${i}.enc`);
-                        if (hasThumb && encThumbBlob) {
-                            fileFormData.append('files', encThumbBlob, `file_${i}.thumb.enc`);
-                        }
-
-                        let upStartTime = Date.now();
-                        await uploadFormData(`/api/upload/${uuid}`, fileFormData, token, (loaded, total) => {
-                            const fileRatio = loaded / total;
-                            const overallRatio = (i + fileRatio) / selectedFiles.length;
-                            const overallPct = Math.round(overallRatio * 100);
-                            uploadProgressBar.style.width = `${50 + Math.round(overallRatio * 50)}%`;
-                            progressPercentage.textContent = `${overallPct}% (Uploaded)`;
-
-                            const elapsed = (Date.now() - upStartTime) / 1000;
-                            if (elapsed > 0) {
-                                const speed = loaded / elapsed;
-                                progressSpeed.textContent = `${formatBytes(speed)}/s`;
-                                const remBytes = total - loaded;
-                                const remSecs = remBytes / speed;
-                                const secs = Math.floor(remSecs % 60);
-                                progressEta.textContent = `Uploading ${item.file.name} • ETA ${secs}s`;
-                            }
-                        });
                     }
+
+                    async function processBatch(batchIndex) {
+                        const batchIndices = batches[batchIndex];
+                        const fileFormData = new FormData();
+                        let estimatedBatchEncSize = 0;
+
+                        const itemsResults = await Promise.all(batchIndices.map(async (i) => {
+                            const item = selectedFiles[i];
+                            const encBlob = await encryptFileChunked(item.file, key, (chunkSize) => {
+                                bytesEncryptedTotal += chunkSize;
+                            });
+
+                            let hasThumb = false;
+                            let encThumbBlob = null;
+                            try {
+                                const thumbBuf = await generateThumbnail(item.file);
+                                if (thumbBuf && thumbBuf.byteLength > 0) {
+                                    const encThumbBuf = await encryptData(thumbBuf, key);
+                                    encThumbBlob = new Blob([encThumbBuf], { type: 'application/octet-stream' });
+                                    hasThumb = true;
+                                }
+                            } catch (e) {
+                                console.warn('[dill] thumbnail generation failed for', item.relativePath, e);
+                            }
+
+                            return { i, item, encBlob, hasThumb, encThumbBlob };
+                        }));
+
+                        for (const res of itemsResults) {
+                            const { i, item, encBlob, hasThumb, encThumbBlob } = res;
+                            metaFiles[i] = {
+                                id: i.toString(),
+                                name: item.relativePath,
+                                size: item.file.size,
+                                type: item.file.type || 'application/octet-stream',
+                                chunked: true,
+                                thumb: hasThumb
+                            };
+
+                            fileFormData.append('files', encBlob, `file_${i}.enc`);
+                            estimatedBatchEncSize += encBlob.size;
+                            if (hasThumb && encThumbBlob) {
+                                fileFormData.append('files', encThumbBlob, `file_${i}.thumb.enc`);
+                                estimatedBatchEncSize += encThumbBlob.size;
+                            }
+                        }
+
+                        batchTotalBytes[batchIndex] = estimatedBatchEncSize;
+
+                        await uploadFormData(`/api/upload/${uuid}`, fileFormData, token, (loaded, total) => {
+                            batchLoadedBytes[batchIndex] = loaded;
+                            if (total > batchTotalBytes[batchIndex]) {
+                                batchTotalBytes[batchIndex] = total;
+                            }
+                            updateUploadProgressUI();
+                        });
+
+                        batchLoadedBytes[batchIndex] = batchTotalBytes[batchIndex];
+                        filesProcessedCount += batchIndices.length;
+                        updateUploadProgressUI();
+                    }
+
+                    uploadStartTime = Date.now();
+                    let currentBatchIdx = 0;
+
+                    async function worker() {
+                        while (currentBatchIdx < batches.length) {
+                            const bIdx = currentBatchIdx++;
+                            await processBatch(bIdx);
+                        }
+                    }
+
+                    const workerCount = Math.min(CONCURRENCY, batches.length);
+                    const workers = [];
+                    for (let w = 0; w < workerCount; w++) {
+                        workers.push(worker());
+                    }
+                    await Promise.all(workers);
+
+                    meta.files = metaFiles;
 
                     // Encrypt and upload metadata manifest
                     if (uploadProgressTitle) uploadProgressTitle.textContent = 'Finalizing metadata...';
