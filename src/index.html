@@ -3201,8 +3201,43 @@
                     shares = JSON.parse(localStorage.getItem('my_shares') || '[]');
                 }
                 
+                if (shares.length === 0) {
+                    sharesListBody.innerHTML = '';
+                    sharesTable.style.display = 'none';
+                    sharesEmptyState.style.display = 'block';
+                    return;
+                }
+
+                // Verify shares in parallel and filter out 404s (deleted/expired shares)
+                const checkResults = await Promise.all(shares.map(async (share) => {
+                    try {
+                        const res = await fetch(`/api/share/${share.uuid}`);
+                        if (res.status === 404) {
+                            return { share, dead: true };
+                        }
+                        if (!res.ok) return { share, dead: false, error: true };
+                        const details = await res.json();
+                        return { share, dead: false, details };
+                    } catch (err) {
+                        return { share, dead: false, error: true };
+                    }
+                }));
+
+                const validResults = checkResults.filter(r => !r.dead);
+                const deadResults = checkResults.filter(r => r.dead);
+
+                if (deadResults.length > 0) {
+                    const cleanShares = validResults.map(r => r.share);
+                    shares = cleanShares;
+                    if (isLoggedIn) {
+                        await saveAccountShares(cleanShares).catch(() => {});
+                    } else {
+                        localStorage.setItem('my_shares', JSON.stringify(cleanShares));
+                    }
+                }
+
                 sharesListBody.innerHTML = '';
-                
+
                 if (shares.length === 0) {
                     sharesTable.style.display = 'none';
                     sharesEmptyState.style.display = 'block';
@@ -3212,12 +3247,35 @@
                 sharesTable.style.display = 'table';
                 sharesEmptyState.style.display = 'none';
 
-                shares.forEach(share => {
+                validResults.forEach(({ share, details, error }) => {
                     const row = document.createElement('tr');
                     row.id = `share-row-${share.uuid}`;
                     const origin = window.location.origin;
                     const shareUrl = `${origin}/share/${share.uuid}#${share.key}`;
                     
+                    let statusHTML = '';
+                    if (error || !details) {
+                        statusHTML = `<td colspan="2"><span style="color:var(--danger);">Unavailable</span></td>`;
+                    } else {
+                        const expiresAt = new Date(details.expires_at);
+                        const now = new Date();
+                        const diffTime = expiresAt - now;
+                        let expStr = 'Expired';
+                        if (diffTime > 0) {
+                            const diffDays = Math.floor(diffTime / (1000 * 60 * 60 * 24));
+                            const diffHrs = Math.floor((diffTime % (1000 * 60 * 60 * 24)) / (1000 * 60 * 60));
+                            expStr = `${diffDays}d ${diffHrs}h`;
+                        }
+                        statusHTML = `
+                            <td>${new Date(details.upload_time).toLocaleDateString()}</td>
+                            <td>
+                                <span class="badge ${diffTime > 0 ? 'success' : ''}">
+                                    ${expStr}
+                                </span>
+                            </td>
+                        `;
+                    }
+
                     row.innerHTML = `
                         <td>
                             <div class="share-id-cell">
@@ -3231,7 +3289,7 @@
                         </td>
                         <td>${share.files_count} files</td>
                         <td>${formatBytes(share.total_size)}</td>
-                        <td colspan="2" class="share-status-cell"><span style="color:var(--text-muted);">Verifying...</span></td>
+                        ${statusHTML}
                         <td>
                             <div class="share-actions">
                                 <button class="action-btn copy-btn" data-url="${shareUrl}" title="Copy Link">
@@ -3244,46 +3302,6 @@
                         </td>
                     `;
                     sharesListBody.appendChild(row);
-
-                    // Fetch state asynchronously to verify if it has expired
-                    fetch(`/api/share/${share.uuid}`)
-                        .then(async res => {
-                            const statusCell = row.querySelector('.share-status-cell');
-                            if (res.status === 404) {
-                                statusCell.outerHTML = `
-                                    <td><span style="color:var(--text-muted);">Unknown</span></td>
-                                    <td><span class="badge">Expired / Deleted</span></td>
-                                `;
-                                return;
-                            }
-                            if (!res.ok) throw new Error();
-                            
-                            const details = await res.json();
-                            const expiresAt = new Date(details.expires_at);
-                            const now = new Date();
-                            const diffTime = expiresAt - now;
-                            let expStr = 'Expired';
-                            if (diffTime > 0) {
-                                const diffDays = Math.floor(diffTime / (1000 * 60 * 60 * 24));
-                                const diffHrs = Math.floor((diffTime % (1000 * 60 * 60 * 24)) / (1000 * 60 * 60));
-                                expStr = `${diffDays}d ${diffHrs}h`;
-                            }
-
-                            statusCell.outerHTML = `
-                                <td>${new Date(details.upload_time).toLocaleDateString()}</td>
-                                <td>
-                                    <span class="badge ${diffTime > 0 ? 'success' : ''}">
-                                        ${expStr}
-                                    </span>
-                                </td>
-                            `;
-                        })
-                        .catch(() => {
-                            const statusCell = row.querySelector('.share-status-cell');
-                            if (statusCell) {
-                                statusCell.outerHTML = `<td colspan="2"><span style="color:var(--danger);">Unavailable</span></td>`;
-                            }
-                        });
                 });
 
                 document.querySelectorAll('.share-nav-link').forEach(link => {

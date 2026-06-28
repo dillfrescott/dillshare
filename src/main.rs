@@ -1481,24 +1481,15 @@ async fn admin_delete_share(
     delete_share_objects(&state.s3_client, &state.bucket, &uuid).await?;
 
     if !owner.is_empty() {
-        let public_shares_key = format!("users/{}/public_shares.json", owner);
-        if let Ok(output) = state.s3_client.get_object()
-            .bucket(&state.bucket)
-            .key(&public_shares_key)
-            .send()
-            .await
-        {
-            if let Ok(bytes) = output.body.collect().await {
-                if let Ok(mut shares) = serde_json::from_slice::<Vec<serde_json::Value>>(&bytes.into_bytes()) {
-                    shares.retain(|s| s.get("uuid").and_then(|u| u.as_str()) != Some(&uuid));
-                    if let Ok(shares_bytes) = serde_json::to_vec(&shares) {
-                        let _ = state.s3_client.put_object()
-                            .bucket(&state.bucket)
-                            .key(&public_shares_key)
-                            .content_type("application/json")
-                            .body(aws_sdk_s3::primitives::ByteStream::from(shares_bytes))
-                            .send()
-                            .await;
+        remove_share_from_user_index(&state.s3_client, &state.bucket, &owner, &uuid).await;
+    } else {
+        if let Ok(response) = state.s3_client.list_objects_v2().bucket(&state.bucket).prefix("users/").send().await {
+            for object in response.contents() {
+                if let Some(key) = object.key() {
+                    if key.ends_with("/public_shares.json") {
+                        if let Some(user_part) = key.strip_prefix("users/").and_then(|k| k.strip_suffix("/public_shares.json")) {
+                            remove_share_from_user_index(&state.s3_client, &state.bucket, user_part, &uuid).await;
+                        }
                     }
                 }
             }
@@ -1607,6 +1598,21 @@ async fn verify_admin(headers: &axum::http::HeaderMap, state: &AppState) -> Resu
 }
 
 async fn delete_s3_prefix(s3_client: &aws_sdk_s3::Client, bucket: &str, prefix: &str) -> Result<(), (StatusCode, String)> {
+    if let Ok(mp_out) = s3_client.list_multipart_uploads().bucket(bucket).prefix(prefix).send().await {
+        if let Some(uploads) = mp_out.uploads {
+            for u in uploads {
+                if let (Some(key), Some(upload_id)) = (u.key(), u.upload_id()) {
+                    let _ = s3_client.abort_multipart_upload()
+                        .bucket(bucket)
+                        .key(key)
+                        .upload_id(upload_id)
+                        .send()
+                        .await;
+                }
+            }
+        }
+    }
+
     let mut response = s3_client
         .list_objects_v2()
         .bucket(bucket)
