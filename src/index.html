@@ -1964,10 +1964,136 @@
             return new Blob(parts, { type: 'application/octet-stream' });
         }
 
-        // High-performance streaming decryptor with parallel chunk WebCrypto processing.
+        // --- MULTI-THREADED WEB WORKER DECRYPTION POOL & PARALLEL RANGE DOWNLOADER ---
+        async function getRawKeyBytes(key) {
+            if (!key) return null;
+            if (key instanceof ArrayBuffer) return new Uint8Array(key);
+            if (ArrayBuffer.isView(key)) return new Uint8Array(key.buffer, key.byteOffset, key.byteLength);
+            try {
+                const exported = await window.crypto.subtle.exportKey('raw', key);
+                return new Uint8Array(exported);
+            } catch (_) {
+                const keyHex = window.location.hash ? window.location.hash.substring(1) : '';
+                const buf = hexToBuf(keyHex);
+                if (buf) return new Uint8Array(buf);
+            }
+            return null;
+        }
+
+        class DecryptWorkerPool {
+            constructor() {
+                const workerCode = `
+                    const keysMap = new Map();
+                    self.onmessage = async (e) => {
+                        const { id, type, iv, ct, keyRaw } = e.data;
+                        if (type === 'decrypt') {
+                            try {
+                                let key = keysMap.get(keyRaw.buffer);
+                                if (!key) {
+                                    key = await self.crypto.subtle.importKey(
+                                        'raw',
+                                        keyRaw,
+                                        { name: 'AES-GCM' },
+                                        false,
+                                        ['decrypt']
+                                    );
+                                    if (keysMap.size > 10) keysMap.clear();
+                                    keysMap.set(keyRaw.buffer, key);
+                                }
+                                const ptBuf = await self.crypto.subtle.decrypt(
+                                    { name: 'AES-GCM', iv },
+                                    key,
+                                    ct
+                                );
+                                self.postMessage({ id, status: 'ok', ptBuf }, [ptBuf]);
+                            } catch (err) {
+                                self.postMessage({ id, status: 'error', error: err ? (err.message || String(err)) : 'Decrypt failed' });
+                            }
+                        }
+                    };
+                `;
+                const blob = new Blob([workerCode], { type: 'application/javascript' });
+                this.workerUrl = URL.createObjectURL(blob);
+                const count = Math.max(4, Math.min(16, (navigator.hardwareConcurrency || 4) * 2));
+                this.workers = [];
+                this.idleWorkers = [];
+                this.taskQueue = [];
+                for (let i = 0; i < count; i++) {
+                    const w = new Worker(this.workerUrl);
+                    w.onmessage = (e) => this._onWorkerMessage(w, e);
+                    w.onerror = (e) => this._onWorkerError(w, e);
+                    this.workers.push(w);
+                    this.idleWorkers.push(w);
+                }
+                this.activeTasks = new Map();
+                this.nextId = 1;
+            }
+
+            decrypt(iv, ct, keyRaw, bufferToTransfer) {
+                return new Promise((resolve, reject) => {
+                    const id = this.nextId++;
+                    this.activeTasks.set(id, { resolve, reject });
+                    this.taskQueue.push({ id, iv, ct, keyRaw, bufferToTransfer });
+                    this._processQueue();
+                });
+            }
+
+            _processQueue() {
+                while (this.idleWorkers.length > 0 && this.taskQueue.length > 0) {
+                    const worker = this.idleWorkers.pop();
+                    const task = this.taskQueue.shift();
+                    worker.currentTaskId = task.id;
+                    const transfers = [];
+                    if (task.bufferToTransfer) transfers.push(task.bufferToTransfer);
+                    worker.postMessage({
+                        id: task.id,
+                        type: 'decrypt',
+                        iv: task.iv,
+                        ct: task.ct,
+                        keyRaw: task.keyRaw
+                    }, transfers);
+                }
+            }
+
+            _onWorkerMessage(worker, e) {
+                const { id, status, ptBuf, error } = e.data;
+                const task = this.activeTasks.get(id);
+                if (task) {
+                    this.activeTasks.delete(id);
+                    if (status === 'ok') task.resolve(new Uint8Array(ptBuf));
+                    else task.reject(new Error(error));
+                }
+                worker.currentTaskId = null;
+                this.idleWorkers.push(worker);
+                this._processQueue();
+            }
+
+            _onWorkerError(worker, e) {
+                if (worker.currentTaskId) {
+                    const task = this.activeTasks.get(worker.currentTaskId);
+                    if (task) {
+                        this.activeTasks.delete(worker.currentTaskId);
+                        task.reject(new Error('Worker error: ' + (e.message || 'Unknown')));
+                    }
+                }
+                worker.currentTaskId = null;
+                this.idleWorkers.push(worker);
+                this._processQueue();
+            }
+        }
+
+        let globalDecryptPool = null;
+        function getDecryptPool() {
+            if (!globalDecryptPool) globalDecryptPool = new DecryptWorkerPool();
+            return globalDecryptPool;
+        }
+
+        // High-performance streaming decryptor with Web Worker pool integration
         async function* streamDecryptChunked(reader, key, totalPlaintextSize, onProgress) {
             const chunkSize = ENCRYPT_CHUNK_SIZE;
             const totalChunks = Math.max(1, Math.ceil(totalPlaintextSize / chunkSize));
+            const rawKeyBytes = await getRawKeyBytes(key);
+            const pool = rawKeyBytes ? getDecryptPool() : null;
             let bytesReceived = 0;
             let bytesDecrypted = 0;
             const queue = [];
@@ -2015,7 +2141,6 @@
                 });
             }
 
-            // Start background reader/decryptor producer loop
             (async () => {
                 let rem = totalPlaintextSize;
                 try {
@@ -2028,9 +2153,15 @@
 
                         const iv = block.subarray(0, 12);
                         const ct = block.subarray(12);
-                        window.crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, ct)
-                            .then(pt => resolvers[idx](new Uint8Array(pt)))
-                            .catch(err => rejecters[idx](err));
+                        if (pool && rawKeyBytes) {
+                            pool.decrypt(iv, ct, rawKeyBytes, block.buffer)
+                                .then(pt => resolvers[idx](pt))
+                                .catch(err => rejecters[idx](err));
+                        } else {
+                            window.crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, ct)
+                                .then(pt => resolvers[idx](new Uint8Array(pt)))
+                                .catch(err => rejecters[idx](err));
+                        }
                     }
                 } catch (err) {
                     for (let i = 0; i < totalChunks; i++) {
@@ -2050,28 +2181,122 @@
             }
         }
 
-        // Core decrypt-and-deliver routine. If `sink` (a FileSystemWritableFileStream
-        // or WritableStreamDefaultWriter from StreamSaver.js) is supplied, decrypted
-        // bytes are streamed straight to it; otherwise they are buffered into
-        // plaintextChunks and (if `ownSink` is true) delivered via an anchor download
-        // at the end. onProgress is invoked per chunk.
-        async function decryptAndDeliver(url, key, fileMeta, sink, ownSink, onProgress) {
-            // Tie an AbortController to the fetch so that if the disk sink rejects
-            // (e.g. user cancels the StreamSaver download in the browser UI), we
-            // also tear down the upstream network read instead of letting it
-            // silently keep pulling bytes — which previously caused the page
-            // progress counter to keep climbing after the user had already hit
-            // cancel.
-            const ac = new AbortController();
-            const res = await fetch(url, { signal: ac.signal });
-            if (!res.ok) throw new Error('File download failed');
+        // High-performance Parallel HTTP Range downloader + Web Worker pool decryptor
+        async function* streamDecryptChunkedParallel(target, key, totalPlaintextSize, signal, onProgress) {
+            const chunkSize = ENCRYPT_CHUNK_SIZE;
+            const totalChunks = Math.max(1, Math.ceil(totalPlaintextSize / chunkSize));
+            const rawKeyBytes = await getRawKeyBytes(key);
 
+            if (typeof target === 'string' && rawKeyBytes) {
+                const url = target;
+                const pool = getDecryptPool();
+                const promises = new Array(totalChunks);
+                const resolvers = new Array(totalChunks);
+                const rejecters = new Array(totalChunks);
+
+                for (let i = 0; i < totalChunks; i++) {
+                    promises[i] = new Promise((res, rej) => {
+                        resolvers[i] = res;
+                        rejecters[i] = rej;
+                    });
+                }
+
+                const NETWORK_CONCURRENCY = Math.max(6, Math.min(16, (navigator.hardwareConcurrency || 4) * 2));
+                let nextChunkToFetch = 0;
+                let isAborted = false;
+
+                const checkAbort = () => {
+                    if (signal && signal.aborted) isAborted = true;
+                    return isAborted;
+                };
+
+                let ctCursor = 0;
+                let plainRem = totalPlaintextSize;
+                const chunkMeta = new Array(totalChunks);
+                for (let i = 0; i < totalChunks; i++) {
+                    const thisPlain = Math.min(chunkSize, plainRem);
+                    const ctLen = thisPlain + 16;
+                    const blockLen = 12 + ctLen;
+                    chunkMeta[i] = {
+                        idx: i,
+                        plainLen: thisPlain,
+                        fetchStart: ctCursor,
+                        fetchEnd: ctCursor + blockLen - 1
+                    };
+                    ctCursor += blockLen;
+                    plainRem -= thisPlain;
+                }
+
+                async function fetchWorker() {
+                    while (nextChunkToFetch < totalChunks && !checkAbort()) {
+                        const chunkIdx = nextChunkToFetch++;
+                        const meta = chunkMeta[chunkIdx];
+                        try {
+                            const fetchOpts = {
+                                headers: { Range: `bytes=${meta.fetchStart}-${meta.fetchEnd}` }
+                            };
+                            if (signal) fetchOpts.signal = signal;
+                            const res = await fetch(url, fetchOpts);
+                            if (!res.ok && res.status !== 206) {
+                                throw new Error(`Range fetch failed status ${res.status} for chunk ${chunkIdx}`);
+                            }
+                            const arrayBuf = await res.arrayBuffer();
+                            if (checkAbort()) break;
+                            const block = new Uint8Array(arrayBuf);
+                            if (block.length < meta.fetchEnd - meta.fetchStart + 1) {
+                                throw new Error(`Truncated range download for chunk ${chunkIdx}`);
+                            }
+                            const iv = block.subarray(0, 12);
+                            const ct = block.subarray(12);
+                            pool.decrypt(iv, ct, rawKeyBytes, arrayBuf)
+                                .then(pt => {
+                                    if (!checkAbort()) resolvers[chunkIdx](pt);
+                                })
+                                .catch(err => rejecters[chunkIdx](err));
+                        } catch (err) {
+                            rejecters[chunkIdx](err);
+                            isAborted = true;
+                            break;
+                        }
+                    }
+                }
+
+                const workerCount = Math.min(NETWORK_CONCURRENCY, totalChunks);
+                const fetchWorkers = [];
+                for (let w = 0; w < workerCount; w++) {
+                    fetchWorkers.push(fetchWorker());
+                }
+
+                let bytesDecrypted = 0;
+                let remYield = totalPlaintextSize;
+                for (let idx = 0; idx < totalChunks; idx++) {
+                    if (checkAbort()) throw new Error('Download aborted');
+                    const thisPlain = Math.min(chunkSize, remYield);
+                    const pt = await promises[idx];
+                    yield pt;
+                    remYield -= thisPlain;
+                    bytesDecrypted += thisPlain;
+                    if (onProgress) onProgress({ bytesReceived: bytesDecrypted, bytesDecrypted, totalBytes: totalPlaintextSize });
+                }
+                return;
+            }
+
+            const reader = (typeof target === 'string') ? (await fetch(target, { signal }).then(r => r.body.getReader())) : target;
+            yield* streamDecryptChunked(reader, key, totalPlaintextSize, onProgress);
+        }
+
+        // Core decrypt-and-deliver routine with parallel range download & Web Worker pool delivery.
+        async function decryptAndDeliver(url, key, fileMeta, sink, ownSink, onProgress) {
+            const ac = new AbortController();
             const isChunked = fileMeta && fileMeta.chunked === true;
+            let res = null;
+            if (!isChunked) {
+                res = await fetch(url, { signal: ac.signal });
+                if (!res.ok) throw new Error('File download failed');
+            }
+
             const plaintextChunks = sink ? null : [];
             let errored = false;
-            // Counter tracks bytes that have actually landed in the sink, NOT
-            // bytes pulled from the network / decrypted. This is what makes the
-            // on-screen counter honest w.r.t. what's been persisted to disk.
             let written = 0;
             const report = (delta) => {
                 written += delta;
@@ -2080,12 +2305,7 @@
             try {
                 if (isChunked) {
                     const totalSize = fileMeta.size;
-                    const reader = res.body.getReader();
-                    // NOTE: onProgress is intentionally NOT passed to the generator
-                    // here. Decryption alone is not a meaningful "downloaded"
-                    // signal; we only advance the counter after sink.write() /
-                    // buffer push succeeds below.
-                    for await (const pt of streamDecryptChunked(reader, key, totalSize)) {
+                    for await (const pt of streamDecryptChunkedParallel(url, key, totalSize, ac.signal)) {
                         if (sink) {
                             if (sink.isCancelled) {
                                 ac.abort();
@@ -2093,8 +2313,6 @@
                             }
                             try { await sink.write(pt); }
                             catch (e) {
-                                // Writer rejected (user cancelled / disk error).
-                                // Stop pulling from the network so progress halts.
                                 ac.abort();
                                 throw e;
                             }
@@ -2103,7 +2321,6 @@
                         }
                         report(pt.length);
                     }
-                    reader.releaseLock?.();
                 } else {
                     // Legacy single-block format: buffer then decrypt.
                     const ab = await res.arrayBuffer();
@@ -2118,8 +2335,6 @@
                 }
             } catch (e) {
                 errored = true;
-                // Abort the stream on error so the user doesn't get a corrupt
-                // partial file (relevant for StreamSaver.js downloads).
                 ac.abort();
                 if (ownSink && sink) {
                     try { if (sink.abort) await sink.abort(); else await sink.close(); } catch (_) {}
@@ -2258,22 +2473,20 @@
         // Fully decrypt a (possibly chunked) file into a single ArrayBuffer.
         // Used by the in-browser preview path where the whole file is needed.
         async function decryptFileToArrayBuffer(url, key, fileMeta, onProgress) {
-            const res = await fetch(url);
-            if (!res.ok) throw new Error('File retrieval failed');
             if (fileMeta && fileMeta.chunked === true) {
-                const reader = res.body.getReader();
                 const chunks = [];
                 let total = 0;
-                for await (const pt of streamDecryptChunked(reader, key, fileMeta.size, onProgress)) {
+                for await (const pt of streamDecryptChunkedParallel(url, key, fileMeta.size, null, onProgress)) {
                     chunks.push(pt);
                     total += pt.length;
                 }
-                reader.releaseLock?.();
                 const out = new Uint8Array(total);
                 let o = 0;
                 for (const c of chunks) { out.set(c, o); o += c.length; }
                 return out.buffer;
             }
+            const res = await fetch(url);
+            if (!res.ok) throw new Error('File retrieval failed');
             const ab = await res.arrayBuffer();
             if (onProgress) onProgress({ bytesReceived: ab.byteLength, bytesDecrypted: 0, totalBytes: ab.byteLength });
             const dec = await decryptData(ab, key);
