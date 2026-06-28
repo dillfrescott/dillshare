@@ -1688,8 +1688,10 @@
             });
         }
 
+        const IMAGE_EXTS = ['jpg', 'jpeg', 'png', 'gif', 'svg', 'webp', 'bmp', 'ico', 'avif'];
         const MEDIA_VIDEO_EXTS = ['mp4', 'webm', 'ogg', 'mov', 'mkv', 'ogv', 'm4v', 'avi', 'ts', 'm2ts'];
         const MEDIA_AUDIO_EXTS = ['mp3', 'wav', 'ogg', 'aac', 'flac', 'm4a', 'opus', 'oga', 'wma', 'aiff', 'aif'];
+        const TEXT_EXTS = ['txt', 'js', 'jsx', 'ts', 'tsx', 'html', 'css', 'json', 'md', 'rs', 'py', 'go', 'yaml', 'yml', 'toml', 'xml', 'csv', 'sh', 'bat', 'c', 'cpp', 'h', 'hpp', 'sql', 'ini', 'env', 'log'];
 
         // Minimal extension -> MIME map for media types the browser must know to
         // play a stream; falls back to octet-stream. Used for the SW streaming URL.
@@ -2448,11 +2450,11 @@
 
         function getFileIcon(filename) {
             const ext = filename.split('.').pop().toLowerCase();
-            if (['jpg', 'jpeg', 'png', 'gif', 'svg', 'webp', 'bmp'].includes(ext)) return ICONS.image;
-            if (['mp3', 'wav', 'ogg', 'aac', 'flac', 'm4a'].includes(ext)) return ICONS.audio;
-            if (['mp4', 'webm', 'ogg', 'avi', 'mov', 'mkv'].includes(ext)) return ICONS.video;
+            if (IMAGE_EXTS.includes(ext)) return ICONS.image;
+            if (MEDIA_AUDIO_EXTS.includes(ext)) return ICONS.audio;
+            if (MEDIA_VIDEO_EXTS.includes(ext)) return ICONS.video;
             if (['pdf'].includes(ext)) return ICONS.pdf;
-            if (['txt', 'js', 'html', 'css', 'json', 'md', 'rs', 'py', 'go', 'ts', 'yaml', 'yml', 'toml'].includes(ext)) return ICONS.code;
+            if (TEXT_EXTS.includes(ext)) return ICONS.code;
             return ICONS.file;
         }
 
@@ -3445,8 +3447,8 @@
                 card.className = 'explorer-item';
                 const filename = file.name.split('/').pop();
                 const ext = filename.split('.').pop().toLowerCase();
-                const isImage = ['jpg', 'jpeg', 'png', 'gif', 'svg', 'webp', 'bmp'].includes(ext);
-                const isVideo = ['mp4', 'webm', 'ogg', 'avi', 'mov', 'mkv'].includes(ext);
+                const isImage = IMAGE_EXTS.includes(ext);
+                const isVideo = MEDIA_VIDEO_EXTS.includes(ext);
                 
                 card.innerHTML = `
                     <div class="explorer-item-icon" id="icon-${file.id}">${getFileIcon(filename)}</div>
@@ -3508,24 +3510,13 @@
             const ext = filename.split('.').pop().toLowerCase();
 
             previewFilename.textContent = filename;
+            const isImage = IMAGE_EXTS.includes(ext);
             const isVideo = MEDIA_VIDEO_EXTS.includes(ext);
             const isAudio = MEDIA_AUDIO_EXTS.includes(ext);
+            const isText = TEXT_EXTS.includes(ext);
             const isStreamingMedia = (isVideo || isAudio);
-            previewContentBox.innerHTML = `
-                <div class="empty-state" style="width:100%;">
-                    <div class="loader" style="margin:0 auto 1rem auto;"></div>
-                    <p>${isStreamingMedia ? 'Starting secure stream...' : 'Downloading and decrypting file in your browser...'}</p>
-                    ${isStreamingMedia ? '' : `
-                    <div class="progress-bar-container" style="margin-top:1rem; width:80%; margin-left:auto; margin-right:auto;">
-                        <div class="progress-bar" id="preview-progress-bar"></div>
-                    </div>
-                    <p id="preview-progress-label" style="font-size:0.8rem; color:var(--text-muted); margin-top:0.5rem;">0%</p>
-                    `}
-                </div>
-            `;
-            
-            btnPreviewDownload.style.opacity = '0.5';
-            btnPreviewDownload.style.pointerEvents = 'none';
+            const isPreviewable = isImage || isVideo || isAudio || isText;
+
             previewModal.classList.add('active');
 
             const keyHex = window.location.hash.substring(1);
@@ -3563,14 +3554,41 @@
                 }
             };
 
+            // If file is not previewable (e.g. PyTorch checkpoint, zip, exe, bin, etc.),
+            // do NOT attempt to download and decrypt it in-memory for preview!
+            if (!isPreviewable) {
+                btnPreviewDownload.style.opacity = '1';
+                btnPreviewDownload.style.pointerEvents = 'auto';
+                previewContentBox.innerHTML = `
+                    <div class="generic-file-preview">
+                        <div style="font-size: 3rem; color: var(--text-muted);">
+                            ${getFileIcon(filename)}
+                        </div>
+                        <h4>Preview not available for this file type</h4>
+                        <p class="file-meta">Click "Download" to save the decrypted file</p>
+                        <p class="file-meta">Size: ${formatBytes(file.size)}</p>
+                    </div>
+                `;
+                return;
+            }
+
+            previewContentBox.innerHTML = `
+                <div class="empty-state" style="width:100%;">
+                    <div class="loader" style="margin:0 auto 1rem auto;"></div>
+                    <p>${isStreamingMedia ? 'Starting secure stream...' : 'Downloading and decrypting file in your browser...'}</p>
+                    ${isStreamingMedia ? '' : `
+                    <div class="progress-bar-container" style="margin-top:1rem; width:80%; margin-left:auto; margin-right:auto;">
+                        <div class="progress-bar" id="preview-progress-bar"></div>
+                    </div>
+                    <p id="preview-progress-label" style="font-size:0.8rem; color:var(--text-muted); margin-top:0.5rem;">0%</p>
+                    `}
+                </div>
+            `;
+            
+            btnPreviewDownload.style.opacity = '0.5';
+            btnPreviewDownload.style.pointerEvents = 'none';
+
             // Fast streaming path for media via the preview service worker.
-            // The <video>/<audio> element issues HTTP range requests against a
-            // virtual URL; the SW fetches the needed encrypted 4 MB chunks from
-            // the server, decrypts them, and returns the requested plaintext
-            // range. Playback begins as soon as the first chunk is ready, so it
-            // works for any container (mp4, mkv, webm, mov, mp3, wav, flac,
-            // opus, aac, m4a, ...). Falls back to buffered decryption if the SW
-            // is unavailable (private mode / unsupported browser).
             if (isStreamingMedia) {
                 let streamUrl = null;
                 console.log('[dill-sw] opening streaming preview for', ext, 'isVideo=', isVideo, 'isAudio=', isAudio, 'file=', file);
@@ -3616,9 +3634,6 @@
                     }
                     return;
                 } catch (err) {
-                    // Fall through to the buffered preview path below. Show a
-                    // proper progress bar so the wait is visible instead of
-                    // the (now-stale) "Starting secure stream..." text.
                     console.error('[dill-sw] streaming preview FAILED, falling back to buffered:', err);
                     previewContentBox.innerHTML = `
                         <div class="empty-state" style="width:100%;">
@@ -3655,7 +3670,7 @@
                 btnPreviewDownload.style.opacity = '1';
                 btnPreviewDownload.style.pointerEvents = 'auto';
 
-                if (['jpg', 'jpeg', 'png', 'gif', 'svg', 'webp', 'bmp'].includes(ext)) {
+                if (isImage) {
                     const img = document.createElement('img');
                     img.className = 'preview-media';
                     img.src = localUrl;
@@ -3696,7 +3711,7 @@
                     wrapper.appendChild(audio);
                     previewContentBox.appendChild(wrapper);
                 } 
-                else if (['txt', 'js', 'html', 'css', 'json', 'md', 'rs', 'py', 'go', 'ts', 'yaml', 'yml', 'toml'].includes(ext)) {
+                else if (isText) {
                     const text = new TextDecoder().decode(decBytes);
                     const codeBlock = document.createElement('pre');
                     codeBlock.className = 'code-preview';
