@@ -2060,34 +2060,107 @@
             return true;
         }
 
-        // Stream a decrypted file directly to disk via File System Access API /
-        // StreamSaver.js (shows browser download bar / save prompt) or falls back
-        // to an in-memory Blob + anchor download. Returns true if delivered.
+        // Stream a decrypted output directly to a native browser download via Service Worker
+        async function createSWWriteStream(filename, size, contentType) {
+            try {
+                const ok = await ensureStreamingSW();
+                if (!ok || !navigator.serviceWorker || !navigator.serviceWorker.controller) {
+                    return null;
+                }
+                const streamId = Date.now() + '_' + Math.random().toString(36).substring(2);
+                const streamPath = `/sw-download/${streamId}/${encodeURIComponent(filename)}`;
+                const channel = new MessageChannel();
+
+                return await new Promise((resolve) => {
+                    const timer = setTimeout(() => resolve(null), 3000);
+                    const onMsg = (evt) => {
+                        if (evt.data && evt.data.type === 'DILL_DOWNLOAD_READY' && evt.data.streamPath === streamPath) {
+                            clearTimeout(timer);
+                            navigator.serviceWorker.removeEventListener('message', onMsg);
+
+                            const a = document.createElement('a');
+                            a.href = streamPath;
+                            a.style.display = 'none';
+                            document.body.appendChild(a);
+                            a.click();
+                            setTimeout(() => a.remove(), 1000);
+
+                            let isClosed = false;
+                            const sink = {
+                                async write(chunk) {
+                                    if (isClosed) return;
+                                    const u8 = chunk instanceof Uint8Array ? chunk.slice() : new Uint8Array(chunk).slice();
+                                    channel.port1.postMessage(u8, [u8.buffer]);
+                                },
+                                async close() {
+                                    if (isClosed) return;
+                                    isClosed = true;
+                                    channel.port1.postMessage('end');
+                                },
+                                async abort(reason) {
+                                    if (isClosed) return;
+                                    isClosed = true;
+                                    channel.port1.postMessage('abort');
+                                }
+                            };
+
+                            channel.port1.onmessage = (e) => {
+                                if (e.data === 'cancel') {
+                                    isClosed = true;
+                                }
+                            };
+
+                            resolve(sink);
+                        }
+                    };
+                    navigator.serviceWorker.addEventListener('message', onMsg);
+                    navigator.serviceWorker.controller.postMessage({
+                        type: 'DILL_DOWNLOAD_INIT',
+                        streamPath,
+                        filename,
+                        size,
+                        contentType
+                    }, [channel.port2]);
+                });
+            } catch (e) {
+                console.warn('[dill-sw] createSWWriteStream failed:', e);
+                return null;
+            }
+        }
+
+        // Stream a decrypted file directly to disk via Service Worker streaming download /
+        // File System Access API / StreamSaver.js or falls back to an in-memory Blob + anchor download.
         async function downloadDecryptedFile(url, key, fileMeta, suggestedName, onProgress) {
             let sink = null;
-            if (window.showSaveFilePicker) {
+            const size = fileMeta && typeof fileMeta.size === 'number' ? fileMeta.size : undefined;
+            const contentType = (fileMeta && fileMeta.type) || 'application/octet-stream';
+
+            // 1. Try Service Worker streaming download (starts real-time native browser download bar)
+            sink = await createSWWriteStream(suggestedName, size, contentType);
+
+            // 2. Fallback to StreamSaver.js if SW stream failed to initialize
+            if (!sink && typeof streamSaver !== 'undefined') {
                 try {
-                    const handle = await window.showSaveFilePicker({
-                        suggestedName: suggestedName
-                    });
+                    const fileStream = streamSaver.createWriteStream(suggestedName, { size });
+                    sink = fileStream.getWriter();
+                } catch (e) {
+                    console.warn('StreamSaver failed, trying showSaveFilePicker:', e);
+                    sink = null;
+                }
+            }
+
+            // 3. Fallback to File System Access API if neither SW nor StreamSaver worked
+            if (!sink && window.showSaveFilePicker) {
+                try {
+                    const handle = await window.showSaveFilePicker({ suggestedName });
                     sink = await handle.createWritable();
                 } catch (e) {
                     if (e.name === 'AbortError') return false; // User cancelled save picker
-                    console.warn('showSaveFilePicker failed, trying StreamSaver:', e);
+                    console.warn('showSaveFilePicker failed:', e);
                     sink = null;
                 }
             }
-            if (!sink && typeof streamSaver !== 'undefined') {
-                try {
-                    const fileStream = streamSaver.createWriteStream(suggestedName, {
-                        size: fileMeta && typeof fileMeta.size === 'number' ? fileMeta.size : undefined
-                    });
-                    sink = fileStream.getWriter();
-                } catch (e) {
-                    console.warn('StreamSaver failed, using blob download:', e);
-                    sink = null;
-                }
-            }
+
             // Patch fileMeta to carry the suggested name for the anchor fallback.
             const meta = Object.assign({}, fileMeta || {}, { name: suggestedName });
             return decryptAndDeliver(url, key, meta, sink, true, onProgress);
@@ -3716,29 +3789,26 @@
                 };
 
                 // --- Acquire a streaming disk sink for the ZIP output. ---
-                // StreamSaver.js triggers a normal browser download bar without
-                // any "save as" dialog.
-                let sink = null;
-
-                if (window.showSaveFilePicker) {
-                    try {
-                        const handle = await window.showSaveFilePicker({
-                            suggestedName: zipFileName
-                        });
-                        sink = await handle.createWritable();
-                    } catch (e) {
-                        if (e.name === 'AbortError') return; // User cancelled
-                        console.warn('showSaveFilePicker failed for ZIP, trying StreamSaver:', e);
-                        sink = null;
-                    }
-                }
+                let sink = await createSWWriteStream(zipFileName, totalPlainSize > 0 ? totalPlainSize : undefined, 'application/zip');
 
                 if (!sink && typeof streamSaver !== 'undefined') {
                     try {
                         const fileStream = streamSaver.createWriteStream(zipFileName);
                         sink = fileStream.getWriter();
                     } catch (e) {
-                        console.warn('StreamSaver.js failed, will buffer in memory:', e);
+                        console.warn('StreamSaver.js failed, trying showSaveFilePicker:', e);
+                        sink = null;
+                    }
+                }
+
+                if (!sink && window.showSaveFilePicker) {
+                    try {
+                        const handle = await window.showSaveFilePicker({ suggestedName: zipFileName });
+                        sink = await handle.createWritable();
+                    } catch (e) {
+                        if (e.name === 'AbortError') return; // User cancelled
+                        console.warn('showSaveFilePicker failed for ZIP:', e);
+                        sink = null;
                     }
                 }
 

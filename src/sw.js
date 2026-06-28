@@ -27,9 +27,11 @@
 
 const CHUNK_SIZE = 4 * 1024 * 1024; // 4 MB plaintext per chunk (matches page)
 const STREAM_PREFIX = '/preview-stream/';
+const DOWNLOAD_PREFIX = '/sw-download/';
 
 // Map<fileKey, { key, size, chunked, ctSize, contentType, url, cached: Uint8Array|null }>
 const files = new Map();
+const downloadStreams = new Map();
 
 function ctSizeFor(totalPlain, chunked) {
     if (!chunked) return null; // unknown without fetching; handled lazily
@@ -94,6 +96,36 @@ async function importKeyFromRaw(rawBuf) {
 self.addEventListener('message', async (event) => {
     const d = event.data;
     if (!d) return;
+    if (d.type === 'DILL_DOWNLOAD_INIT') {
+        const port = event.ports && event.ports[0];
+        if (!port) return;
+        const streamPath = d.streamPath;
+        const filename = d.filename || 'download';
+        const size = d.size;
+        const contentType = d.contentType || 'application/octet-stream';
+
+        const readable = new ReadableStream({
+            start(controller) {
+                port.onmessage = (evt) => {
+                    if (evt.data === 'end') {
+                        try { controller.close(); } catch (_) {}
+                    } else if (evt.data === 'abort') {
+                        try { controller.error(new Error('Download aborted')); } catch (_) {}
+                    } else if (evt.data instanceof Uint8Array || ArrayBuffer.isView(evt.data)) {
+                        const u8 = new Uint8Array(evt.data.buffer, evt.data.byteOffset, evt.data.byteLength);
+                        try { controller.enqueue(u8); } catch (_) {}
+                    }
+                };
+            },
+            cancel(reason) {
+                try { port.postMessage('cancel'); } catch (_) {}
+            }
+        });
+
+        downloadStreams.set(streamPath, { readable, filename, size, contentType });
+        if (event.source) event.source.postMessage({ type: 'DILL_DOWNLOAD_READY', streamPath });
+        return;
+    }
     if (d.type === 'DILL_PREVIEW_INIT') {
         console.log('[dill-sw] INIT received for', d.streamPath, 'chunked=', d.chunked, 'size=', d.size);
         try {
@@ -141,10 +173,33 @@ self.addEventListener('activate', (event) => {
 
 self.addEventListener('fetch', (event) => {
     const url = new URL(event.request.url);
+    if (url.pathname.startsWith(DOWNLOAD_PREFIX)) {
+        event.respondWith(handleDownloadStream(url.pathname));
+        return;
+    }
     if (!url.pathname.startsWith(STREAM_PREFIX)) return;
     console.log('[dill-sw] fetch intercept:', event.request.method, url.pathname, 'range=', event.request.headers.get('Range'));
     event.respondWith(handleStream(event.request, url.pathname));
 });
+
+function handleDownloadStream(streamPath) {
+    const entry = downloadStreams.get(streamPath);
+    if (!entry) {
+        return new Response('Download stream not found or expired', { status: 404 });
+    }
+    downloadStreams.delete(streamPath);
+    const filename = entry.filename;
+    const encodedFilename = encodeURIComponent(filename).replace(/['()]/g, escape).replace(/\*/g, '%2A');
+    const headers = new Headers({
+        'Content-Type': entry.contentType || 'application/octet-stream',
+        'Content-Disposition': `attachment; filename="${encodedFilename}"; filename*=UTF-8''${encodedFilename}`,
+        'Cache-Control': 'no-cache, no-store'
+    });
+    if (typeof entry.size === 'number' && entry.size > 0) {
+        headers.set('Content-Length', String(entry.size));
+    }
+    return new Response(entry.readable, { headers });
+}
 
 async function handleStream(request, streamPath) {
     console.log('[dill-sw] handleStream', streamPath, 'has meta:', files.has(streamPath));
