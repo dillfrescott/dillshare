@@ -7,7 +7,7 @@ RUN apt-get update && apt-get install -y \
     libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /usr/src/s3-share
+WORKDIR /usr/src/dillshare
 
 # Copy Cargo configuration files
 COPY Cargo.toml ./
@@ -15,7 +15,7 @@ COPY Cargo.toml ./
 # Create a dummy project to build dependencies first (helps caching layers)
 RUN mkdir src && echo "fn main() {}" > src/main.rs
 RUN cargo build --release
-RUN rm -rf src/ target/release/deps/s3_share* target/release/deps/s3-share*
+RUN rm -rf src/ target/release/deps/s3_share* target/release/deps/dillshare*
 
 # Copy the actual source files
 COPY src/ ./src/
@@ -35,10 +35,10 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 
 # Copy the compiled binary from builder stage
-COPY --from=builder /usr/src/s3-share/target/release/s3-share /app/s3-share
+COPY --from=builder /usr/src/dillshare/target/release/dillshare /app/dillshare
 
 # Expose port
 EXPOSE 8000
 
 # Set execution command
-CMD ["/app/s3-share"]
+CMD ["/app/dillshare"]
