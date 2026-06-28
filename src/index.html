@@ -1491,7 +1491,7 @@
                                 <div id="share-owner-pfp-placeholder" style="width: 1.15rem; height: 1.15rem; border-radius: 50%; background: var(--primary); display: flex; align-items: center; justify-content: center; font-size: 0.65rem; font-weight: bold; font-family: monospace; color: white;">U</div>
                                 <span id="share-owner-username" style="font-size: 0.75rem; font-weight: 600; color: var(--text-main);">username</span>
                             </div>
-                            <p class="file-meta" id="share-created-date" style="margin: 0;">Created on: ...</p>
+                            <p class="file-meta" id="share-created-date" style="margin: 0;">Uploaded on: ...</p>
                         </div>
                     </div>
                     <div style="display: flex; gap: 0.75rem; align-items: center; flex-wrap: wrap;">
@@ -4075,7 +4075,8 @@
                 };
 
                 // Setup countdown clock
-                shareCreatedDate.textContent = `Uploaded on: ${new Date(currentShareData.upload_time).toLocaleString()}`;
+                const totalShareSize = (currentShareData.files || []).reduce((sum, f) => sum + (f.size || 0), 0);
+                shareCreatedDate.textContent = `Uploaded on: ${new Date(currentShareData.upload_time).toLocaleString()} • Total Size: ${formatBytes(totalShareSize)}`;
                 shareCountdown.style.display = 'inline-flex';
 
                 // Render decrypted share message if present
