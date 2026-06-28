@@ -1913,10 +1913,7 @@
                         key,
                         plain
                     );
-                    const block = new Uint8Array(12 + ct.byteLength);
-                    block.set(iv, 0);
-                    block.set(new Uint8Array(ct), 12);
-                    parts[idx] = block;
+                    parts[idx] = new Blob([iv, ct]);
                 }
             }
 
@@ -1925,11 +1922,8 @@
             for (let i = 0; i < workerCount; i++) workers.push(worker());
             await Promise.all(workers);
 
-            const totalLen = parts.reduce((a, c) => a + c.length, 0);
-            const out = new Uint8Array(totalLen);
-            let o = 0;
-            for (const c of parts) { out.set(c, o); o += c.length; }
-            return out.buffer;
+            const blob = new Blob(parts, { type: 'application/octet-stream' });
+            return await blob.arrayBuffer();
         }
 
         async function encryptFileChunked(file, key, onProgress) {
@@ -1954,10 +1948,7 @@
                         key,
                         plainBuf
                     );
-                    const block = new Uint8Array(12 + ct.byteLength);
-                    block.set(iv, 0);
-                    block.set(new Uint8Array(ct), 12);
-                    parts[idx] = block;
+                    parts[idx] = new Blob([iv, ct]);
                     
                     if (onProgress) {
                         onProgress(end - start);
