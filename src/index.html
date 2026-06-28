@@ -43,6 +43,7 @@
             color: var(--text-main);
             font-family: var(--font-family);
             min-height: 100vh;
+            min-height: 100dvh;
             display: flex;
             flex-direction: column;
             overflow-x: hidden;
@@ -1035,13 +1036,41 @@
 
         @media (max-width: 640px) {
             main {
-                padding: 1.25rem 0.75rem;
+                padding: 1rem 0.75rem;
+            }
+            .tab-content.active {
+                gap: 1rem;
+                margin: auto 0;
+            }
+            .glass-card {
+                padding: 1rem;
+            }
+            .drop-zone {
+                padding: 1.5rem 1rem;
+            }
+            .drop-icon-container {
+                width: 2.75rem;
+                height: 2.75rem;
+                margin-bottom: 0.75rem;
+            }
+            .drop-icon-container svg {
+                width: 1.4rem;
+                height: 1.4rem;
+            }
+            .drop-zone h3 {
+                font-size: 1rem;
+                margin-bottom: 0.25rem;
+            }
+            .drop-zone p {
+                margin-bottom: 1rem;
+                font-size: 0.8rem;
             }
             .btn-group {
                 flex-direction: column;
+                gap: 0.5rem;
             }
             header {
-                padding: 0.85rem 1rem;
+                padding: 0.75rem 1rem;
             }
         }
     </style>
