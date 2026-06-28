@@ -102,6 +102,9 @@ async fn main() {
         .route("/api/upload", post(upload_files))
         .route("/api/upload/init", post(upload_init))
         .route("/api/upload/:uuid", post(upload_chunk_or_file).delete(upload_abort))
+        .route("/api/upload/:uuid/multipart/init", post(upload_multipart_init))
+        .route("/api/upload/:uuid/multipart/part", post(upload_multipart_part))
+        .route("/api/upload/:uuid/multipart/complete", post(upload_multipart_complete))
         .route("/api/upload/:uuid/finish", post(upload_finish))
         .route("/api/upload/:uuid/abort", post(upload_abort))
         .route("/api/upload/:uuid/ping", post(upload_ping))
@@ -621,6 +624,146 @@ async fn upload_abort(
     delete_s3_prefix(&state.s3_client, &state.bucket, &prefix).await?;
 
     Ok(axum::Json(serde_json::json!({ "status": "aborted" })))
+}
+
+#[derive(serde::Deserialize)]
+struct MultipartInitReq {
+    file_name: String,
+}
+
+async fn upload_multipart_init(
+    State(state): State<AppState>,
+    Path(uuid): Path<String>,
+    headers: axum::http::HeaderMap,
+    axum::Json(payload): axum::Json<MultipartInitReq>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let token = extract_token(&headers)?;
+    let (_username, _) = verify_session(&token, &state)
+        .await
+        .ok_or_else(|| (StatusCode::UNAUTHORIZED, "Invalid or expired session".to_string()))?;
+
+    let key = format!("uploads/{}/{}", uuid, payload.file_name);
+    let content_type = mime_guess::from_path(&payload.file_name)
+        .first_or_octet_stream()
+        .to_string();
+
+    let res = state.s3_client
+        .create_multipart_upload()
+        .bucket(&state.bucket)
+        .key(&key)
+        .content_type(content_type)
+        .send()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to create S3 multipart upload: {:?}", e)))?;
+
+    let upload_id = res.upload_id().ok_or_else(|| {
+        (StatusCode::INTERNAL_SERVER_ERROR, "No upload_id returned from S3".to_string())
+    })?.to_string();
+
+    Ok(axum::Json(serde_json::json!({ "upload_id": upload_id })))
+}
+
+#[derive(serde::Deserialize)]
+struct MultipartPartQuery {
+    upload_id: String,
+    part_number: i32,
+    file_name: String,
+}
+
+async fn upload_multipart_part(
+    State(state): State<AppState>,
+    Path(uuid): Path<String>,
+    axum::extract::Query(query): axum::extract::Query<MultipartPartQuery>,
+    headers: axum::http::HeaderMap,
+    bytes: axum::body::Bytes,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let token = extract_token(&headers)?;
+    let (_username, _) = verify_session(&token, &state)
+        .await
+        .ok_or_else(|| (StatusCode::UNAUTHORIZED, "Invalid or expired session".to_string()))?;
+
+    let key = format!("uploads/{}/{}", uuid, query.file_name);
+
+    let res = state.s3_client
+        .upload_part()
+        .bucket(&state.bucket)
+        .key(&key)
+        .upload_id(&query.upload_id)
+        .part_number(query.part_number)
+        .body(aws_sdk_s3::primitives::ByteStream::from(bytes))
+        .send()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to upload part: {:?}", e)))?;
+
+    let e_tag = res.e_tag().unwrap_or("").to_string();
+
+    // Refresh active heartbeat timestamp on part activity
+    let active_key = format!("uploads/{}/.active", uuid);
+    let _ = state.s3_client
+        .put_object()
+        .bucket(&state.bucket)
+        .key(&active_key)
+        .content_type("text/plain")
+        .body(aws_sdk_s3::primitives::ByteStream::from(b"active".to_vec()))
+        .send()
+        .await;
+
+    Ok(axum::Json(serde_json::json!({
+        "part_number": query.part_number,
+        "e_tag": e_tag
+    })))
+}
+
+#[derive(serde::Deserialize)]
+struct CompletedPartReq {
+    part_number: i32,
+    e_tag: String,
+}
+
+#[derive(serde::Deserialize)]
+struct MultipartCompleteReq {
+    upload_id: String,
+    file_name: String,
+    parts: Vec<CompletedPartReq>,
+}
+
+async fn upload_multipart_complete(
+    State(state): State<AppState>,
+    Path(uuid): Path<String>,
+    headers: axum::http::HeaderMap,
+    axum::Json(payload): axum::Json<MultipartCompleteReq>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let token = extract_token(&headers)?;
+    let (_username, _) = verify_session(&token, &state)
+        .await
+        .ok_or_else(|| (StatusCode::UNAUTHORIZED, "Invalid or expired session".to_string()))?;
+
+    let key = format!("uploads/{}/{}", uuid, payload.file_name);
+
+    let mut completed_parts = Vec::new();
+    for p in payload.parts {
+        let completed_part = aws_sdk_s3::types::CompletedPart::builder()
+            .part_number(p.part_number)
+            .e_tag(p.e_tag)
+            .build();
+        completed_parts.push(completed_part);
+    }
+
+    let multipart_upload = aws_sdk_s3::types::CompletedMultipartUpload::builder()
+        .set_parts(Some(completed_parts))
+        .build();
+
+    state.s3_client
+        .complete_multipart_upload()
+        .bucket(&state.bucket)
+        .key(&key)
+        .upload_id(&payload.upload_id)
+        .multipart_upload(multipart_upload)
+        .send()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to complete S3 multipart upload: {:?}", e)))?;
+
+    Ok(axum::Json(serde_json::json!({ "status": "ok" })))
 }
 
 

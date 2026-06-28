@@ -2770,6 +2770,78 @@
             });
         }
 
+        function uploadBinaryBodySingle(url, bodyData, contentType, token, onProgress) {
+            return new Promise((resolve, reject) => {
+                if (isUploadCancelled) {
+                    return reject(new Error('Upload cancelled'));
+                }
+                const xhr = new XMLHttpRequest();
+                activeUploadXhrs.push(xhr);
+                xhr.open('POST', url, true);
+                if (contentType) {
+                    xhr.setRequestHeader('Content-Type', contentType);
+                }
+                if (token) {
+                    xhr.setRequestHeader('Authorization', `Bearer ${token}`);
+                }
+                if (onProgress) {
+                    xhr.upload.onprogress = (e) => {
+                        if (e.lengthComputable) {
+                            onProgress(e.loaded, e.total);
+                        }
+                    };
+                }
+                const cleanup = () => {
+                    const idx = activeUploadXhrs.indexOf(xhr);
+                    if (idx !== -1) activeUploadXhrs.splice(idx, 1);
+                };
+                xhr.onload = () => {
+                    cleanup();
+                    if (isUploadCancelled) {
+                        return reject(new Error('Upload cancelled'));
+                    }
+                    if (xhr.status === 200) {
+                        try {
+                            resolve(JSON.parse(xhr.responseText));
+                        } catch (e) {
+                            resolve(xhr.responseText);
+                        }
+                    } else {
+                        if (xhr.status === 401) {
+                            showToast('Your session has expired. Please sign in again.', 'info');
+                            logoutUser();
+                        }
+                        reject(new Error(xhr.responseText || `Upload failed with status ${xhr.status}`));
+                    }
+                };
+                xhr.onerror = () => {
+                    cleanup();
+                    reject(new Error(isUploadCancelled ? 'Upload cancelled' : 'Network error during upload'));
+                };
+                xhr.onabort = () => {
+                    cleanup();
+                    reject(new Error('Upload cancelled'));
+                };
+                xhr.send(bodyData);
+            });
+        }
+
+        async function uploadBinaryBody(url, bodyData, contentType, token, onProgress, retries = 3) {
+            for (let attempt = 0; attempt <= retries; attempt++) {
+                if (isUploadCancelled) throw new Error('Upload cancelled');
+                try {
+                    return await uploadBinaryBodySingle(url, bodyData, contentType, token, onProgress);
+                } catch (err) {
+                    if (isUploadCancelled || err.message === 'Upload cancelled' || err.message.includes('401') || attempt === retries) {
+                        throw err;
+                    }
+                    const delay = Math.pow(2, attempt) * 1000;
+                    showToast(`Upload glitch detected. Retrying... (${attempt + 1}/${retries})`, 'info');
+                    await new Promise(r => setTimeout(r, delay));
+                }
+            }
+        }
+
         async function uploadFormData(url, formData, token, onProgress, retries = 3) {
             for (let attempt = 0; attempt <= retries; attempt++) {
                 if (isUploadCancelled) throw new Error('Upload cancelled');
@@ -2840,44 +2912,19 @@
                 if (uploadProgressTitle) uploadProgressTitle.textContent = `Encrypting ${selectedFiles.length} file(s)...`;
 
                 if (isSessionUpload && uuid) {
-                    // Batched concurrent uploading (high speed & bounded memory)
-                    const BATCH_MAX_FILES = 25;
-                    const BATCH_MAX_BYTES = 24 * 1024 * 1024; // 24MB per batch threshold
-                    const CONCURRENCY = Math.max(6, Math.min(16, (navigator.hardwareConcurrency || 4) * 2));
-
-                    const batches = [];
-                    let currentBatch = [];
-                    let currentBatchBytes = 0;
-
-                    for (let i = 0; i < selectedFiles.length; i++) {
-                        const item = selectedFiles[i];
-                        const itemSize = item.file.size;
-                        if (currentBatch.length > 0 && (currentBatch.length >= BATCH_MAX_FILES || currentBatchBytes + itemSize > BATCH_MAX_BYTES)) {
-                            batches.push(currentBatch);
-                            currentBatch = [];
-                            currentBatchBytes = 0;
-                        }
-                        currentBatch.push(i);
-                        currentBatchBytes += itemSize;
-                    }
-                    if (currentBatch.length > 0) {
-                        batches.push(currentBatch);
-                    }
-
                     const metaFiles = new Array(selectedFiles.length);
                     let filesProcessedCount = 0;
-                    let bytesEncryptedTotal = 0;
 
-                    const batchLoadedBytes = new Array(batches.length).fill(0);
-                    const batchTotalBytes = new Array(batches.length).fill(0);
-                    let uploadStartTime = Date.now();
+                    const fileLoadedBytes = new Array(selectedFiles.length).fill(0);
+                    const fileTotalBytes = new Array(selectedFiles.length).fill(0);
+                    let speedSamples = [];
 
                     function updateUploadProgressUI() {
                         let totalLoaded = 0;
                         let totalExpected = 0;
-                        for (let b = 0; b < batches.length; b++) {
-                            totalLoaded += batchLoadedBytes[b];
-                            totalExpected += batchTotalBytes[b];
+                        for (let i = 0; i < selectedFiles.length; i++) {
+                            totalLoaded += fileLoadedBytes[i];
+                            totalExpected += Math.max(fileTotalBytes[i], selectedFiles[i].file.size);
                         }
 
                         let overallRatio = totalExpected > 0 ? (totalLoaded / totalExpected) : (filesProcessedCount / selectedFiles.length);
@@ -2886,9 +2933,22 @@
                         uploadProgressBar.style.width = `${overallPct}%`;
                         progressPercentage.textContent = `${overallPct}% (Uploaded)`;
 
-                        const elapsed = (Date.now() - uploadStartTime) / 1000;
-                        if (elapsed > 0 && totalLoaded > 0) {
-                            const speed = totalLoaded / elapsed;
+                        const now = Date.now();
+                        speedSamples.push({ time: now, loaded: totalLoaded });
+                        speedSamples = speedSamples.filter(s => now - s.time <= 2000);
+
+                        let speed = 0;
+                        if (speedSamples.length >= 2) {
+                            const oldest = speedSamples[0];
+                            const newest = speedSamples[speedSamples.length - 1];
+                            const timeDiff = (newest.time - oldest.time) / 1000;
+                            const bytesDiff = newest.loaded - oldest.loaded;
+                            if (timeDiff > 0 && bytesDiff >= 0) {
+                                speed = bytesDiff / timeDiff;
+                            }
+                        }
+
+                        if (speed > 0) {
                             progressSpeed.textContent = `${formatBytes(speed)}/s`;
                             if (totalExpected > totalLoaded) {
                                 const remBytes = totalExpected - totalLoaded;
@@ -2905,84 +2965,171 @@
                         }
                     }
 
-                    async function processBatch(batchIndex) {
-                        const batchIndices = batches[batchIndex];
-                        const fileFormData = new FormData();
-                        let estimatedBatchEncSize = 0;
+                    async function processSingleFile(i) {
+                        const item = selectedFiles[i];
+                        const file = item.file;
+                        const fileName = `file_${i}.enc`;
 
-                        const itemsResults = await Promise.all(batchIndices.map(async (i) => {
-                            const item = selectedFiles[i];
-                            const encBlob = await encryptFileChunked(item.file, key, (chunkSize) => {
-                                bytesEncryptedTotal += chunkSize;
-                            });
-
-                            let hasThumb = false;
-                            let encThumbBlob = null;
-                            try {
-                                const thumbBuf = await generateThumbnail(item.file);
-                                if (thumbBuf && thumbBuf.byteLength > 0) {
-                                    const encThumbBuf = await encryptData(thumbBuf, key);
-                                    encThumbBlob = new Blob([encThumbBuf], { type: 'application/octet-stream' });
-                                    hasThumb = true;
-                                }
-                            } catch (e) {
-                                console.warn('[dill] thumbnail generation failed for', item.relativePath, e);
+                        let hasThumb = false;
+                        let encThumbBlob = null;
+                        try {
+                            const thumbBuf = await generateThumbnail(file);
+                            if (thumbBuf && thumbBuf.byteLength > 0) {
+                                const encThumbBuf = await encryptData(thumbBuf, key);
+                                encThumbBlob = new Blob([encThumbBuf], { type: 'application/octet-stream' });
+                                hasThumb = true;
                             }
+                        } catch (e) {
+                            console.warn('[dill] thumbnail generation failed for', item.relativePath, e);
+                        }
 
-                            return { i, item, encBlob, hasThumb, encThumbBlob };
-                        }));
+                        metaFiles[i] = {
+                            id: i.toString(),
+                            name: item.relativePath,
+                            size: file.size,
+                            type: file.type || 'application/octet-stream',
+                            chunked: true,
+                            thumb: hasThumb
+                        };
 
-                        for (const res of itemsResults) {
-                            const { i, item, encBlob, hasThumb, encThumbBlob } = res;
-                            metaFiles[i] = {
-                                id: i.toString(),
-                                name: item.relativePath,
-                                size: item.file.size,
-                                type: item.file.type || 'application/octet-stream',
-                                chunked: true,
-                                thumb: hasThumb
-                            };
+                        if (hasThumb && encThumbBlob) {
+                            const thumbFormData = new FormData();
+                            thumbFormData.append('files', encThumbBlob, `file_${i}.thumb.enc`);
+                            uploadFormData(`/api/upload/${uuid}`, thumbFormData, token).catch(() => {});
+                        }
 
-                            fileFormData.append('files', encBlob, `file_${i}.enc`);
-                            estimatedBatchEncSize += encBlob.size;
-                            if (hasThumb && encThumbBlob) {
-                                fileFormData.append('files', encThumbBlob, `file_${i}.thumb.enc`);
-                                estimatedBatchEncSize += encThumbBlob.size;
+                        if (file.size <= 8 * 1024 * 1024) {
+                            const encBlob = await encryptFileChunked(file, key, null);
+                            fileLoadedBytes[i] = 0;
+                            fileTotalBytes[i] = encBlob.size;
+                            updateUploadProgressUI();
+
+                            const fileFormData = new FormData();
+                            fileFormData.append('files', encBlob, fileName);
+                            await uploadFormData(`/api/upload/${uuid}`, fileFormData, token, (loaded, total) => {
+                                fileLoadedBytes[i] = loaded;
+                                fileTotalBytes[i] = total;
+                                updateUploadProgressUI();
+                            });
+                            fileLoadedBytes[i] = fileTotalBytes[i];
+                            filesProcessedCount++;
+                            updateUploadProgressUI();
+                            return;
+                        }
+
+                        // Parallel S3 Multipart Upload for files > 8MB
+                        const initRes = await fetch(`/api/upload/${uuid}/multipart/init`, {
+                            method: 'POST',
+                            headers: {
+                                'Content-Type': 'application/json',
+                                ...(token ? { 'Authorization': `Bearer ${token}` } : {})
+                            },
+                            body: JSON.stringify({ file_name: fileName })
+                        });
+                        if (!initRes.ok) throw new Error(await initRes.text());
+                        const { upload_id } = await initRes.json();
+
+                        const chunkSize = ENCRYPT_CHUNK_SIZE; // 4MB
+                        const totalPlainChunks = Math.max(1, Math.ceil(file.size / chunkSize));
+                        const CHUNKS_PER_PART = 2; // 8MB per S3 part (> 5MB S3 min limit)
+                        const totalParts = Math.ceil(totalPlainChunks / CHUNKS_PER_PART);
+
+                        const completedParts = new Array(totalParts);
+                        const partLoadedBytes = new Array(totalParts).fill(0);
+                        const partTotalBytes = new Array(totalParts).fill(0);
+
+                        let currentPartIdx = 0;
+
+                        async function partWorker() {
+                            while (currentPartIdx < totalParts) {
+                                if (isUploadCancelled) break;
+                                const pIdx = currentPartIdx++;
+                                const partNum = pIdx + 1;
+
+                                const startChunk = pIdx * CHUNKS_PER_PART;
+                                const endChunk = Math.min(startChunk + CHUNKS_PER_PART, totalPlainChunks);
+
+                                const encChunks = [];
+                                for (let c = startChunk; c < endChunk; c++) {
+                                    const startByte = c * chunkSize;
+                                    const endByte = Math.min(startByte + chunkSize, file.size);
+                                    const slice = file.slice(startByte, endByte);
+                                    const plainBuf = await slice.arrayBuffer();
+
+                                    const iv = window.crypto.getRandomValues(new Uint8Array(12));
+                                    const ct = await window.crypto.subtle.encrypt(
+                                        { name: "AES-GCM", iv: iv },
+                                        key,
+                                        plainBuf
+                                    );
+                                    encChunks.push(new Blob([iv, ct]));
+                                }
+
+                                const partBlob = new Blob(encChunks, { type: 'application/octet-stream' });
+                                partTotalBytes[pIdx] = partBlob.size;
+
+                                const partUrl = `/api/upload/${uuid}/multipart/part?upload_id=${encodeURIComponent(upload_id)}&part_number=${partNum}&file_name=${encodeURIComponent(fileName)}`;
+                                const resData = await uploadBinaryBody(partUrl, partBlob, 'application/octet-stream', token, (loaded, total) => {
+                                    partLoadedBytes[pIdx] = loaded;
+                                    fileLoadedBytes[i] = partLoadedBytes.reduce((a, b) => a + b, 0);
+                                    fileTotalBytes[i] = partTotalBytes.reduce((a, b) => a + b, 0);
+                                    updateUploadProgressUI();
+                                });
+
+                                partLoadedBytes[pIdx] = partBlob.size;
+                                fileLoadedBytes[i] = partLoadedBytes.reduce((a, b) => a + b, 0);
+                                updateUploadProgressUI();
+
+                                completedParts[pIdx] = {
+                                    part_number: partNum,
+                                    e_tag: resData.e_tag
+                                };
                             }
                         }
 
-                        batchTotalBytes[batchIndex] = estimatedBatchEncSize;
+                        const concurrency = Math.max(6, Math.min(16, (navigator.hardwareConcurrency || 4) * 2));
+                        const partWorkers = [];
+                        const numPartWorkers = Math.min(concurrency, totalParts);
+                        for (let w = 0; w < numPartWorkers; w++) {
+                            partWorkers.push(partWorker());
+                        }
+                        await Promise.all(partWorkers);
 
-                        await uploadFormData(`/api/upload/${uuid}`, fileFormData, token, (loaded, total) => {
-                            batchLoadedBytes[batchIndex] = loaded;
-                            if (total > batchTotalBytes[batchIndex]) {
-                                batchTotalBytes[batchIndex] = total;
-                            }
-                            updateUploadProgressUI();
+                        if (isUploadCancelled) throw new Error('Upload cancelled');
+
+                        const compRes = await fetch(`/api/upload/${uuid}/multipart/complete`, {
+                            method: 'POST',
+                            headers: {
+                                'Content-Type': 'application/json',
+                                ...(token ? { 'Authorization': `Bearer ${token}` } : {})
+                            },
+                            body: JSON.stringify({
+                                upload_id: upload_id,
+                                file_name: fileName,
+                                parts: completedParts
+                            })
                         });
+                        if (!compRes.ok) throw new Error(await compRes.text());
 
-                        batchLoadedBytes[batchIndex] = batchTotalBytes[batchIndex];
-                        filesProcessedCount += batchIndices.length;
+                        filesProcessedCount++;
                         updateUploadProgressUI();
                     }
 
-                    uploadStartTime = Date.now();
-                    let currentBatchIdx = 0;
-
-                    async function worker() {
-                        while (currentBatchIdx < batches.length) {
+                    let currentFileIdx = 0;
+                    async function fileWorker() {
+                        while (currentFileIdx < selectedFiles.length) {
                             if (isUploadCancelled) break;
-                            const bIdx = currentBatchIdx++;
-                            await processBatch(bIdx);
+                            const fIdx = currentFileIdx++;
+                            await processSingleFile(fIdx);
                         }
                     }
 
-                    const workerCount = Math.min(CONCURRENCY, batches.length);
-                    const workers = [];
-                    for (let w = 0; w < workerCount; w++) {
-                        workers.push(worker());
+                    const activeFileWorkers = [];
+                    const numFileWorkers = Math.min(4, selectedFiles.length);
+                    for (let w = 0; w < numFileWorkers; w++) {
+                        activeFileWorkers.push(fileWorker());
                     }
-                    await Promise.all(workers);
+                    await Promise.all(activeFileWorkers);
 
                     meta.files = metaFiles;
 
