@@ -488,16 +488,20 @@ async fn upload_chunk_or_file(
         uploaded_files.push(file_path);
     }
 
-    // Refresh active heartbeat timestamp on chunk/file activity
+    // Refresh active heartbeat timestamp on chunk/file activity asynchronously
     let active_key = format!("uploads/{}/.active", uuid);
-    let _ = state.s3_client
-        .put_object()
-        .bucket(&state.bucket)
-        .key(&active_key)
-        .content_type("text/plain")
-        .body(aws_sdk_s3::primitives::ByteStream::from(b"active".to_vec()))
-        .send()
-        .await;
+    let s3_client = state.s3_client.clone();
+    let bucket = state.bucket.clone();
+    tokio::spawn(async move {
+        let _ = s3_client
+            .put_object()
+            .bucket(&bucket)
+            .key(&active_key)
+            .content_type("text/plain")
+            .body(aws_sdk_s3::primitives::ByteStream::from(b"active".to_vec()))
+            .send()
+            .await;
+    });
 
     Ok(axum::Json(serde_json::json!({
         "status": "ok",
@@ -697,16 +701,20 @@ async fn upload_multipart_part(
 
     let e_tag = res.e_tag().unwrap_or("").to_string();
 
-    // Refresh active heartbeat timestamp on part activity
+    // Refresh active heartbeat timestamp on part activity asynchronously
     let active_key = format!("uploads/{}/.active", uuid);
-    let _ = state.s3_client
-        .put_object()
-        .bucket(&state.bucket)
-        .key(&active_key)
-        .content_type("text/plain")
-        .body(aws_sdk_s3::primitives::ByteStream::from(b"active".to_vec()))
-        .send()
-        .await;
+    let s3_client = state.s3_client.clone();
+    let bucket = state.bucket.clone();
+    tokio::spawn(async move {
+        let _ = s3_client
+            .put_object()
+            .bucket(&bucket)
+            .key(&active_key)
+            .content_type("text/plain")
+            .body(aws_sdk_s3::primitives::ByteStream::from(b"active".to_vec()))
+            .send()
+            .await;
+    });
 
     Ok(axum::Json(serde_json::json!({
         "part_number": query.part_number,
@@ -926,9 +934,9 @@ async fn download_file(
         }
     };
 
-    // Convert S3 ByteStream into an AsyncRead reader, and wrap in ReaderStream with 128KB capacity for high throughput
+    // Convert S3 ByteStream into an AsyncRead reader, and wrap in ReaderStream with 1MB capacity for ultra-high throughput streaming
     let reader = res.body.into_async_read();
-    let stream = tokio_util::io::ReaderStream::with_capacity(reader, 128 * 1024);
+    let stream = tokio_util::io::ReaderStream::with_capacity(reader, 1024 * 1024);
     let body = Body::from_stream(stream);
 
     let status = if range_header.is_some() {

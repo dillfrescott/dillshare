@@ -1899,7 +1899,7 @@
             const chunkSize = ENCRYPT_CHUNK_SIZE;
             const totalChunks = Math.max(1, Math.ceil(total / chunkSize));
             const parts = new Array(totalChunks);
-            const CONCURRENCY = 4;
+            const CONCURRENCY = Math.max(4, Math.min(16, (navigator.hardwareConcurrency || 4) * 2));
             let currentChunkIdx = 0;
 
             async function worker() {
@@ -3049,21 +3049,23 @@
                                 const startChunk = pIdx * CHUNKS_PER_PART;
                                 const endChunk = Math.min(startChunk + CHUNKS_PER_PART, totalPlainChunks);
 
-                                const encChunks = [];
+                                const chunkPromises = [];
                                 for (let c = startChunk; c < endChunk; c++) {
                                     const startByte = c * chunkSize;
                                     const endByte = Math.min(startByte + chunkSize, file.size);
                                     const slice = file.slice(startByte, endByte);
-                                    const plainBuf = await slice.arrayBuffer();
-
-                                    const iv = window.crypto.getRandomValues(new Uint8Array(12));
-                                    const ct = await window.crypto.subtle.encrypt(
-                                        { name: "AES-GCM", iv: iv },
-                                        key,
-                                        plainBuf
-                                    );
-                                    encChunks.push(new Blob([iv, ct]));
+                                    chunkPromises.push((async () => {
+                                        const plainBuf = await slice.arrayBuffer();
+                                        const iv = window.crypto.getRandomValues(new Uint8Array(12));
+                                        const ct = await window.crypto.subtle.encrypt(
+                                            { name: "AES-GCM", iv: iv },
+                                            key,
+                                            plainBuf
+                                        );
+                                        return new Blob([iv, ct]);
+                                    })());
                                 }
+                                const encChunks = await Promise.all(chunkPromises);
 
                                 const partBlob = new Blob(encChunks, { type: 'application/octet-stream' });
                                 partTotalBytes[pIdx] = partBlob.size;
