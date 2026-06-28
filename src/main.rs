@@ -100,6 +100,9 @@ async fn main() {
     let app = Router::new()
         // API routes
         .route("/api/upload", post(upload_files))
+        .route("/api/upload/init", post(upload_init))
+        .route("/api/upload/:uuid", post(upload_chunk_or_file))
+        .route("/api/upload/:uuid/finish", post(upload_finish))
         .route("/api/share/:uuid", get(get_share).delete(delete_share))
         .route("/api/share/:uuid/file/*filename", get(download_file))
         // Service worker for streaming decrypted media preview
@@ -327,6 +330,189 @@ async fn upload_files_inner(
 
     // Actual user files count (excluding metadata.enc)
     let files_count = uploaded_files.iter().filter(|f| *f != "metadata.enc").count();
+
+    // Update user's public shares index in S3
+    let public_shares_key = format!("users/{}/public_shares.json", username);
+    let mut shares = match state.s3_client.get_object()
+        .bucket(&state.bucket)
+        .key(&public_shares_key)
+        .send()
+        .await
+    {
+        Ok(output) => {
+            if let Ok(bytes) = output.body.collect().await {
+                serde_json::from_slice::<Vec<serde_json::Value>>(&bytes.into_bytes()).unwrap_or_default()
+            } else {
+                Vec::new()
+            }
+        }
+        Err(_) => Vec::new(),
+    };
+
+    shares.push(serde_json::json!({
+        "uuid": uuid,
+        "files_count": files_count,
+        "total_size": total_size,
+        "created_at": chrono::Utc::now().to_rfc3339()
+    }));
+
+    let shares_bytes = serde_json::to_vec(&shares)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    state.s3_client.put_object()
+        .bucket(&state.bucket)
+        .key(&public_shares_key)
+        .content_type("application/json")
+        .body(aws_sdk_s3::primitives::ByteStream::from(shares_bytes))
+        .send()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to save public shares list: {:?}", e)))?;
+
+    Ok(axum::Json(serde_json::json!({
+        "uuid": uuid,
+        "files": uploaded_files
+    })))
+}
+
+async fn upload_init(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let token = extract_token(&headers)?;
+    let (_username, _) = verify_session(&token, &state)
+        .await
+        .ok_or_else(|| (StatusCode::UNAUTHORIZED, "Invalid or expired session".to_string()))?;
+
+    let uuid = uuid::Uuid::new_v4().to_string();
+    Ok(axum::Json(serde_json::json!({
+        "uuid": uuid
+    })))
+}
+
+async fn upload_chunk_or_file(
+    State(state): State<AppState>,
+    Path(uuid): Path<String>,
+    headers: axum::http::HeaderMap,
+    mut multipart: Multipart,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let token = extract_token(&headers)?;
+    let (_username, _) = verify_session(&token, &state)
+        .await
+        .ok_or_else(|| (StatusCode::UNAUTHORIZED, "Invalid or expired session".to_string()))?;
+
+    let mut uploaded_files = Vec::new();
+
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?
+    {
+        let file_path = match field.file_name() {
+            Some(name) => name.to_string(),
+            None => continue,
+        };
+
+        if file_path.trim().is_empty() {
+            continue;
+        }
+
+        let content_type = mime_guess::from_path(&file_path)
+            .first_or_octet_stream()
+            .to_string();
+
+        let bytes = field
+            .bytes()
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+        let key = format!("uploads/{}/{}", uuid, file_path);
+        tracing::info!("Uploading {} to S3 bucket '{}'...", file_path, state.bucket);
+
+        state.s3_client
+            .put_object()
+            .bucket(&state.bucket)
+            .key(&key)
+            .content_type(content_type)
+            .body(aws_sdk_s3::primitives::ByteStream::from(bytes))
+            .send()
+            .await
+            .map_err(|e| {
+                tracing::error!("S3 PutObject error: {:?}", e);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to upload to S3: {:?}", e),
+                )
+            })?;
+
+        uploaded_files.push(file_path);
+    }
+
+    Ok(axum::Json(serde_json::json!({
+        "status": "ok",
+        "uploaded": uploaded_files
+    })))
+}
+
+#[derive(serde::Deserialize)]
+struct UploadFinishReq {
+    files_count: Option<usize>,
+    total_size: Option<i64>,
+}
+
+async fn upload_finish(
+    State(state): State<AppState>,
+    Path(uuid): Path<String>,
+    headers: axum::http::HeaderMap,
+    axum::Json(payload): axum::Json<UploadFinishReq>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let token = extract_token(&headers)?;
+    let (username, _) = verify_session(&token, &state)
+        .await
+        .ok_or_else(|| (StatusCode::UNAUTHORIZED, "Invalid or expired session".to_string()))?;
+
+    // Write owner record
+    let owner_key = format!("uploads/{}/owner.txt", uuid);
+    state.s3_client
+        .put_object()
+        .bucket(&state.bucket)
+        .key(&owner_key)
+        .content_type("text/plain")
+        .body(aws_sdk_s3::primitives::ByteStream::from(username.as_bytes().to_vec()))
+        .send()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to save owner: {:?}", e)))?;
+
+    // List files under uploads/{uuid}/ to count and check uploaded files
+    let prefix = format!("uploads/{}/", uuid);
+    let mut uploaded_files = Vec::new();
+    let mut s3_total_size: i64 = 0;
+
+    let list_res = state.s3_client.list_objects_v2()
+        .bucket(&state.bucket)
+        .prefix(&prefix)
+        .send()
+        .await;
+
+    if let Ok(out) = list_res {
+        if let Some(objects) = out.contents {
+            for obj in objects {
+                if let Some(k) = obj.key {
+                    let rel_path = k.strip_prefix(&prefix).unwrap_or(&k).to_string();
+                    if rel_path != "owner.txt" {
+                        uploaded_files.push(rel_path.clone());
+                    }
+                    if rel_path != "owner.txt" && rel_path != "metadata.enc" && !rel_path.ends_with(".thumb.enc") {
+                        s3_total_size += obj.size.unwrap_or(0);
+                    }
+                }
+            }
+        }
+    }
+
+    let files_count = payload.files_count.unwrap_or_else(|| {
+        uploaded_files.iter().filter(|f| *f != "metadata.enc" && !f.ends_with(".thumb.enc")).count()
+    });
+    let total_size = payload.total_size.unwrap_or(s3_total_size);
 
     // Update user's public shares index in S3
     let public_shares_key = format!("users/{}/public_shares.json", username);

@@ -1078,7 +1078,7 @@
 
             <!-- Upload Progress -->
             <div class="glass-card progress-card" id="upload-progress-card" style="display: none;">
-                <h4>Uploading files...</h4>
+                <h4 id="upload-progress-title">Uploading files...</h4>
                 <div class="progress-bar-container">
                     <div class="progress-bar" id="upload-progress-bar"></div>
                 </div>
@@ -1456,6 +1456,7 @@
         const btnUpload = document.getElementById('btn-upload');
 
         const uploadProgressCard = document.getElementById('upload-progress-card');
+        const uploadProgressTitle = document.getElementById('upload-progress-title');
         const uploadProgressBar = document.getElementById('upload-progress-bar');
         const progressPercentage = document.getElementById('progress-percentage');
         const progressSpeed = document.getElementById('progress-speed');
@@ -1830,6 +1831,36 @@
             let o = 0;
             for (const c of parts) { out.set(c, o); o += c.length; }
             return out.buffer;
+        }
+
+        async function encryptFileChunked(file, key, onProgress) {
+            const chunkSize = ENCRYPT_CHUNK_SIZE;
+            const total = file.size;
+            let offset = 0;
+            const parts = [];
+            
+            while (offset < total) {
+                const slice = file.slice(offset, offset + chunkSize);
+                const plainBuf = await slice.arrayBuffer();
+                offset += slice.size;
+                
+                const iv = window.crypto.getRandomValues(new Uint8Array(12));
+                const ct = await window.crypto.subtle.encrypt(
+                    { name: "AES-GCM", iv: iv },
+                    key,
+                    plainBuf
+                );
+                const block = new Uint8Array(12 + ct.byteLength);
+                block.set(iv, 0);
+                block.set(new Uint8Array(ct), 12);
+                parts.push(block);
+                
+                if (onProgress) {
+                    onProgress(slice.size);
+                }
+            }
+            
+            return new Blob(parts, { type: 'application/octet-stream' });
         }
 
         // Streaming decryptor for chunked files: yields plaintext Uint8Array chunks
@@ -2346,6 +2377,40 @@
             updateSelectedFilesUI();
         });
 
+        function uploadFormData(url, formData, token, onProgress) {
+            return new Promise((resolve, reject) => {
+                const xhr = new XMLHttpRequest();
+                xhr.open('POST', url, true);
+                if (token) {
+                    xhr.setRequestHeader('Authorization', `Bearer ${token}`);
+                }
+                if (onProgress) {
+                    xhr.upload.onprogress = (e) => {
+                        if (e.lengthComputable) {
+                            onProgress(e.loaded, e.total);
+                        }
+                    };
+                }
+                xhr.onload = () => {
+                    if (xhr.status === 200) {
+                        try {
+                            resolve(JSON.parse(xhr.responseText));
+                        } catch (e) {
+                            resolve(xhr.responseText);
+                        }
+                    } else {
+                        if (xhr.status === 401) {
+                            showToast('Your session has expired. Please sign in again.', 'info');
+                            logoutUser();
+                        }
+                        reject(new Error(xhr.responseText || `Upload failed with status ${xhr.status}`));
+                    }
+                };
+                xhr.onerror = () => reject(new Error('Network error during upload'));
+                xhr.send(formData);
+            });
+        }
+
         // Handle File Encryption & Upload Process
         btnUpload.addEventListener('click', async () => {
             if (selectedFiles.length === 0) return;
@@ -2356,85 +2421,221 @@
             uploadProgressCard.style.display = 'flex';
             
             try {
+                const totalUnencryptedSize = selectedFiles.reduce((acc, f) => acc + f.file.size, 0);
+                const token = localStorage.getItem('dill_session_token');
+
                 // 1. Generate 256-bit AES-GCM key
                 showToast('Generating encryption key...', 'info');
+                if (uploadProgressTitle) uploadProgressTitle.textContent = 'Generating Key...';
                 const { key, hex: keyHex } = await generateEncryptionKey();
 
-                // 2. Encrypt file contents & build encrypted metadata
-                showToast('Encrypting files in browser...', 'info');
-                const formData = new FormData();
+                // 2. Initialize upload session on server
+                if (uploadProgressTitle) uploadProgressTitle.textContent = 'Initializing Session...';
+                const initHeaders = {};
+                if (token) initHeaders['Authorization'] = `Bearer ${token}`;
                 
-                const meta = {
-                    files: []
-                };
+                const initRes = await fetch('/api/upload/init', { method: 'POST', headers: initHeaders });
+                let uuid = null;
+                let isSessionUpload = false;
+                if (initRes.ok) {
+                    const initData = await initRes.json();
+                    uuid = initData.uuid;
+                    isSessionUpload = true;
+                }
 
-                progressEta.textContent = `Encrypting ${selectedFiles.length} file(s)...`;
-                const filePromises = selectedFiles.map(async (item, i) => {
-                    const fileBuf = await item.file.arrayBuffer();
-                    const encryptedBuf = await encryptDataChunked(fileBuf, key);
-                    const encBlob = new Blob([encryptedBuf], { type: 'application/octet-stream' });
+                const meta = { files: [] };
+                let bytesEncryptedTotal = 0;
+                let encStartTime = Date.now();
 
-                    let hasThumb = false;
-                    let encThumbBlob = null;
-                    try {
-                        const thumbBuf = await generateThumbnail(item.file);
-                        if (thumbBuf && thumbBuf.byteLength > 0) {
-                            const encThumbBuf = await encryptData(thumbBuf, key);
-                            encThumbBlob = new Blob([encThumbBuf], { type: 'application/octet-stream' });
-                            hasThumb = true;
+                if (uploadProgressTitle) uploadProgressTitle.textContent = `Encrypting ${selectedFiles.length} file(s)...`;
+
+                if (isSessionUpload && uuid) {
+                    // Sequential file-by-file processing (low memory footprint for large files)
+                    for (let i = 0; i < selectedFiles.length; i++) {
+                        const item = selectedFiles[i];
+                        if (uploadProgressTitle) {
+                            uploadProgressTitle.textContent = `Encrypting file ${i + 1} of ${selectedFiles.length}...`;
                         }
-                    } catch (e) {
-                        console.warn('[dill] thumbnail generation failed for', item.relativePath, e);
+
+                        const encBlob = await encryptFileChunked(item.file, key, (chunkSize) => {
+                            bytesEncryptedTotal += chunkSize;
+                            const progressRatio = totalUnencryptedSize > 0 ? (bytesEncryptedTotal / totalUnencryptedSize) : 1;
+                            const pct = Math.round(progressRatio * 100);
+                            uploadProgressBar.style.width = `${Math.round(progressRatio * 50)}%`;
+                            progressPercentage.textContent = `${pct}% (Encrypted)`;
+
+                            const elapsed = (Date.now() - encStartTime) / 1000;
+                            if (elapsed > 0) {
+                                const speed = bytesEncryptedTotal / elapsed;
+                                progressSpeed.textContent = `${formatBytes(speed)}/s`;
+                                const remBytes = totalUnencryptedSize - bytesEncryptedTotal;
+                                const remSecs = remBytes / speed;
+                                const mins = Math.floor(remSecs / 60);
+                                const secs = Math.floor(remSecs % 60);
+                                progressEta.textContent = mins > 0 ? `Encrypting ${item.file.name} • ETA ${mins}m ${secs}s` : `Encrypting ${item.file.name} • ETA ${secs}s`;
+                            }
+                        });
+
+                        let hasThumb = false;
+                        let encThumbBlob = null;
+                        try {
+                            const thumbBuf = await generateThumbnail(item.file);
+                            if (thumbBuf && thumbBuf.byteLength > 0) {
+                                const encThumbBuf = await encryptData(thumbBuf, key);
+                                encThumbBlob = new Blob([encThumbBuf], { type: 'application/octet-stream' });
+                                hasThumb = true;
+                            }
+                        } catch (e) {
+                            console.warn('[dill] thumbnail generation failed for', item.relativePath, e);
+                        }
+
+                        meta.files.push({
+                            id: i.toString(),
+                            name: item.relativePath,
+                            size: item.file.size,
+                            type: item.file.type || 'application/octet-stream',
+                            chunked: true,
+                            thumb: hasThumb
+                        });
+
+                        // Upload this encrypted file immediately
+                        if (uploadProgressTitle) {
+                            uploadProgressTitle.textContent = `Uploading file ${i + 1} of ${selectedFiles.length}...`;
+                        }
+                        const fileFormData = new FormData();
+                        fileFormData.append('files', encBlob, `file_${i}.enc`);
+                        if (hasThumb && encThumbBlob) {
+                            fileFormData.append('files', encThumbBlob, `file_${i}.thumb.enc`);
+                        }
+
+                        let upStartTime = Date.now();
+                        await uploadFormData(`/api/upload/${uuid}`, fileFormData, token, (loaded, total) => {
+                            const fileRatio = loaded / total;
+                            const overallRatio = (i + fileRatio) / selectedFiles.length;
+                            const overallPct = Math.round(overallRatio * 100);
+                            uploadProgressBar.style.width = `${50 + Math.round(overallRatio * 50)}%`;
+                            progressPercentage.textContent = `${overallPct}% (Uploaded)`;
+
+                            const elapsed = (Date.now() - upStartTime) / 1000;
+                            if (elapsed > 0) {
+                                const speed = loaded / elapsed;
+                                progressSpeed.textContent = `${formatBytes(speed)}/s`;
+                                const remBytes = total - loaded;
+                                const remSecs = remBytes / speed;
+                                const secs = Math.floor(remSecs % 60);
+                                progressEta.textContent = `Uploading ${item.file.name} • ETA ${secs}s`;
+                            }
+                        });
                     }
 
-                    return { index: i, item, encBlob, encThumbBlob, hasThumb };
-                });
+                    // Encrypt and upload metadata manifest
+                    if (uploadProgressTitle) uploadProgressTitle.textContent = 'Finalizing metadata...';
+                    const metaBuf = new TextEncoder().encode(JSON.stringify(meta));
+                    const encryptedMetaBuf = await encryptData(metaBuf.buffer, key);
+                    const metaBlob = new Blob([encryptedMetaBuf], { type: 'application/octet-stream' });
 
-                const processedFiles = await Promise.all(filePromises);
-                for (const pf of processedFiles) {
-                    formData.append('files', pf.encBlob, `file_${pf.index}.enc`);
-                    if (pf.hasThumb && pf.encThumbBlob) {
-                        formData.append('files', pf.encThumbBlob, `file_${pf.index}.thumb.enc`);
-                    }
-                    meta.files.push({
-                        id: pf.index.toString(),
-                        name: pf.item.relativePath,
-                        size: pf.item.file.size,
-                        type: pf.item.file.type || 'application/octet-stream',
-                        chunked: true,
-                        thumb: pf.hasThumb
+                    const metaFormData = new FormData();
+                    metaFormData.append('files', metaBlob, 'metadata.enc');
+                    await uploadFormData(`/api/upload/${uuid}`, metaFormData, token);
+
+                    // Call finish endpoint
+                    const finishHeaders = { 'Content-Type': 'application/json' };
+                    if (token) finishHeaders['Authorization'] = `Bearer ${token}`;
+                    const finishRes = await fetch(`/api/upload/${uuid}/finish`, {
+                        method: 'POST',
+                        headers: finishHeaders,
+                        body: JSON.stringify({
+                            files_count: selectedFiles.length,
+                            total_size: totalUnencryptedSize
+                        })
                     });
-                }
+                    if (!finishRes.ok) throw new Error(await finishRes.text());
+                    const response = await finishRes.json();
 
-                // 3. Encrypt metadata manifest
-                const metaBuf = new TextEncoder().encode(JSON.stringify(meta));
-                const encryptedMetaBuf = await encryptData(metaBuf.buffer, key);
-                const metaBlob = new Blob([encryptedMetaBuf], { type: 'application/octet-stream' });
-                formData.append('files', metaBlob, 'metadata.enc');
+                    showToast('Encrypted upload complete!', 'success');
 
-                // 4. Send encrypted payloads to server
-                const xhr = new XMLHttpRequest();
-                xhr.open('POST', '/api/upload', true);
+                    const newShare = {
+                        uuid: response.uuid,
+                        key: keyHex,
+                        files_count: selectedFiles.length,
+                        total_size: totalUnencryptedSize
+                    };
 
-                const token = localStorage.getItem('dill_session_token');
-                if (token) {
-                    xhr.setRequestHeader('Authorization', `Bearer ${token}`);
-                }
+                    const isLoggedIn = !!localStorage.getItem('dill_session_token');
+                    if (isLoggedIn) {
+                        progressEta.textContent = 'Syncing share to account...';
+                        try {
+                            const accountShares = await fetchAccountShares();
+                            accountShares.push(newShare);
+                            await saveAccountShares(accountShares);
+                        } catch (e) {
+                            showToast('Failed to sync share to account', 'error');
+                        }
+                    } else {
+                        const myShares = JSON.parse(localStorage.getItem('my_shares') || '[]');
+                        myShares.push(newShare);
+                        localStorage.setItem('my_shares', JSON.stringify(myShares));
+                    }
 
-                let startTime = Date.now();
+                    uploadProgressCard.style.display = 'none';
+                    dropZone.style.pointerEvents = 'auto';
+                    dropZone.style.opacity = '1';
+                    selectedFiles = [];
+                    displayShareResult(response.uuid, keyHex);
 
-                xhr.upload.onprogress = (e) => {
-                    if (e.lengthComputable) {
-                        const percent = Math.round((e.loaded / e.total) * 100);
-                        uploadProgressBar.style.width = `${percent}%`;
-                        progressPercentage.textContent = `${percent}%`;
+                } else {
+                    // Fallback to legacy single POST upload
+                    const formData = new FormData();
+                    for (let i = 0; i < selectedFiles.length; i++) {
+                        const item = selectedFiles[i];
+                        const encBlob = await encryptFileChunked(item.file, key, (chunkSize) => {
+                            bytesEncryptedTotal += chunkSize;
+                            const pct = Math.round((bytesEncryptedTotal / totalUnencryptedSize) * 100);
+                            uploadProgressBar.style.width = `${Math.round(pct / 2)}%`;
+                            progressPercentage.textContent = `${pct}% (Encrypted)`;
+                        });
+
+                        let hasThumb = false;
+                        let encThumbBlob = null;
+                        try {
+                            const thumbBuf = await generateThumbnail(item.file);
+                            if (thumbBuf && thumbBuf.byteLength > 0) {
+                                const encThumbBuf = await encryptData(thumbBuf, key);
+                                encThumbBlob = new Blob([encThumbBuf], { type: 'application/octet-stream' });
+                                hasThumb = true;
+                            }
+                        } catch (e) {}
+
+                        formData.append('files', encBlob, `file_${i}.enc`);
+                        if (hasThumb && encThumbBlob) {
+                            formData.append('files', encThumbBlob, `file_${i}.thumb.enc`);
+                        }
+                        meta.files.push({
+                            id: i.toString(),
+                            name: item.relativePath,
+                            size: item.file.size,
+                            type: item.file.type || 'application/octet-stream',
+                            chunked: true,
+                            thumb: hasThumb
+                        });
+                    }
+
+                    const metaBuf = new TextEncoder().encode(JSON.stringify(meta));
+                    const encryptedMetaBuf = await encryptData(metaBuf.buffer, key);
+                    const metaBlob = new Blob([encryptedMetaBuf], { type: 'application/octet-stream' });
+                    formData.append('files', metaBlob, 'metadata.enc');
+
+                    let startTime = Date.now();
+                    const response = await uploadFormData('/api/upload', formData, token, (loaded, total) => {
+                        const percent = Math.round((loaded / total) * 100);
+                        uploadProgressBar.style.width = `${50 + Math.round(percent / 2)}%`;
+                        progressPercentage.textContent = `${percent}% (Uploaded)`;
 
                         const elapsedTime = (Date.now() - startTime) / 1000;
                         if (elapsedTime > 0) {
-                            const speedBytes = e.loaded / elapsedTime;
+                            const speedBytes = loaded / elapsedTime;
                             progressSpeed.textContent = `${formatBytes(speedBytes)}/s`;
-
-                            const remainingBytes = e.total - e.loaded;
+                            const remainingBytes = total - loaded;
                             const remainingTime = remainingBytes / speedBytes;
                             if (remainingTime > 0) {
                                 const mins = Math.floor(remainingTime / 60);
@@ -2444,71 +2645,41 @@
                                 progressEta.textContent = 'Finalizing upload...';
                             }
                         }
-                    }
-                };
+                    });
 
-                xhr.onload = () => {
-                    uploadProgressCard.style.display = 'none';
-                    dropZone.style.pointerEvents = 'auto';
-                    dropZone.style.opacity = '1';
-                    
-                    if (xhr.status === 200) {
-                        const response = JSON.parse(xhr.responseText);
-                        showToast('Encrypted upload complete!', 'success');
-                        
-                        // Save share for this user
-                        const newShare = {
-                            uuid: response.uuid,
-                            key: keyHex,
-                            files_count: selectedFiles.length,
-                            total_size: selectedFiles.reduce((acc, f) => acc + f.file.size, 0)
-                        };
+                    showToast('Encrypted upload complete!', 'success');
+                    const newShare = {
+                        uuid: response.uuid,
+                        key: keyHex,
+                        files_count: selectedFiles.length,
+                        total_size: totalUnencryptedSize
+                    };
 
-                        const isLoggedIn = !!localStorage.getItem('dill_session_token');
-                        if (isLoggedIn) {
-                            // Save to account in S3
-                            progressEta.textContent = 'Syncing share to account...';
-                            fetchAccountShares().then(async (accountShares) => {
-                                accountShares.push(newShare);
-                                await saveAccountShares(accountShares);
-                            }).catch(() => {
-                                showToast('Failed to sync share to account', 'error');
-                            });
-                        } else {
-                            // Save to guest localStorage
-                            const myShares = JSON.parse(localStorage.getItem('my_shares') || '[]');
-                            myShares.push(newShare);
-                            localStorage.setItem('my_shares', JSON.stringify(myShares));
-                        }
-                        
-                        selectedFiles = []; // Reset selected files
-                        displayShareResult(response.uuid, keyHex);
+                    const isLoggedIn = !!localStorage.getItem('dill_session_token');
+                    if (isLoggedIn) {
+                        try {
+                            const accountShares = await fetchAccountShares();
+                            accountShares.push(newShare);
+                            await saveAccountShares(accountShares);
+                        } catch (e) {}
                     } else {
-                        if (xhr.status === 401) {
-                            showToast('Your session has expired. Please sign in again.', 'info');
-                            logoutUser();
-                            return;
-                        }
-                        showToast('Upload failed: ' + xhr.responseText, 'error');
-                        updateSelectedFilesUI();
+                        const myShares = JSON.parse(localStorage.getItem('my_shares') || '[]');
+                        myShares.push(newShare);
+                        localStorage.setItem('my_shares', JSON.stringify(myShares));
                     }
-                };
 
-                xhr.onerror = () => {
                     uploadProgressCard.style.display = 'none';
                     dropZone.style.pointerEvents = 'auto';
                     dropZone.style.opacity = '1';
-                    showToast('Network error during upload.', 'error');
-                    updateSelectedFilesUI();
-                };
-
-                xhr.send(formData);
+                    selectedFiles = [];
+                    displayShareResult(response.uuid, keyHex);
+                }
 
             } catch (err) {
                 uploadProgressCard.style.display = 'none';
                 dropZone.style.pointerEvents = 'auto';
                 dropZone.style.opacity = '1';
-                showToast('Encryption failed: ' + err.message, 'error');
+                showToast('Upload failed: ' + err.message, 'error');
                 updateSelectedFilesUI();
             }
         });
