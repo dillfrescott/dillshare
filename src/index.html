@@ -1807,13 +1807,18 @@
         async function encryptDataChunked(arrayBuffer, key) {
             const data = new Uint8Array(arrayBuffer);
             const total = data.length;
-            const chunkPromises = [];
-            let offset = 0;
-            while (offset < total) {
-                const plain = data.subarray(offset, offset + ENCRYPT_CHUNK_SIZE);
-                offset += ENCRYPT_CHUNK_SIZE;
-                const iv = window.crypto.getRandomValues(new Uint8Array(12));
-                chunkPromises.push((async () => {
+            const chunkSize = ENCRYPT_CHUNK_SIZE;
+            const totalChunks = Math.max(1, Math.ceil(total / chunkSize));
+            const parts = new Array(totalChunks);
+            const CONCURRENCY = 4;
+            let currentChunkIdx = 0;
+
+            async function worker() {
+                while (currentChunkIdx < totalChunks) {
+                    const idx = currentChunkIdx++;
+                    const offset = idx * chunkSize;
+                    const plain = data.subarray(offset, Math.min(offset + chunkSize, total));
+                    const iv = window.crypto.getRandomValues(new Uint8Array(12));
                     const ct = await window.crypto.subtle.encrypt(
                         { name: "AES-GCM", iv: iv },
                         key,
@@ -1822,10 +1827,15 @@
                     const block = new Uint8Array(12 + ct.byteLength);
                     block.set(iv, 0);
                     block.set(new Uint8Array(ct), 12);
-                    return block;
-                })());
+                    parts[idx] = block;
+                }
             }
-            const parts = await Promise.all(chunkPromises);
+
+            const workerCount = Math.min(CONCURRENCY, totalChunks);
+            const workers = [];
+            for (let i = 0; i < workerCount; i++) workers.push(worker());
+            await Promise.all(workers);
+
             const totalLen = parts.reduce((a, c) => a + c.length, 0);
             const out = new Uint8Array(totalLen);
             let o = 0;
@@ -1836,29 +1846,40 @@
         async function encryptFileChunked(file, key, onProgress) {
             const chunkSize = ENCRYPT_CHUNK_SIZE;
             const total = file.size;
-            let offset = 0;
-            const parts = [];
-            
-            while (offset < total) {
-                const slice = file.slice(offset, offset + chunkSize);
-                const plainBuf = await slice.arrayBuffer();
-                offset += slice.size;
-                
-                const iv = window.crypto.getRandomValues(new Uint8Array(12));
-                const ct = await window.crypto.subtle.encrypt(
-                    { name: "AES-GCM", iv: iv },
-                    key,
-                    plainBuf
-                );
-                const block = new Uint8Array(12 + ct.byteLength);
-                block.set(iv, 0);
-                block.set(new Uint8Array(ct), 12);
-                parts.push(block);
-                
-                if (onProgress) {
-                    onProgress(slice.size);
+            const totalChunks = Math.max(1, Math.ceil(total / chunkSize));
+            const parts = new Array(totalChunks);
+            const CONCURRENCY = 4;
+            let currentChunkIdx = 0;
+
+            async function worker() {
+                while (currentChunkIdx < totalChunks) {
+                    const idx = currentChunkIdx++;
+                    const start = idx * chunkSize;
+                    const end = Math.min(start + chunkSize, total);
+                    const slice = file.slice(start, end);
+                    const plainBuf = await slice.arrayBuffer();
+                    
+                    const iv = window.crypto.getRandomValues(new Uint8Array(12));
+                    const ct = await window.crypto.subtle.encrypt(
+                        { name: "AES-GCM", iv: iv },
+                        key,
+                        plainBuf
+                    );
+                    const block = new Uint8Array(12 + ct.byteLength);
+                    block.set(iv, 0);
+                    block.set(new Uint8Array(ct), 12);
+                    parts[idx] = block;
+                    
+                    if (onProgress) {
+                        onProgress(end - start);
+                    }
                 }
             }
+
+            const workerCount = Math.min(CONCURRENCY, totalChunks);
+            const workers = [];
+            for (let i = 0; i < workerCount; i++) workers.push(worker());
+            await Promise.all(workers);
             
             return new Blob(parts, { type: 'application/octet-stream' });
         }
@@ -2017,14 +2038,24 @@
             return true;
         }
 
-        // Stream a decrypted file directly to disk via StreamSaver.js (shows a
-        // normal browser download bar) or falls back to an in-memory Blob +
-        // anchor download. Returns true if the download was delivered.
+        // Stream a decrypted file directly to disk via File System Access API /
+        // StreamSaver.js (shows browser download bar / save prompt) or falls back
+        // to an in-memory Blob + anchor download. Returns true if delivered.
         async function downloadDecryptedFile(url, key, fileMeta, suggestedName, onProgress) {
             let sink = null;
-            // StreamSaver.js streams to disk via a service worker and shows a
-            // normal browser download progress bar — no "save as" dialog.
-            if (typeof streamSaver !== 'undefined') {
+            if (window.showSaveFilePicker) {
+                try {
+                    const handle = await window.showSaveFilePicker({
+                        suggestedName: suggestedName
+                    });
+                    sink = await handle.createWritable();
+                } catch (e) {
+                    if (e.name === 'AbortError') return false; // User cancelled save picker
+                    console.warn('showSaveFilePicker failed, trying StreamSaver:', e);
+                    sink = null;
+                }
+            }
+            if (!sink && typeof streamSaver !== 'undefined') {
                 try {
                     const fileStream = streamSaver.createWriteStream(suggestedName, {
                         size: fileMeta && typeof fileMeta.size === 'number' ? fileMeta.size : undefined
@@ -3562,7 +3593,20 @@
                 // any "save as" dialog.
                 let sink = null;
 
-                if (typeof streamSaver !== 'undefined') {
+                if (window.showSaveFilePicker) {
+                    try {
+                        const handle = await window.showSaveFilePicker({
+                            suggestedName: zipFileName
+                        });
+                        sink = await handle.createWritable();
+                    } catch (e) {
+                        if (e.name === 'AbortError') return; // User cancelled
+                        console.warn('showSaveFilePicker failed for ZIP, trying StreamSaver:', e);
+                        sink = null;
+                    }
+                }
+
+                if (!sink && typeof streamSaver !== 'undefined') {
                     try {
                         const fileStream = streamSaver.createWriteStream(zipFileName);
                         sink = fileStream.getWriter();
