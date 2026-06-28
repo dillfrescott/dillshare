@@ -386,12 +386,4 @@ async function respondLegacyRange(meta, start, end, isRange, total) {
     }
     return new Response(slice, { status, headers });
 }
-
-function concat(arrays) {
-    let total = 0;
-    for (const a of arrays) total += a.length;
-    const out = new Uint8Array(total);
-    let o = 0;
-    for (const a of arrays) { out.set(a, o); o += a.length; }
-    return out;
 }

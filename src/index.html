@@ -2051,39 +2051,6 @@
         // (file.size in metadata) without any length prefixes.
         const ENCRYPT_CHUNK_SIZE = 4 * 1024 * 1024; // 4 MB plaintext per chunk
 
-        async function encryptDataChunked(arrayBuffer, key) {
-            const data = new Uint8Array(arrayBuffer);
-            const total = data.length;
-            const chunkSize = ENCRYPT_CHUNK_SIZE;
-            const totalChunks = Math.max(1, Math.ceil(total / chunkSize));
-            const parts = new Array(totalChunks);
-            const CONCURRENCY = Math.max(4, Math.min(16, (navigator.hardwareConcurrency || 4) * 2));
-            let currentChunkIdx = 0;
-
-            async function worker() {
-                while (currentChunkIdx < totalChunks) {
-                    const idx = currentChunkIdx++;
-                    const offset = idx * chunkSize;
-                    const plain = data.subarray(offset, Math.min(offset + chunkSize, total));
-                    const iv = window.crypto.getRandomValues(new Uint8Array(12));
-                    const ct = await window.crypto.subtle.encrypt(
-                        { name: "AES-GCM", iv: iv },
-                        key,
-                        plain
-                    );
-                    parts[idx] = new Blob([iv, ct]);
-                }
-            }
-
-            const workerCount = Math.min(CONCURRENCY, totalChunks);
-            const workers = [];
-            for (let i = 0; i < workerCount; i++) workers.push(worker());
-            await Promise.all(workers);
-
-            const blob = new Blob(parts, { type: 'application/octet-stream' });
-            return await blob.arrayBuffer();
-        }
-
         async function encryptFileChunked(file, key, onProgress) {
             const chunkSize = ENCRYPT_CHUNK_SIZE;
             const total = file.size;
