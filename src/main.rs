@@ -783,9 +783,9 @@ async fn download_file(
         }
     };
 
-    // Convert S3 ByteStream into an AsyncRead reader, and wrap in ReaderStream
+    // Convert S3 ByteStream into an AsyncRead reader, and wrap in ReaderStream with 128KB capacity for high throughput
     let reader = res.body.into_async_read();
-    let stream = tokio_util::io::ReaderStream::new(reader);
+    let stream = tokio_util::io::ReaderStream::with_capacity(reader, 128 * 1024);
     let body = Body::from_stream(stream);
 
     let status = if range_header.is_some() {

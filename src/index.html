@@ -1931,7 +1931,7 @@
             const total = file.size;
             const totalChunks = Math.max(1, Math.ceil(total / chunkSize));
             const parts = new Array(totalChunks);
-            const CONCURRENCY = 4;
+            const CONCURRENCY = Math.max(4, Math.min(16, (navigator.hardwareConcurrency || 4) * 2));
             let currentChunkIdx = 0;
 
             async function worker() {
@@ -1964,17 +1964,12 @@
             return new Blob(parts, { type: 'application/octet-stream' });
         }
 
-        // Streaming decryptor for chunked files: yields plaintext Uint8Array chunks
-        // as they are verified, so memory stays flat regardless of file size.
-        // onProgress, if provided, is called with { bytesReceived, bytesDecrypted,
-        // totalBytes } after each chunk is processed (totalBytes is the plaintext size).
+        // High-performance streaming decryptor with parallel chunk WebCrypto processing.
         async function* streamDecryptChunked(reader, key, totalPlaintextSize, onProgress) {
             const chunkSize = ENCRYPT_CHUNK_SIZE;
             const totalChunks = Math.max(1, Math.ceil(totalPlaintextSize / chunkSize));
-            let remaining = totalPlaintextSize;
             let bytesReceived = 0;
             let bytesDecrypted = 0;
-            // Pull a queue of bytes from the response stream.
             const queue = [];
             let queueLen = 0;
 
@@ -1988,14 +1983,9 @@
                 }
             }
 
-            for (let i = 0; i < totalChunks; i++) {
-                const thisPlain = Math.min(chunkSize, remaining);
-                const thisCtLen = thisPlain + 16; // GCM tag
-                const need = 12 + thisCtLen;
+            async function getNextBlock(need) {
                 await ensure(need);
                 if (queueLen < need) throw new Error('Truncated encrypted stream');
-
-                // Drain exactly `need` bytes into a fresh block buffer.
                 const block = new Uint8Array(need);
                 let o = 0, left = need;
                 while (left > 0) {
@@ -2012,16 +2002,49 @@
                     }
                 }
                 queueLen -= need;
+                return block;
+            }
 
-                const iv = block.subarray(0, 12);
-                const ct = block.subarray(12);
-                const pt = await window.crypto.subtle.decrypt(
-                    { name: "AES-GCM", iv: iv },
-                    key,
-                    ct
-                );
-                yield new Uint8Array(pt);
-                remaining -= thisPlain;
+            const decryptPromises = new Array(totalChunks);
+            const resolvers = new Array(totalChunks);
+            const rejecters = new Array(totalChunks);
+            for (let i = 0; i < totalChunks; i++) {
+                decryptPromises[i] = new Promise((res, rej) => {
+                    resolvers[i] = res;
+                    rejecters[i] = rej;
+                });
+            }
+
+            // Start background reader/decryptor producer loop
+            (async () => {
+                let rem = totalPlaintextSize;
+                try {
+                    for (let idx = 0; idx < totalChunks; idx++) {
+                        const thisPlain = Math.min(chunkSize, rem);
+                        const thisCtLen = thisPlain + 16;
+                        const need = 12 + thisCtLen;
+                        const block = await getNextBlock(need);
+                        rem -= thisPlain;
+
+                        const iv = block.subarray(0, 12);
+                        const ct = block.subarray(12);
+                        window.crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, ct)
+                            .then(pt => resolvers[idx](new Uint8Array(pt)))
+                            .catch(err => rejecters[idx](err));
+                    }
+                } catch (err) {
+                    for (let i = 0; i < totalChunks; i++) {
+                        if (rejecters[i]) rejecters[i](err);
+                    }
+                }
+            })();
+
+            let remYield = totalPlaintextSize;
+            for (let idx = 0; idx < totalChunks; idx++) {
+                const thisPlain = Math.min(chunkSize, remYield);
+                const pt = await decryptPromises[idx];
+                yield pt;
+                remYield -= thisPlain;
                 bytesDecrypted += thisPlain;
                 if (onProgress) onProgress({ bytesReceived, bytesDecrypted, totalBytes: totalPlaintextSize });
             }
@@ -2818,9 +2841,9 @@
 
                 if (isSessionUpload && uuid) {
                     // Batched concurrent uploading (high speed & bounded memory)
-                    const BATCH_MAX_FILES = 20;
-                    const BATCH_MAX_BYTES = 16 * 1024 * 1024; // 16MB per batch threshold
-                    const CONCURRENCY = 4;
+                    const BATCH_MAX_FILES = 25;
+                    const BATCH_MAX_BYTES = 24 * 1024 * 1024; // 24MB per batch threshold
+                    const CONCURRENCY = Math.max(6, Math.min(16, (navigator.hardwareConcurrency || 4) * 2));
 
                     const batches = [];
                     let currentBatch = [];
@@ -4029,47 +4052,55 @@
                     }
                 };
 
-                // Process each file: fetch → stream-decrypt → push chunks into
+                // Pipelined network fetching: prefetch upcoming files in parallel to eliminate network idle gaps.
+                const PREFETCH_DEPTH = 3;
+                const prefetchedStreams = new Map();
+
+                function triggerPrefetch(index) {
+                    if (index >= totalFiles || prefetchedStreams.has(index)) return;
+                    const f = currentShareData.files[index];
+                    const url = `/api/share/${currentShareUUID}/file/file_${f.id}.enc`;
+                    const ac = new AbortController();
+                    const promise = (async () => {
+                        const res = await fetch(url, { signal: ac.signal });
+                        if (!res.ok) throw new Error(`Failed to fetch file: ${f.name}`);
+                        return { res, ac };
+                    })();
+                    prefetchedStreams.set(index, promise);
+                }
+
+                for (let k = 0; k < Math.min(PREFETCH_DEPTH, totalFiles); k++) {
+                    triggerPrefetch(k);
+                }
+
+                // Process each file: prefetch → stream-decrypt → push chunks into
                 // fflate ZipPassThrough entry → ZIP output flows to disk sink.
-                //
-                // A per-file AbortController lets us kill the upstream fetch the
-                // moment the disk sink rejects (user pressed cancel in the
-                // browser download bar), so the on-screen counter stops climbing
-                // instead of racing ahead of reality.
                 for (let i = 0; i < totalFiles; i++) {
+                    for (let k = i + 1; k <= i + PREFETCH_DEPTH && k < totalFiles; k++) {
+                        triggerPrefetch(k);
+                    }
+
                     const file = currentShareData.files[i];
                     const filePlainSize = (typeof file.size === 'number') ? file.size : 0;
                     renderOverall(i, totalPlainSize > 0 ? Math.min(100, Math.round((processedPlainSize / totalPlainSize) * 100)) : 0);
 
-                    const fileUrl = `/api/share/${currentShareUUID}/file/file_${file.id}.enc`;
-
                     // Create a pass-through (STORE, no re-compression) ZIP entry.
-                    // Encrypted data is already incompressible, so STORE is both
-                    // faster and avoids extra memory overhead from deflate.
                     const entry = new fflate.ZipPassThrough(file.name);
                     zip.add(entry);
 
                     const isChunked = file && file.chunked === true;
-                    const ac = new AbortController();
                     let fileWritten = 0;
+
+                    const prefetchPromise = prefetchedStreams.get(i);
+                    prefetchedStreams.delete(i);
+                    const { res, ac } = await prefetchPromise;
 
                     try {
                         if (isChunked) {
-                            // Stream-decrypt chunked file: each decrypted plaintext
-                            // chunk is pushed straight into the ZIP entry.
-                            const res = await fetch(fileUrl, { signal: ac.signal });
-                            if (!res.ok) throw new Error(`Failed to fetch file: ${file.name}`);
                             const reader = res.body.getReader();
-                            // NOTE: do NOT pass onProgress to streamDecryptChunked
-                            // here — progress must reflect bytes that have actually
-                            // been handed to the ZIP/sink, not merely decrypted.
                             for await (const pt of streamDecryptChunked(reader, key, filePlainSize)) {
                                 entry.push(pt, false);
                                 fileWritten += pt.length;
-                                // Drain through the writeChain so a rejected sink
-                                // (cancel) surfaces immediately rather than after
-                                // the entire archive is queued. This is what keeps
-                                // the counter from overrunning on cancel.
                                 await writeChain;
                                 if (zipErr) throw zipErr;
                                 if (totalPlainSize > 0) {
@@ -4079,9 +4110,6 @@
                             }
                             reader.releaseLock?.();
                         } else {
-                            // Legacy single-block file: buffer ciphertext, decrypt, push.
-                            const res = await fetch(fileUrl, { signal: ac.signal });
-                            if (!res.ok) throw new Error(`Failed to fetch file: ${file.name}`);
                             const ab = await res.arrayBuffer();
                             const pt = new Uint8Array(await decryptData(ab, key));
                             entry.push(pt, false);
@@ -4094,6 +4122,9 @@
                             }
                         }
                     } catch (e) {
+                        for (const p of prefetchedStreams.values()) {
+                            p.then(s => s.ac.abort()).catch(() => {});
+                        }
                         ac.abort();
                         if (sink) { try { await sink.abort(); } catch (_) {} }
                         throw e;
