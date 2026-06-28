@@ -1387,12 +1387,12 @@
             </div>
             <div class="preview-footer">
                 <button class="btn btn-secondary" id="btn-preview-close-footer">Close</button>
-                <a href="#" class="btn" id="btn-preview-download" download>
+                <button class="btn" id="btn-preview-download">
                     <svg style="width: 1.1rem; height: 1.1rem; fill: currentColor;" viewBox="0 0 24 24">
                         <path d="M19.35 10.04C18.67 6.59 15.64 4 12 4 9.11 4 6.6 5.64 5.35 8.04 2.34 8.36 0 10.91 0 14c0 3.31 2.69 6 6 6h13c2.76 0 5-2.24 5-5 0-2.64-2.05-4.78-4.65-4.96zM17 13l-5 5-5-5h3V9h4v4h3z"/>
                     </svg>
                     Download
-                </a>
+                </button>
             </div>
         </div>
     </div>
@@ -3539,18 +3539,36 @@
             // Download Click Handler (streaming decrypted downloader)
             btnPreviewDownload.onclick = async (e) => {
                 e.preventDefault();
+                if (btnPreviewDownload.disabled) return;
+                
+                const origHtml = btnPreviewDownload.innerHTML;
+                btnPreviewDownload.disabled = true;
+                btnPreviewDownload.style.opacity = '0.6';
+                btnPreviewDownload.style.pointerEvents = 'none';
+                btnPreviewDownload.innerHTML = `
+                    <div class="loader" style="width:0.85rem; height:0.85rem; border-width:1px; margin-right:6px; display:inline-block; vertical-align:middle;"></div>
+                    <span id="btn-preview-download-text">Downloading...</span>
+                `;
+
                 try {
                     const ok = await downloadDecryptedFile(fileUrl, key, file, filename, ({ bytesDecrypted, totalBytes: tb }) => {
                         const denom = tb || totalBytes;
                         if (denom > 0) {
                             const pct = Math.min(100, Math.round((bytesDecrypted / denom) * 100));
+                            const btnText = document.getElementById('btn-preview-download-text');
+                            if (btnText) btnText.textContent = `Downloading (${pct}%)...`;
                             if (previewProgressBar) previewProgressBar.style.width = pct + '%';
                             if (previewProgressLabel) previewProgressLabel.textContent = pct + '%';
                         }
                     });
-                    if (ok) showToast('Download completed successfully.', 'success');
+                    if (ok) showToast('Download finished!', 'success');
                 } catch (err) {
                     showToast('Download failed: ' + err.message, 'error');
+                } finally {
+                    btnPreviewDownload.disabled = false;
+                    btnPreviewDownload.style.opacity = '1';
+                    btnPreviewDownload.style.pointerEvents = 'auto';
+                    btnPreviewDownload.innerHTML = origHtml;
                 }
             };
 
@@ -3770,6 +3788,7 @@
         // into the ZIP output → disk sink, keeping memory usage flat regardless
         // of total share size. Falls back to in-memory blob only as last resort.
         btnDownloadAll.addEventListener('click', async () => {
+            if (btnDownloadAll.disabled) return;
             if (!currentShareData || !currentShareData.files || currentShareData.files.length === 0) return;
 
             const keyHex = window.location.hash.substring(1);
@@ -3944,7 +3963,7 @@
                     setTimeout(() => URL.revokeObjectURL(localUrl), 15000);
                 }
 
-                showToast('ZIP archive downloaded successfully!', 'success');
+                showToast('Download finished!', 'success');
 
             } catch (err) {
                 showToast('Download all failed: ' + err.message, 'error');
