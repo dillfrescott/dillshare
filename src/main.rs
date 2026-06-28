@@ -936,7 +936,7 @@ async fn download_file(
         }
     };
 
-    let body = Body::from_stream(res.body.into_data_stream());
+    let body = Body::from_stream(tokio_util::io::ReaderStream::new(res.body.into_async_read()));
 
     let status = if range_header.is_some() {
         StatusCode::PARTIAL_CONTENT
