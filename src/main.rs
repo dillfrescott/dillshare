@@ -101,8 +101,10 @@ async fn main() {
         // API routes
         .route("/api/upload", post(upload_files))
         .route("/api/upload/init", post(upload_init))
-        .route("/api/upload/:uuid", post(upload_chunk_or_file))
+        .route("/api/upload/:uuid", post(upload_chunk_or_file).delete(upload_abort))
         .route("/api/upload/:uuid/finish", post(upload_finish))
+        .route("/api/upload/:uuid/abort", post(upload_abort))
+        .route("/api/upload/:uuid/ping", post(upload_ping))
         .route("/api/share/:uuid", get(get_share).delete(delete_share))
         .route("/api/share/:uuid/file/*filename", get(download_file))
         // Service worker for streaming decrypted media preview
@@ -384,9 +386,45 @@ async fn upload_init(
         .ok_or_else(|| (StatusCode::UNAUTHORIZED, "Invalid or expired session".to_string()))?;
 
     let uuid = uuid::Uuid::new_v4().to_string();
+    
+    // Write initial active heartbeat marker
+    let active_key = format!("uploads/{}/.active", uuid);
+    let _ = state.s3_client
+        .put_object()
+        .bucket(&state.bucket)
+        .key(&active_key)
+        .content_type("text/plain")
+        .body(aws_sdk_s3::primitives::ByteStream::from(b"active".to_vec()))
+        .send()
+        .await;
+
     Ok(axum::Json(serde_json::json!({
         "uuid": uuid
     })))
+}
+
+async fn upload_ping(
+    State(state): State<AppState>,
+    Path(uuid): Path<String>,
+    headers: axum::http::HeaderMap,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let token = extract_token(&headers)?;
+    let (_username, _) = verify_session(&token, &state)
+        .await
+        .ok_or_else(|| (StatusCode::UNAUTHORIZED, "Invalid or expired session".to_string()))?;
+
+    let active_key = format!("uploads/{}/.active", uuid);
+    state.s3_client
+        .put_object()
+        .bucket(&state.bucket)
+        .key(&active_key)
+        .content_type("text/plain")
+        .body(aws_sdk_s3::primitives::ByteStream::from(b"active".to_vec()))
+        .send()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to update heartbeat: {:?}", e)))?;
+
+    Ok(axum::Json(serde_json::json!({ "status": "ok" })))
 }
 
 async fn upload_chunk_or_file(
@@ -447,6 +485,17 @@ async fn upload_chunk_or_file(
         uploaded_files.push(file_path);
     }
 
+    // Refresh active heartbeat timestamp on chunk/file activity
+    let active_key = format!("uploads/{}/.active", uuid);
+    let _ = state.s3_client
+        .put_object()
+        .bucket(&state.bucket)
+        .key(&active_key)
+        .content_type("text/plain")
+        .body(aws_sdk_s3::primitives::ByteStream::from(b"active".to_vec()))
+        .send()
+        .await;
+
     Ok(axum::Json(serde_json::json!({
         "status": "ok",
         "uploaded": uploaded_files
@@ -498,10 +547,10 @@ async fn upload_finish(
             for obj in objects {
                 if let Some(k) = obj.key {
                     let rel_path = k.strip_prefix(&prefix).unwrap_or(&k).to_string();
-                    if rel_path != "owner.txt" {
+                    if rel_path != "owner.txt" && rel_path != ".active" {
                         uploaded_files.push(rel_path.clone());
                     }
-                    if rel_path != "owner.txt" && rel_path != "metadata.enc" && !rel_path.ends_with(".thumb.enc") {
+                    if rel_path != "owner.txt" && rel_path != ".active" && rel_path != "metadata.enc" && !rel_path.ends_with(".thumb.enc") {
                         s3_total_size += obj.size.unwrap_or(0);
                     }
                 }
@@ -557,6 +606,23 @@ async fn upload_finish(
     })))
 }
 
+async fn upload_abort(
+    State(state): State<AppState>,
+    Path(uuid): Path<String>,
+    headers: axum::http::HeaderMap,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let token = extract_token(&headers)?;
+    let (_username, _) = verify_session(&token, &state)
+        .await
+        .ok_or_else(|| (StatusCode::UNAUTHORIZED, "Invalid or expired session".to_string()))?;
+
+    let prefix = format!("uploads/{}/", uuid);
+    tracing::info!("Aborting upload session {}; cleaning up S3 prefix '{}'", uuid, prefix);
+    delete_s3_prefix(&state.s3_client, &state.bucket, &prefix).await?;
+
+    Ok(axum::Json(serde_json::json!({ "status": "aborted" })))
+}
+
 
 // Get details of a single share UUID
 async fn get_share(
@@ -601,6 +667,9 @@ async fn get_share(
         for object in page.contents() {
             if let (Some(key), Some(size), Some(last_modified)) = (object.key(), object.size(), object.last_modified()) {
                 let file_name = key.strip_prefix(&prefix).unwrap_or(key).to_string();
+                if file_name == "owner.txt" || file_name == ".active" {
+                    continue;
+                }
 
                 let last_mod_secs = last_modified.secs();
                 let upload_time = chrono::DateTime::<chrono::Utc>::from_timestamp(last_mod_secs, 0)
@@ -803,19 +872,26 @@ async fn delete_share(
     delete_share_objects(&state.s3_client, &state.bucket, &uuid).await?;
 
     // Remove from owner's public shares index in S3
+    remove_share_from_user_index(&state.s3_client, &state.bucket, &username, &uuid).await;
+
+    Ok(axum::Json(serde_json::json!({ "status": "deleted" })))
+}
+
+async fn remove_share_from_user_index(s3_client: &aws_sdk_s3::Client, bucket: &str, username: &str, uuid: &str) {
+    if username.is_empty() { return; }
     let public_shares_key = format!("users/{}/public_shares.json", username);
-    if let Ok(output) = state.s3_client.get_object()
-        .bucket(&state.bucket)
+    if let Ok(output) = s3_client.get_object()
+        .bucket(bucket)
         .key(&public_shares_key)
         .send()
         .await
     {
         if let Ok(bytes) = output.body.collect().await {
             if let Ok(mut shares) = serde_json::from_slice::<Vec<serde_json::Value>>(&bytes.into_bytes()) {
-                shares.retain(|s| s.get("uuid").and_then(|u| u.as_str()) != Some(&uuid));
+                shares.retain(|s| s.get("uuid").and_then(|u| u.as_str()) != Some(uuid));
                 if let Ok(shares_bytes) = serde_json::to_vec(&shares) {
-                    let _ = state.s3_client.put_object()
-                        .bucket(&state.bucket)
+                    let _ = s3_client.put_object()
+                        .bucket(bucket)
                         .key(&public_shares_key)
                         .content_type("application/json")
                         .body(aws_sdk_s3::primitives::ByteStream::from(shares_bytes))
@@ -825,25 +901,60 @@ async fn delete_share(
             }
         }
     }
-
-    Ok(axum::Json(serde_json::json!({ "status": "deleted" })))
 }
 
-// Background cleanup worker thread - deletes S3 objects older than 90 days
+// Background cleanup worker thread - deletes S3 objects older than 90 days or abandoned partial uploads older than 1 hour
 async fn run_cleanup_worker(s3_client: aws_sdk_s3::Client, bucket: String) {
     let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(3600)); // check every hour
     loop {
         interval.tick().await;
-        tracing::info!("Running S3 cleanup worker for files older than 90 days...");
+        tracing::info!("Running S3 cleanup worker for expired shares and abandoned partial uploads...");
         if let Err(e) = perform_cleanup(&s3_client, &bucket).await {
             tracing::error!("Error during cleanup execution: {:?}", e);
         }
     }
 }
 
+struct ShareGroup {
+    has_owner: bool,
+    latest_modified_secs: i64,
+    keys: Vec<String>,
+}
+
 async fn perform_cleanup(s3_client: &aws_sdk_s3::Client, bucket: &str) -> Result<(), Box<dyn std::error::Error>> {
     let now = chrono::Utc::now().timestamp();
-    let limit_secs = 90 * 24 * 60 * 60; // 90 days
+    
+    let share_expiry_days = std::env::var("SHARE_EXPIRY_DAYS")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(90); // Default to 90 days for completed shares
+    let share_expire_limit = share_expiry_days * 24 * 60 * 60;
+    
+    let partial_timeout_hours = std::env::var("PARTIAL_UPLOAD_TIMEOUT_HOURS")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(12); // Default to 12 hours for incomplete / cancelled / abandoned uploads
+    let partial_upload_limit = partial_timeout_hours * 60 * 60;
+
+    // 1. Abort old incomplete multipart uploads in S3
+    if let Ok(mp_out) = s3_client.list_multipart_uploads().bucket(bucket).prefix("uploads/").send().await {
+        if let Some(uploads) = mp_out.uploads {
+            for u in uploads {
+                if let (Some(key), Some(upload_id), Some(initiated)) = (u.key(), u.upload_id(), u.initiated()) {
+                    let init_secs = initiated.secs();
+                    if now - init_secs > partial_upload_limit {
+                        tracing::info!("Aborting abandoned S3 multipart upload '{}' (upload_id: {})...", key, upload_id);
+                        let _ = s3_client.abort_multipart_upload()
+                            .bucket(bucket)
+                            .key(key)
+                            .upload_id(upload_id)
+                            .send()
+                            .await;
+                    }
+                }
+            }
+        }
+    }
 
     let mut response = s3_client
         .list_objects_v2()
@@ -852,23 +963,68 @@ async fn perform_cleanup(s3_client: &aws_sdk_s3::Client, bucket: &str) -> Result
         .into_paginator()
         .send();
 
-    let mut keys_to_delete = Vec::new();
+    let mut groups: std::collections::HashMap<String, ShareGroup> = std::collections::HashMap::new();
 
     while let Some(result) = response.next().await {
         let page = result?;
         for object in page.contents() {
             if let (Some(key), Some(last_modified)) = (object.key(), object.last_modified()) {
-                let age = now - last_modified.secs();
-                if age > limit_secs {
-                    tracing::info!("Object '{}' is older than 90 days (age: {}s), marking for deletion.", key, age);
-                    keys_to_delete.push(key.to_string());
+                let mod_secs = last_modified.secs();
+                let rel = key.strip_prefix("uploads/").unwrap_or(key);
+                let parts: Vec<&str> = rel.splitn(2, '/').collect();
+                let uuid = if !parts.is_empty() { parts[0].to_string() } else { "root".to_string() };
+
+                let entry = groups.entry(uuid).or_insert_with(|| ShareGroup {
+                    has_owner: false,
+                    latest_modified_secs: 0,
+                    keys: Vec::new(),
+                });
+
+                if rel.ends_with("/owner.txt") || rel == "owner.txt" {
+                    entry.has_owner = true;
+                }
+                if mod_secs > entry.latest_modified_secs {
+                    entry.latest_modified_secs = mod_secs;
+                }
+                entry.keys.push(key.to_string());
+            }
+        }
+    }
+
+    let mut keys_to_delete = Vec::new();
+    let mut expired_share_uuids = Vec::new();
+
+    for (uuid, group) in groups {
+        let age = now - group.latest_modified_secs;
+        if group.has_owner {
+            if age > share_expire_limit {
+                tracing::info!("Completed share '{}' is older than {} days (age: {}s). Marking for deletion.", uuid, share_expiry_days, age);
+                keys_to_delete.extend(group.keys);
+                expired_share_uuids.push(uuid);
+            }
+        } else {
+            if age > partial_upload_limit {
+                tracing::info!("Partial/cancelled upload '{}' has no owner record and is inactive (age: {}s). Marking for cleanup.", uuid, age);
+                keys_to_delete.extend(group.keys);
+            }
+        }
+    }
+
+    // Prune expired shares from owner index files before deleting S3 objects
+    for uuid in &expired_share_uuids {
+        let owner_key = format!("uploads/{}/owner.txt", uuid);
+        if let Ok(res) = s3_client.get_object().bucket(bucket).key(&owner_key).send().await {
+            if let Ok(bytes) = res.body.collect().await {
+                let owner = String::from_utf8(bytes.to_vec()).unwrap_or_default().trim().to_string();
+                if !owner.is_empty() {
+                    remove_share_from_user_index(s3_client, bucket, &owner, uuid).await;
                 }
             }
         }
     }
 
     if !keys_to_delete.is_empty() {
-        tracing::info!("Deleting {} expired S3 objects...", keys_to_delete.len());
+        tracing::info!("Deleting {} expired/partial S3 objects...", keys_to_delete.len());
         for chunk in keys_to_delete.chunks(1000) {
             let mut delete_builder = aws_sdk_s3::types::Delete::builder();
             for key in chunk {
@@ -887,7 +1043,7 @@ async fn perform_cleanup(s3_client: &aws_sdk_s3::Client, bucket: &str) -> Result
         }
         tracing::info!("Cleanup sweep finished successfully.");
     } else {
-        tracing::info!("Cleanup sweep completed. No expired objects found.");
+        tracing::info!("Cleanup sweep completed. No expired or partial objects found.");
     }
 
     Ok(())
