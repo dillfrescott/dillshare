@@ -918,8 +918,10 @@ async fn download_file(
     let mut get_object = state.s3_client.get_object().bucket(&state.bucket).key(&key);
 
     if let Some((start, end)) = &range_header {
-        let range_end = end.unwrap_or(u64::MAX);
-        let range_value = format!("bytes={}-{}", start, range_end);
+        let range_value = match end {
+            Some(e) => format!("bytes={}-{}", start, e),
+            None => format!("bytes={}-", start),
+        };
         get_object = get_object.range(range_value);
     }
 
@@ -934,10 +936,7 @@ async fn download_file(
         }
     };
 
-    // Convert S3 ByteStream into an AsyncRead reader, and wrap in ReaderStream with 1MB capacity for ultra-high throughput streaming
-    let reader = res.body.into_async_read();
-    let stream = tokio_util::io::ReaderStream::with_capacity(reader, 1024 * 1024);
-    let body = Body::from_stream(stream);
+    let body = Body::from_stream(res.body.into_data_stream());
 
     let status = if range_header.is_some() {
         StatusCode::PARTIAL_CONTENT

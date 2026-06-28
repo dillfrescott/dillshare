@@ -2087,6 +2087,10 @@
                     // buffer push succeeds below.
                     for await (const pt of streamDecryptChunked(reader, key, totalSize)) {
                         if (sink) {
+                            if (sink.isCancelled) {
+                                ac.abort();
+                                throw new Error('Download stream cancelled by user');
+                            }
                             try { await sink.write(pt); }
                             catch (e) {
                                 // Writer rejected (user cancelled / disk error).
@@ -2167,10 +2171,13 @@
                             setTimeout(() => a.remove(), 1000);
 
                             let isClosed = false;
+                            let isCancelled = false;
                             const sink = {
+                                get isCancelled() { return isCancelled; },
                                 async write(chunk) {
-                                    if (isClosed) return;
-                                    const u8 = chunk instanceof Uint8Array ? chunk.slice() : new Uint8Array(chunk).slice();
+                                    if (isCancelled) throw new Error('Download stream cancelled by user');
+                                    if (isClosed) throw new Error('Download stream closed');
+                                    const u8 = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
                                     channel.port1.postMessage(u8, [u8.buffer]);
                                 },
                                 async close() {
@@ -2188,6 +2195,7 @@
                             channel.port1.onmessage = (e) => {
                                 if (e.data === 'cancel') {
                                     isClosed = true;
+                                    isCancelled = true;
                                 }
                             };
 
@@ -3901,7 +3909,11 @@
                     });
                     if (ok) showToast('Download finished!', 'success');
                 } catch (err) {
-                    showToast('Download failed: ' + err.message, 'error');
+                    if (err && err.message && err.message.includes('cancelled')) {
+                        showToast('Download cancelled', 'info');
+                    } else {
+                        showToast('Download failed: ' + (err ? err.message : 'Unknown error'), 'error');
+                    }
                 } finally {
                     btnPreviewDownload.disabled = false;
                     btnPreviewDownload.style.opacity = '1';
