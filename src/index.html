@@ -736,6 +736,7 @@
         }
 
         #confirm-modal .preview-content,
+        #prompt-modal .preview-content,
         #auth-modal .preview-content {
             min-height: auto;
             flex: initial;
@@ -1381,7 +1382,6 @@
                                         <th>Device / User Agent</th>
                                         <th>IP Address</th>
                                         <th>Created</th>
-                                        <th>Expires</th>
                                         <th>Action</th>
                                     </tr>
                                 </thead>
@@ -1467,7 +1467,6 @@
                                 <th style="padding: 0.85rem; font-size: 0.8rem; text-transform: uppercase; color: var(--text-muted);">Device / Browser</th>
                                 <th style="padding: 0.85rem; font-size: 0.8rem; text-transform: uppercase; color: var(--text-muted);">IP Address</th>
                                 <th style="padding: 0.85rem; font-size: 0.8rem; text-transform: uppercase; color: var(--text-muted);">Created At</th>
-                                <th style="padding: 0.85rem; font-size: 0.8rem; text-transform: uppercase; color: var(--text-muted);">Expires</th>
                                 <th style="padding: 0.85rem; font-size: 0.8rem; text-transform: uppercase; color: var(--text-muted); text-align: right;">Action</th>
                             </tr>
                         </thead>
@@ -1614,6 +1613,35 @@
                 <div style="display: flex; justify-content: flex-end; gap: 0.75rem; margin-top: 0.25rem;">
                     <button class="btn btn-secondary" id="btn-confirm-cancel" style="padding: 0.55rem 1.1rem; font-weight: 500;">Cancel</button>
                     <button class="btn btn-danger" id="btn-confirm-ok" style="padding: 0.55rem 1.1rem; font-weight: 600;">Confirm</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- PROMPT MODAL -->
+    <div class="preview-modal" id="prompt-modal">
+        <div class="preview-container" style="max-width: 440px; border-radius: 8px; box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.5), 0 10px 10px -5px rgba(0, 0, 0, 0.04);">
+            <div class="preview-modal-header" style="background: rgba(255, 255, 255, 0.02);">
+                <div style="display: flex; align-items: center; gap: 0.6rem;">
+                    <div id="prompt-modal-icon" style="display: flex; align-items: center; justify-content: center; width: 1.8rem; height: 1.8rem; border-radius: 50%; background: rgba(76, 175, 80, 0.15); color: var(--primary);">
+                        <svg style="width: 1.1rem; height: 1.1rem; fill: currentColor;" viewBox="0 0 24 24">
+                            <path d="M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM20.71 7.04c.39-.39.39-1.02 0-1.41l-2.34-2.34c-.39-.39-1.02-.39-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z"/>
+                        </svg>
+                    </div>
+                    <span class="preview-title" id="prompt-modal-title" style="font-weight: 600;">Rename Session</span>
+                </div>
+                <button class="close-btn" id="btn-prompt-cancel-x">
+                    <svg style="width: 1.25rem; height: 1.25rem; fill: currentColor;" viewBox="0 0 24 24">
+                        <path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/>
+                    </svg>
+                </button>
+            </div>
+            <div class="preview-content" style="padding: 1.5rem; flex-direction: column; align-items: stretch; justify-content: flex-start; background: var(--surface-color); gap: 1.25rem; min-height: auto; flex: initial;">
+                <p id="prompt-modal-message" style="font-size: 0.9rem; color: var(--text-main); line-height: 1.5; white-space: pre-wrap; margin: 0;"></p>
+                <input type="text" id="prompt-modal-input" maxlength="32" style="background: rgba(0,0,0,0.2); border: 1px solid var(--surface-border); border-radius: 4px; padding: 0.6rem 0.75rem; color: var(--text-main); font-family: inherit; font-size: 0.9rem; outline: none; width: 100%;" />
+                <div style="display: flex; justify-content: flex-end; gap: 0.75rem; margin-top: 0.25rem;">
+                    <button class="btn btn-secondary" id="btn-prompt-cancel" style="padding: 0.55rem 1.1rem; font-weight: 500;">Cancel</button>
+                    <button class="btn" id="btn-prompt-ok" style="padding: 0.55rem 1.1rem; font-weight: 600;">Save</button>
                 </div>
             </div>
         </div>
@@ -2793,13 +2821,12 @@
                 }
 
                 const cleanup = () => {
-                    closeAppModal(modal, () => {
-                        okBtn.removeEventListener('click', onOk);
-                        cancelBtn.removeEventListener('click', onCancel);
-                        closeX.removeEventListener('click', onCancel);
-                        modal.removeEventListener('click', onBackdrop);
-                        document.removeEventListener('keydown', onKeyDown);
-                    });
+                    okBtn.removeEventListener('click', onOk);
+                    cancelBtn.removeEventListener('click', onCancel);
+                    closeX.removeEventListener('click', onCancel);
+                    modal.removeEventListener('click', onBackdrop);
+                    document.removeEventListener('keydown', onKeyDown);
+                    closeAppModal(modal);
                 };
 
                 const onOk = () => {
@@ -2837,6 +2864,77 @@
             });
         }
 
+        // Native Custom Prompt Modal helper
+        function customPrompt(message, title = 'Rename Session', defaultValue = '') {
+            return new Promise((resolve) => {
+                const modal = document.getElementById('prompt-modal');
+                const titleEl = document.getElementById('prompt-modal-title');
+                const messageEl = document.getElementById('prompt-modal-message');
+                const inputEl = document.getElementById('prompt-modal-input');
+                const okBtn = document.getElementById('btn-prompt-ok');
+                const cancelBtn = document.getElementById('btn-prompt-cancel');
+                const closeX = document.getElementById('btn-prompt-cancel-x');
+
+                titleEl.textContent = title;
+                messageEl.textContent = message;
+                inputEl.maxLength = 32;
+                inputEl.value = defaultValue.slice(0, 32);
+
+                openAppModal(modal);
+                setTimeout(() => {
+                    inputEl.focus();
+                    inputEl.select();
+                }, 100);
+
+                const cleanup = () => {
+                    okBtn.removeEventListener('click', onOk);
+                    cancelBtn.removeEventListener('click', onCancel);
+                    closeX.removeEventListener('click', onCancel);
+                    modal.removeEventListener('click', onBackdrop);
+                    inputEl.removeEventListener('keydown', onInputKeyDown);
+                    document.removeEventListener('keydown', onKeyDown);
+                    closeAppModal(modal);
+                };
+
+                const onOk = () => {
+                    const val = inputEl.value.slice(0, 32);
+                    cleanup();
+                    resolve(val);
+                };
+
+                const onCancel = () => {
+                    cleanup();
+                    resolve(null);
+                };
+
+                const onBackdrop = (e) => {
+                    if (e.target === modal) {
+                        onCancel();
+                    }
+                };
+
+                const onInputKeyDown = (e) => {
+                    if (e.key === 'Enter') {
+                        e.preventDefault();
+                        onOk();
+                    }
+                };
+
+                const onKeyDown = (e) => {
+                    if (e.key === 'Escape') {
+                        onCancel();
+                    }
+                };
+
+                okBtn.addEventListener('click', onOk);
+                cancelBtn.addEventListener('click', onCancel);
+                closeX.addEventListener('click', onCancel);
+                modal.addEventListener('click', onBackdrop);
+                inputEl.addEventListener('keydown', onInputKeyDown);
+                document.addEventListener('keydown', onKeyDown);
+            });
+        }
+
         // File size formatter
         function formatBytes(bytes, decimals = 2) {
             if (bytes === 0) return '0 B';
@@ -2847,12 +2945,17 @@
             return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ' ' + sizes[i];
         }
 
+        // HTML escaping utility
+        function escapeHtml(str) {
+            if (str === null || str === undefined) return '';
+            return String(str).replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
+        }
+
         // Vendored Marked.js Markdown renderer
         let markedConfigured = false;
         function configureMarked() {
             if (markedConfigured || typeof marked === 'undefined') return;
             markedConfigured = true;
-            const escapeHtml = str => str.replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
             marked.use({
                 renderer: {
                     paragraph(token) {
@@ -5742,7 +5845,6 @@
                                                 <th style="padding:0.5rem; font-size:0.75rem; width:45%;">Device / Browser</th>
                                                 <th style="padding:0.5rem; font-size:0.75rem;">IP Address</th>
                                                 <th style="padding:0.5rem; font-size:0.75rem;">Created At</th>
-                                                <th style="padding:0.5rem; font-size:0.75rem;">Expires</th>
                                                 <th style="padding:0.5rem; font-size:0.75rem; text-align:right;">Actions</th>
                                             </tr>
                                         </thead>
@@ -5751,15 +5853,14 @@
                                                 <tr>
                                                     <td style="padding:0.5rem; font-size:0.75rem;">
                                                         <div style="display:flex; flex-direction:column;">
-                                                            <span style="font-weight:600;">${parseUserAgent(s.user_agent)}</span>
+                                                            ${s.name ? `<span style="font-weight:600; color:var(--primary);">${escapeHtml(s.name)}</span><span style="font-size:0.7rem; font-weight:500;">${parseUserAgent(s.user_agent)}</span>` : `<span style="font-weight:600;">${parseUserAgent(s.user_agent)}</span>`}
                                                             <span style="font-size:0.65rem; color:var(--text-muted); font-family:monospace; margin-top:0.1rem; word-break:break-all;">${s.user_agent}</span>
                                                         </div>
                                                     </td>
                                                     <td style="padding:0.5rem; font-size:0.75rem; font-family:monospace;">${s.ip}</td>
                                                     <td style="padding:0.5rem; font-size:0.75rem;">${new Date(s.created_at * 1000).toLocaleString()}</td>
-                                                    <td style="padding:0.5rem; font-size:0.75rem;">${new Date(s.expires_at * 1000).toLocaleString()}</td>
                                                     <td style="padding:0.5rem; font-size:0.75rem; text-align:right;">
-                                                        <button class="action-btn delete admin-revoke-session-btn" data-username="${username}" data-session-id="${s.id}" style="padding: 0.2rem 0.4rem; font-size:0.7rem; font-weight:600; display:inline-flex;">
+                                                        <button class="action-btn delete admin-revoke-user-session-btn" data-username="${username}" data-session-id="${s.id}" style="padding: 0.2rem 0.4rem; font-size:0.7rem; font-weight:600; display:inline-flex;">
                                                             Revoke
                                                         </button>
                                                     </td>
@@ -5770,7 +5871,7 @@
                                 `;
 
                                  // Attach event listeners to admin revoke session buttons
-                                container.querySelectorAll('.admin-revoke-session-btn').forEach(revokeBtn => {
+                                container.querySelectorAll('.admin-revoke-user-session-btn').forEach(revokeBtn => {
                                     revokeBtn.addEventListener('click', async (evt) => {
                                         const targetBtn = evt.currentTarget;
                                         const uName = targetBtn.getAttribute('data-username');
@@ -5941,7 +6042,6 @@
                     const ipStr = session.ip;
                     
                     const createdDate = new Date(session.created_at * 1000).toLocaleString();
-                    const expiresDate = new Date(session.expires_at * 1000).toLocaleString();
                     
                     const currentBadge = session.is_current 
                         ? `<span class="badge success" style="margin-left:0.5rem; font-size:0.7rem; font-family:sans-serif; text-transform:uppercase;">Current</span>` 
@@ -5949,12 +6049,15 @@
                     
                     const buttonClass = session.is_current ? 'btn btn-secondary' : 'btn btn-danger';
                     
+                    const titleHtml = session.name 
+                        ? `<span style="font-weight:600; display:flex; align-items:center; color:var(--primary);">${escapeHtml(session.name)} ${currentBadge}</span>
+                           <span style="font-size:0.75rem; color:var(--text-main); margin-top:0.1rem;">${deviceName}</span>`
+                        : `<span style="font-weight:500; display:flex; align-items:center;">${deviceName} ${currentBadge}</span>`;
+
                     row.innerHTML = `
                         <td style="padding: 1rem 0.85rem; border-bottom: 1px solid var(--surface-border);">
                             <div style="display:flex; flex-direction:column;">
-                                <span style="font-weight:500; display:flex; align-items:center;">
-                                    ${deviceName} ${currentBadge}
-                                </span>
+                                ${titleHtml}
                                 <span style="font-size:0.75rem; color:var(--text-muted); font-family:monospace; margin-top:0.2rem; word-break:break-all;">
                                     ${session.user_agent}
                                 </span>
@@ -5962,52 +6065,86 @@
                         </td>
                         <td style="padding: 1rem 0.85rem; font-family:monospace; border-bottom: 1px solid var(--surface-border);">${ipStr}</td>
                         <td style="padding: 1rem 0.85rem; border-bottom: 1px solid var(--surface-border); font-size:0.8rem;">${createdDate}</td>
-                        <td style="padding: 1rem 0.85rem; border-bottom: 1px solid var(--surface-border); font-size:0.8rem;">${expiresDate}</td>
                         <td style="padding: 1rem 0.85rem; text-align:right; border-bottom: 1px solid var(--surface-border);">
-                            <button class="${buttonClass} btn-revoke-admin-session" data-id="${session.id}" data-current="${session.is_current}" style="padding: 0.3rem 0.6rem; font-size: 0.75rem; font-weight: 600; white-space: nowrap;">
-                                Revoke
-                            </button>
+                            <div style="display:flex; gap:0.5rem; justify-content:flex-end;">
+                                <button class="btn btn-secondary btn-rename-admin-session" data-id="${session.id}" data-name="${escapeHtml(session.name || '')}" style="padding: 0.3rem 0.6rem; font-size: 0.75rem; font-weight: 600; white-space: nowrap;">
+                                    Rename
+                                </button>
+                                <button class="${buttonClass} btn-revoke-admin-session" data-id="${session.id}" data-current="${session.is_current}" style="padding: 0.3rem 0.6rem; font-size: 0.75rem; font-weight: 600; white-space: nowrap;">
+                                    Revoke
+                                </button>
+                            </div>
                         </td>
                     `;
                     adminSessionsBody.appendChild(row);
-                });
 
-                // Attach event listeners to revoke buttons
-                document.querySelectorAll('.btn-revoke-admin-session').forEach(btn => {
-                    btn.addEventListener('click', async (e) => {
-                        const id = e.currentTarget.getAttribute('data-id');
-                        const isCurrent = e.currentTarget.getAttribute('data-current') === 'true';
-                        
-                        const confirmMsg = isCurrent 
-                            ? 'Are you sure you want to log out of your current admin session?'
-                            : 'Are you sure you want to revoke this admin session? That browser will be logged out immediately.';
-                            
-                        if (await customConfirm(confirmMsg, isCurrent ? 'Log Out' : 'Revoke Admin Session', isCurrent ? 'Log Out' : 'Revoke', true)) {
-                            try {
-                                const revRes = await fetch(`/api/admin/sessions/${id}`, {
-                                    method: 'DELETE',
-                                    headers: { 'Authorization': `Bearer ${token}` }
-                                });
-                                
-                                if (revRes.ok) {
-                                    showToast(isCurrent ? 'Logged out successfully' : 'Admin session revoked successfully', 'success');
-                                    if (isCurrent) {
-                                        localStorage.removeItem('dill_admin_token');
-                                        const adminTokenInput = document.getElementById('admin-token-input');
-                                        if (adminTokenInput) adminTokenInput.value = '';
-                                        window.history.replaceState({}, '', '/admin');
-                                        loadAdminStats();
-                                    } else {
+                    const renameBtn = row.querySelector('.btn-rename-admin-session');
+                    if (renameBtn) {
+                        renameBtn.addEventListener('click', async (e) => {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            const currentName = session.name || '';
+                            const newName = await customPrompt('Enter a custom name for this admin session:', 'Rename Admin Session', currentName);
+                            if (newName !== null) {
+                                try {
+                                    const renRes = await fetch(`/api/admin/sessions/${session.id}`, {
+                                        method: 'PUT',
+                                        headers: { 
+                                            'Authorization': `Bearer ${token}`,
+                                            'Content-Type': 'application/json'
+                                        },
+                                        body: JSON.stringify({ name: newName })
+                                    });
+                                    if (renRes.ok) {
+                                        showToast('Admin session renamed successfully', 'success');
                                         loadAdminSessions();
+                                    } else {
+                                        showToast('Failed to rename admin session: ' + await renRes.text(), 'error');
                                     }
-                                } else {
-                                    showToast('Failed to revoke admin session: ' + await revRes.text(), 'error');
+                                } catch (err) {
+                                    showToast('Network error while renaming admin session', 'error');
                                 }
-                            } catch (err) {
-                                showToast('Network error while revoking admin session', 'error');
                             }
-                        }
-                    });
+                        });
+                    }
+
+                    const revokeBtn = row.querySelector('.btn-revoke-admin-session');
+                    if (revokeBtn) {
+                        revokeBtn.addEventListener('click', async (e) => {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            const isCurrent = session.is_current;
+                            const confirmMsg = isCurrent 
+                                ? 'Are you sure you want to log out of your current admin session?'
+                                : 'Are you sure you want to revoke this admin session? That browser will be logged out immediately.';
+                                
+                            if (await customConfirm(confirmMsg, isCurrent ? 'Log Out' : 'Revoke Admin Session', isCurrent ? 'Log Out' : 'Revoke', true)) {
+                                try {
+                                    const revRes = await fetch(`/api/admin/sessions/${session.id}`, {
+                                        method: 'DELETE',
+                                        headers: { 'Authorization': `Bearer ${token}` }
+                                    });
+                                    
+                                    if (revRes.ok) {
+                                        showToast(isCurrent ? 'Logged out successfully' : 'Admin session revoked successfully', 'success');
+                                        if (isCurrent) {
+                                            localStorage.removeItem('dill_admin_token');
+                                            const adminTokenInput = document.getElementById('admin-token-input');
+                                            if (adminTokenInput) adminTokenInput.value = '';
+                                            window.history.replaceState({}, '', '/admin');
+                                            loadAdminStats();
+                                        } else {
+                                            loadAdminSessions();
+                                        }
+                                    } else {
+                                        showToast('Failed to revoke admin session: ' + await revRes.text(), 'error');
+                                    }
+                                } catch (err) {
+                                    showToast('Network error while revoking admin session', 'error');
+                                }
+                            }
+                        });
+                    }
                 });
 
             } catch (err) {
@@ -6104,7 +6241,6 @@
                     const ipStr = session.ip;
                     
                     const createdDate = new Date(session.created_at * 1000).toLocaleString();
-                    const expiresDate = new Date(session.expires_at * 1000).toLocaleString();
                     
                     const currentBadge = session.is_current 
                         ? `<span class="badge success" style="margin-left:0.5rem; font-size:0.7rem; font-family:sans-serif; text-transform:uppercase;">Current</span>` 
@@ -6112,12 +6248,15 @@
                     
                     const buttonClass = session.is_current ? 'btn btn-secondary' : 'btn btn-danger';
                     
+                    const titleHtml = session.name 
+                        ? `<span style="font-weight:600; display:flex; align-items:center; color:var(--primary);">${escapeHtml(session.name)} ${currentBadge}</span>
+                           <span style="font-size:0.75rem; color:var(--text-main); margin-top:0.1rem;">${deviceName}</span>`
+                        : `<span style="font-weight:500; display:flex; align-items:center;">${deviceName} ${currentBadge}</span>`;
+
                     row.innerHTML = `
                         <td style="padding: 1rem 0.85rem; border-bottom: 1px solid var(--surface-border);">
                             <div style="display:flex; flex-direction:column;">
-                                <span style="font-weight:500; display:flex; align-items:center;">
-                                    ${deviceName} ${currentBadge}
-                                </span>
+                                ${titleHtml}
                                 <span style="font-size:0.75rem; color:var(--text-muted); font-family:monospace; margin-top:0.2rem; word-break:break-all;">
                                     ${session.user_agent}
                                 </span>
@@ -6125,48 +6264,82 @@
                         </td>
                         <td style="padding: 1rem 0.85rem; font-family:monospace; border-bottom: 1px solid var(--surface-border);">${ipStr}</td>
                         <td style="padding: 1rem 0.85rem; border-bottom: 1px solid var(--surface-border); font-size:0.8rem;">${createdDate}</td>
-                        <td style="padding: 1rem 0.85rem; border-bottom: 1px solid var(--surface-border); font-size:0.8rem;">${expiresDate}</td>
                         <td style="padding: 1rem 0.85rem; text-align:right; border-bottom: 1px solid var(--surface-border);">
-                            <button class="${buttonClass} btn-revoke-session" data-id="${session.id}" data-current="${session.is_current}" style="padding: 0.3rem 0.6rem; font-size: 0.75rem; font-weight: 600; white-space: nowrap;">
-                                Revoke
-                            </button>
+                            <div style="display:flex; gap:0.5rem; justify-content:flex-end;">
+                                <button class="btn btn-secondary btn-rename-session" data-id="${session.id}" data-name="${escapeHtml(session.name || '')}" style="padding: 0.3rem 0.6rem; font-size: 0.75rem; font-weight: 600; white-space: nowrap;">
+                                    Rename
+                                </button>
+                                <button class="${buttonClass} btn-revoke-session" data-id="${session.id}" data-current="${session.is_current}" style="padding: 0.3rem 0.6rem; font-size: 0.75rem; font-weight: 600; white-space: nowrap;">
+                                    Revoke
+                                </button>
+                            </div>
                         </td>
                     `;
                     sessionsListBody.appendChild(row);
-                });
 
-                // Attach event listeners to revoke buttons
-                document.querySelectorAll('.btn-revoke-session').forEach(btn => {
-                    btn.addEventListener('click', async (e) => {
-                        const id = e.currentTarget.getAttribute('data-id');
-                        const isCurrent = e.currentTarget.getAttribute('data-current') === 'true';
-                        
-                        const confirmMsg = isCurrent 
-                            ? 'Are you sure you want to log out of your current session?'
-                            : 'Are you sure you want to revoke this session? That device will be logged out immediately.';
-                            
-                        if (await customConfirm(confirmMsg, isCurrent ? 'Log Out' : 'Revoke Session', isCurrent ? 'Log Out' : 'Revoke', true)) {
-                            try {
-                                const revRes = await fetch(`/api/user/sessions/${id}`, {
-                                    method: 'DELETE',
-                                    headers: { 'Authorization': `Bearer ${token}` }
-                                });
-                                
-                                if (revRes.ok) {
-                                    showToast(isCurrent ? 'Logged out successfully' : 'Session revoked successfully', 'success');
-                                    if (isCurrent) {
-                                        logoutUser();
-                                    } else {
+                    const renameBtn = row.querySelector('.btn-rename-session');
+                    if (renameBtn) {
+                        renameBtn.addEventListener('click', async (e) => {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            const currentName = session.name || '';
+                            const newName = await customPrompt('Enter a custom name for this session:', 'Rename Session', currentName);
+                            if (newName !== null) {
+                                try {
+                                    const renRes = await fetch(`/api/user/sessions/${session.id}`, {
+                                        method: 'PUT',
+                                        headers: { 
+                                            'Authorization': `Bearer ${token}`,
+                                            'Content-Type': 'application/json'
+                                        },
+                                        body: JSON.stringify({ name: newName })
+                                    });
+                                    if (renRes.ok) {
+                                        showToast('Session renamed successfully', 'success');
                                         loadUserSessionsView();
+                                    } else {
+                                        showToast('Failed to rename session: ' + await renRes.text(), 'error');
                                     }
-                                } else {
-                                    showToast('Failed to revoke session: ' + await revRes.text(), 'error');
+                                } catch (err) {
+                                    showToast('Network error while renaming session', 'error');
                                 }
-                            } catch (err) {
-                                showToast('Network error while revoking session', 'error');
                             }
-                        }
-                    });
+                        });
+                    }
+
+                    const revokeBtn = row.querySelector('.btn-revoke-session');
+                    if (revokeBtn) {
+                        revokeBtn.addEventListener('click', async (e) => {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            const isCurrent = session.is_current;
+                            const confirmMsg = isCurrent 
+                                ? 'Are you sure you want to log out of your current session?'
+                                : 'Are you sure you want to revoke this session? That device will be logged out immediately.';
+                                
+                            if (await customConfirm(confirmMsg, isCurrent ? 'Log Out' : 'Revoke Session', isCurrent ? 'Log Out' : 'Revoke', true)) {
+                                try {
+                                    const revRes = await fetch(`/api/user/sessions/${session.id}`, {
+                                        method: 'DELETE',
+                                        headers: { 'Authorization': `Bearer ${token}` }
+                                    });
+                                    
+                                    if (revRes.ok) {
+                                        showToast(isCurrent ? 'Logged out successfully' : 'Session revoked successfully', 'success');
+                                        if (isCurrent) {
+                                            logoutUser();
+                                        } else {
+                                            loadUserSessionsView();
+                                        }
+                                    } else {
+                                        showToast('Failed to revoke session: ' + await revRes.text(), 'error');
+                                    }
+                                } catch (err) {
+                                    showToast('Network error while revoking session', 'error');
+                                }
+                            }
+                        });
+                    }
                 });
 
             } catch (err) {

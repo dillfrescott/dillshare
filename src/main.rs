@@ -130,11 +130,11 @@ async fn main() {
         .route("/api/user/change_password", post(user_change_password))
         .route("/api/user/account", delete(user_delete_account))
         .route("/api/user/sessions", get(get_user_sessions))
-        .route("/api/user/sessions/:id", delete(revoke_user_session))
+        .route("/api/user/sessions/:id", delete(revoke_user_session).put(rename_user_session))
         // Admin routes
         .route("/api/admin/login", post(admin_login))
         .route("/api/admin/sessions", get(admin_get_sessions))
-        .route("/api/admin/sessions/:id", delete(admin_revoke_session))
+        .route("/api/admin/sessions/:id", delete(admin_revoke_session).put(admin_rename_session))
         .route("/api/admin/stats", get(admin_get_stats))
         .route("/api/admin/share/:uuid", delete(admin_delete_share))
         .route("/api/admin/user/:username", delete(admin_delete_user))
@@ -1297,9 +1297,9 @@ async fn login_user(
         return Err((StatusCode::UNAUTHORIZED, "Invalid username or password".to_string()));
     }
 
-    // Generate token valid for 1 year with a unique session id
+    // Generate token with a unique session id (sessions never expire)
     let session_id = uuid::Uuid::new_v4().to_string();
-    let expiry = chrono::Utc::now().timestamp() + (365 * 24 * 60 * 60);
+    let expiry = 0;
     let token = generate_token(username, &state.jwt_secret, expiry, &session_id);
 
     // Extract user agent and IP
@@ -1319,6 +1319,7 @@ async fn login_user(
         user_agent,
         ip,
         expires_at: expiry,
+        name: None,
     };
 
     let sessions_key = format!("users/{}/sessions.json", username);
@@ -1338,9 +1339,6 @@ async fn login_user(
         Err(_) => Vec::new(),
     };
 
-    // Filter out expired sessions
-    let now = chrono::Utc::now().timestamp();
-    sessions.retain(|s| s.expires_at > now);
     sessions.push(new_session);
 
     if let Ok(session_bytes) = serde_json::to_vec(&sessions) {
@@ -1456,6 +1454,8 @@ struct UserSession {
     user_agent: String,
     ip: String,
     expires_at: i64,
+    #[serde(default)]
+    name: Option<String>,
 }
 
 fn generate_token(username: &str, secret: &[u8], expiry_timestamp: i64, session_id: &str) -> String {
@@ -1479,10 +1479,6 @@ fn verify_token_signature(token: &str, secret: &[u8]) -> Option<(String, i64, St
     let signature = parts[3];
     
     let expiry_timestamp = expiry_str.parse::<i64>().ok()?;
-    let now = chrono::Utc::now().timestamp();
-    if now > expiry_timestamp {
-        return None;
-    }
     
     let mut username_bytes = Vec::new();
     for i in (0..username_hex.len()).step_by(2) {
@@ -2061,8 +2057,7 @@ async fn user_change_password(
         Err(_) => Vec::new(),
     };
 
-    let now = chrono::Utc::now().timestamp();
-    sessions.retain(|s| s.id == current_session_id && s.expires_at > now);
+    sessions.retain(|s| s.id == current_session_id);
 
     if let Ok(session_bytes) = serde_json::to_vec(&sessions) {
         let _ = state.s3_client.put_object()
@@ -2156,21 +2151,19 @@ async fn get_user_sessions(
         Err(_) => Vec::new(),
     };
 
-    let now = chrono::Utc::now().timestamp();
     let mut response_sessions = Vec::new();
 
     for s in sessions {
-        if s.expires_at > now {
-            let is_current = s.id == current_session_id;
-            response_sessions.push(serde_json::json!({
-                "id": s.id,
-                "created_at": s.created_at,
-                "user_agent": s.user_agent,
-                "ip": s.ip,
-                "expires_at": s.expires_at,
-                "is_current": is_current,
-            }));
-        }
+        let is_current = s.id == current_session_id;
+        response_sessions.push(serde_json::json!({
+            "id": s.id,
+            "created_at": s.created_at,
+            "user_agent": s.user_agent,
+            "ip": s.ip,
+            "expires_at": s.expires_at,
+            "is_current": is_current,
+            "name": s.name,
+        }));
     }
 
     Ok(axum::Json(response_sessions))
@@ -2223,6 +2216,69 @@ async fn revoke_user_session(
     Ok(StatusCode::OK)
 }
 
+#[derive(serde::Deserialize)]
+struct RenameSessionRequest {
+    name: String,
+}
+
+async fn rename_user_session(
+    State(state): State<AppState>,
+    axum::extract::Path(session_id): axum::extract::Path<String>,
+    headers: axum::http::HeaderMap,
+    axum::Json(payload): axum::Json<RenameSessionRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let token = extract_token(&headers)?;
+    let (username, _current_session_id) = verify_session(&token, &state)
+        .await
+        .ok_or_else(|| (StatusCode::UNAUTHORIZED, "Invalid or expired session".to_string()))?;
+
+    let sessions_key = format!("users/{}/sessions.json", username);
+    let mut sessions: Vec<UserSession> = match state.s3_client.get_object()
+        .bucket(&state.bucket)
+        .key(&sessions_key)
+        .send()
+        .await
+    {
+        Ok(output) => {
+            if let Ok(bytes) = output.body.collect().await {
+                serde_json::from_slice(&bytes.into_bytes()).unwrap_or_default()
+            } else {
+                Vec::new()
+            }
+        }
+        Err(_) => Vec::new(),
+    };
+
+    let clean_name = payload.name.trim();
+    let truncated_name: String = clean_name.chars().take(32).collect();
+    let new_name_opt = if truncated_name.is_empty() { None } else { Some(truncated_name) };
+
+    let mut updated = false;
+    for s in sessions.iter_mut() {
+        if s.id == session_id {
+            s.name = new_name_opt.clone();
+            updated = true;
+            break;
+        }
+    }
+
+    if updated {
+        let session_bytes = serde_json::to_vec(&sessions)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+        state.s3_client.put_object()
+            .bucket(&state.bucket)
+            .key(&sessions_key)
+            .content_type("application/json")
+            .body(aws_sdk_s3::primitives::ByteStream::from(session_bytes))
+            .send()
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to update session: {:?}", e)))?;
+    }
+
+    Ok(StatusCode::OK)
+}
+
 async fn admin_get_user_sessions(
     State(state): State<AppState>,
     Path(username): Path<String>,
@@ -2247,20 +2303,18 @@ async fn admin_get_user_sessions(
         Err(_) => Vec::new(),
     };
 
-    let now = chrono::Utc::now().timestamp();
     let mut response_sessions = Vec::new();
 
     for s in sessions {
-        if s.expires_at > now {
-            response_sessions.push(serde_json::json!({
-                "id": s.id,
-                "created_at": s.created_at,
-                "user_agent": s.user_agent,
-                "ip": s.ip,
-                "expires_at": s.expires_at,
-                "is_current": false,
-            }));
-        }
+        response_sessions.push(serde_json::json!({
+            "id": s.id,
+            "created_at": s.created_at,
+            "user_agent": s.user_agent,
+            "ip": s.ip,
+            "expires_at": s.expires_at,
+            "is_current": false,
+            "name": s.name,
+        }));
     }
 
     Ok(axum::Json(response_sessions))
@@ -2332,7 +2386,7 @@ async fn admin_login(
         return Err((StatusCode::FORBIDDEN, "Invalid admin token".to_string()));
     }
     
-    let expiry = chrono::Utc::now().timestamp() + 365 * 24 * 60 * 60; // 1 year
+    let expiry = 0;
     let session_id = uuid::Uuid::new_v4().to_string();
     let session_token = generate_token("admin", &state.jwt_secret, expiry, &session_id);
     
@@ -2351,6 +2405,7 @@ async fn admin_login(
         user_agent,
         ip,
         expires_at: expiry,
+        name: None,
     };
     
     let sessions_key = "admin/sessions.json";
@@ -2370,8 +2425,6 @@ async fn admin_login(
         Err(_) => Vec::new(),
     };
     
-    let now = chrono::Utc::now().timestamp();
-    sessions.retain(|s| s.expires_at > now);
     sessions.push(new_session);
     
     if let Ok(session_bytes) = serde_json::to_vec(&sessions) {
@@ -2411,7 +2464,6 @@ async fn admin_get_sessions(
         Err(_) => Vec::new(),
     };
 
-    let now = chrono::Utc::now().timestamp();
     let mut response_sessions = Vec::new();
 
     let current_session_id = if let Some(auth_header) = headers.get(axum::http::header::AUTHORIZATION) {
@@ -2425,17 +2477,16 @@ async fn admin_get_sessions(
     } else { None };
 
     for s in sessions {
-        if s.expires_at > now {
-            let is_current = current_session_id.as_ref() == Some(&s.id);
-            response_sessions.push(serde_json::json!({
-                "id": s.id,
-                "created_at": s.created_at,
-                "user_agent": s.user_agent,
-                "ip": s.ip,
-                "expires_at": s.expires_at,
-                "is_current": is_current,
-            }));
-        }
+        let is_current = current_session_id.as_ref() == Some(&s.id);
+        response_sessions.push(serde_json::json!({
+            "id": s.id,
+            "created_at": s.created_at,
+            "user_agent": s.user_agent,
+            "ip": s.ip,
+            "expires_at": s.expires_at,
+            "is_current": is_current,
+            "name": s.name,
+        }));
     }
 
     Ok(axum::Json(response_sessions))
@@ -2480,6 +2531,61 @@ async fn admin_revoke_session(
             .send()
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to update sessions: {:?}", e)))?;
+    }
+
+    Ok(StatusCode::OK)
+}
+
+async fn admin_rename_session(
+    State(state): State<AppState>,
+    axum::extract::Path(session_id): axum::extract::Path<String>,
+    headers: axum::http::HeaderMap,
+    axum::Json(payload): axum::Json<RenameSessionRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    verify_admin(&headers, &state).await?;
+
+    let sessions_key = "admin/sessions.json";
+    let mut sessions: Vec<UserSession> = match state.s3_client.get_object()
+        .bucket(&state.bucket)
+        .key(sessions_key)
+        .send()
+        .await
+    {
+        Ok(output) => {
+            if let Ok(bytes) = output.body.collect().await {
+                serde_json::from_slice(&bytes.into_bytes()).unwrap_or_default()
+            } else {
+                Vec::new()
+            }
+        }
+        Err(_) => Vec::new(),
+    };
+
+    let clean_name = payload.name.trim();
+    let truncated_name: String = clean_name.chars().take(32).collect();
+    let new_name_opt = if truncated_name.is_empty() { None } else { Some(truncated_name) };
+
+    let mut updated = false;
+    for s in sessions.iter_mut() {
+        if s.id == session_id {
+            s.name = new_name_opt.clone();
+            updated = true;
+            break;
+        }
+    }
+
+    if updated {
+        let session_bytes = serde_json::to_vec(&sessions)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+        state.s3_client.put_object()
+            .bucket(&state.bucket)
+            .key(sessions_key)
+            .content_type("application/json")
+            .body(aws_sdk_s3::primitives::ByteStream::from(session_bytes))
+            .send()
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to update admin session: {:?}", e)))?;
     }
 
     Ok(StatusCode::OK)

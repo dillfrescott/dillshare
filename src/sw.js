@@ -386,4 +386,3 @@ async function respondLegacyRange(meta, start, end, isRange, total) {
     }
     return new Response(slice, { status, headers });
 }
-}
