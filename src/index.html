@@ -2513,9 +2513,19 @@
             return true;
         }
 
+        function isSafariOrIOS() {
+            const ua = navigator.userAgent;
+            const isSafari = /^((?!chrome|android).)*safari/i.test(ua);
+            const isIOS = /iPad|iPhone|iPod/.test(ua) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+            return isSafari || isIOS;
+        }
+
         // Stream a decrypted output directly to a native browser download via Service Worker
         async function createSWWriteStream(filename, size, contentType) {
             try {
+                if (isSafariOrIOS()) {
+                    return null;
+                }
                 const ok = await ensureStreamingSW();
                 if (!ok || !navigator.serviceWorker || !navigator.serviceWorker.controller) {
                     return null;
@@ -2596,7 +2606,7 @@
             sink = await createSWWriteStream(suggestedName, size, contentType);
 
             // 2. Fallback to StreamSaver.js if SW stream failed to initialize
-            if (!sink && typeof streamSaver !== 'undefined') {
+            if (!sink && typeof streamSaver !== 'undefined' && !isSafariOrIOS()) {
                 try {
                     const fileStream = streamSaver.createWriteStream(suggestedName, { size });
                     sink = fileStream.getWriter();
@@ -4731,7 +4741,7 @@
                 // --- Acquire a streaming disk sink for the ZIP output. ---
                 let sink = await createSWWriteStream(zipFileName, totalPlainSize > 0 ? totalPlainSize : undefined, 'application/zip');
 
-                if (!sink && typeof streamSaver !== 'undefined') {
+                if (!sink && typeof streamSaver !== 'undefined' && !isSafariOrIOS()) {
                     try {
                         const fileStream = streamSaver.createWriteStream(zipFileName);
                         sink = fileStream.getWriter();
