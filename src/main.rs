@@ -1997,6 +1997,106 @@ async fn perform_cleanup(
         }
     }
 
+    // Cleanup old auth sessions
+    if let Ok(sessions) = storage.list_objects(bucket, Some("auth_sessions/"), None).await {
+        for session in sessions {
+            if now - session.last_modified_secs > partial_upload_limit {
+                keys_to_delete.push(session.key);
+            }
+        }
+    }
+
+    // Cleanup old user passkey states
+    if let Ok(users) = storage.list_objects(bucket, Some("users/"), None).await {
+        for object in users {
+            if object.key.ends_with("/passkey_reg.json") || object.key.ends_with("/passkey_auth.json") {
+                if now - object.last_modified_secs > partial_upload_limit {
+                    keys_to_delete.push(object.key);
+                }
+            }
+        }
+    }
+
+    // Cleanup orphaned passkey indexes
+    if let Ok(indexes) = storage.list_objects(bucket, Some("passkey_index/"), None).await {
+        for index in indexes {
+            let cred_id_b64 = index.key.strip_prefix("passkey_index/").unwrap_or(&index.key);
+            let mut keep = false;
+            if let Ok(bytes) = storage.get_object_bytes(bucket, &index.key).await {
+                if let Ok(username) = String::from_utf8(bytes.to_vec()) {
+                    let passkeys_key = format!("users/{}/passkeys.json", username.trim());
+                    if let Ok(pk_bytes) = storage.get_object_bytes(bucket, &passkeys_key).await {
+                        if let Ok(passkeys) = serde_json::from_slice::<Vec<webauthn_rs::prelude::Passkey>>(&pk_bytes) {
+                            use base64::Engine;
+                            keep = passkeys.iter().any(|pk| {
+                                base64::prelude::BASE64_URL_SAFE_NO_PAD.encode(pk.cred_id()) == cred_id_b64
+                            });
+                        }
+                    }
+                }
+            }
+            if !keep {
+                keys_to_delete.push(index.key);
+            }
+        }
+    }
+
+    // Full bucket scan for completely foreign files and orphaned user data
+    if let Ok(all_objects) = storage.list_objects(bucket, None, None).await {
+        let mut valid_users = std::collections::HashSet::new();
+        for object in &all_objects {
+            if object.key.starts_with("users/") {
+                let parts: Vec<&str> = object.key.split('/').collect();
+                if parts.len() == 2 && object.key.ends_with(".json") {
+                    if let Some(username) = parts[1].strip_suffix(".json") {
+                        valid_users.insert(username.to_string());
+                    }
+                }
+            }
+        }
+
+        for object in all_objects {
+            let key = object.key;
+            if key.starts_with("config/")
+                || key.starts_with("admin/")
+                || key.starts_with("uploads/")
+                || key.starts_with("auth_sessions/")
+                || key.starts_with("passkey_index/")
+            {
+                continue;
+            }
+
+            if key.starts_with("users/") {
+                let parts: Vec<&str> = key.split('/').collect();
+                if parts.len() == 2 && key.ends_with(".json") {
+                    continue;
+                } else if parts.len() == 3 {
+                    let username = parts[1];
+                    let filename = parts[2];
+                    if valid_users.contains(username) {
+                        let allowed_files = [
+                            "passkeys.json",
+                            "passkeys_meta.json",
+                            "sessions.json",
+                            "public_shares.json",
+                            "pfp.enc",
+                            "passkey_reg.json",
+                            "passkey_auth.json",
+                        ];
+                        if allowed_files.contains(&filename) {
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            keys_to_delete.push(key);
+        }
+    }
+
+    keys_to_delete.sort();
+    keys_to_delete.dedup();
+
     if !keys_to_delete.is_empty() {
         tracing::info!(
             "Deleting {} expired/partial S3 objects...",
