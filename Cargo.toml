@@ -11,7 +11,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 aws-config = { version = "1.1", features = ["behavior-version-latest"] }
 aws-sdk-s3 = "1.18"
-uuid = { version = "1.7", features = ["v4"] }
+uuid = { version = "1.7", features = ["v4", "v5"] }
 mime_guess = "2.0"
 chrono = { version = "0.4", features = ["serde"] }
 tokio-util = { version = "0.7", features = ["io"] }
@@ -24,6 +24,8 @@ sha2 = "0.10.8"
 hmac = "0.12.1"
 totp-rs = { version = "5.5", features = ["qr", "gen_secret"] }
 rand = "0.10.2"
+base64 = "0.22.1"
+webauthn-rs = { version = "0.5.5", features = ["danger-allow-state-serialisation", "conditional-ui"] }
 
 [profile.release]
 opt-level = 3

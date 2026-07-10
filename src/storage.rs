@@ -36,7 +36,12 @@ pub struct CompletedPart {
 }
 
 impl Storage {
-    pub async fn get_object(&self, bucket: &str, key: &str, range_header: Option<String>) -> Result<GetObjectOutput, String> {
+    pub async fn get_object(
+        &self,
+        bucket: &str,
+        key: &str,
+        range_header: Option<String>,
+    ) -> Result<GetObjectOutput, String> {
         match self {
             Storage::S3(client) => {
                 let mut req = client.get_object().bucket(bucket).key(key);
@@ -91,21 +96,45 @@ impl Storage {
     pub async fn get_object_bytes(&self, bucket: &str, key: &str) -> Result<Vec<u8>, String> {
         match self {
             Storage::S3(client) => {
-                let res = client.get_object().bucket(bucket).key(key).send().await.map_err(|e| e.to_string())?;
-                let bytes = res.body.collect().await.map_err(|e| e.to_string())?.into_bytes();
+                let res = client
+                    .get_object()
+                    .bucket(bucket)
+                    .key(key)
+                    .send()
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let bytes = res
+                    .body
+                    .collect()
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .into_bytes();
                 Ok(bytes.to_vec())
             }
             Storage::Memory(mem) => {
                 let m = mem.lock().await;
-                m.files.get(key).cloned().ok_or_else(|| "Not found".to_string())
+                m.files
+                    .get(key)
+                    .cloned()
+                    .ok_or_else(|| "Not found".to_string())
             }
         }
     }
 
-    pub async fn put_object(&self, bucket: &str, key: &str, data: Vec<u8>, content_type: Option<&str>) -> Result<(), String> {
+    pub async fn put_object(
+        &self,
+        bucket: &str,
+        key: &str,
+        data: Vec<u8>,
+        content_type: Option<&str>,
+    ) -> Result<(), String> {
         match self {
             Storage::S3(client) => {
-                let mut req = client.put_object().bucket(bucket).key(key).body(aws_sdk_s3::primitives::ByteStream::from(data));
+                let mut req = client
+                    .put_object()
+                    .bucket(bucket)
+                    .key(key)
+                    .body(aws_sdk_s3::primitives::ByteStream::from(data));
                 if let Some(ct) = content_type {
                     req = req.content_type(ct);
                 }
@@ -141,7 +170,13 @@ impl Storage {
     pub async fn delete_object(&self, bucket: &str, key: &str) -> Result<(), String> {
         match self {
             Storage::S3(client) => {
-                client.delete_object().bucket(bucket).key(key).send().await.map_err(|e| e.to_string())?;
+                client
+                    .delete_object()
+                    .bucket(bucket)
+                    .key(key)
+                    .send()
+                    .await
+                    .map_err(|e| e.to_string())?;
                 Ok(())
             }
             Storage::Memory(mem) => {
@@ -153,7 +188,12 @@ impl Storage {
         }
     }
 
-    pub async fn list_objects(&self, bucket: &str, prefix: Option<&str>, max_keys: Option<i32>) -> Result<Vec<ObjectInfo>, String> {
+    pub async fn list_objects(
+        &self,
+        bucket: &str,
+        prefix: Option<&str>,
+        max_keys: Option<i32>,
+    ) -> Result<Vec<ObjectInfo>, String> {
         match self {
             Storage::S3(client) => {
                 let mut req = client.list_objects_v2().bucket(bucket);
@@ -172,7 +212,10 @@ impl Storage {
                                 keys.push(ObjectInfo {
                                     key: k.to_string(),
                                     size: obj.size().unwrap_or(0),
-                                    last_modified_secs: obj.last_modified().map(|d| d.secs()).unwrap_or(0),
+                                    last_modified_secs: obj
+                                        .last_modified()
+                                        .map(|d| d.secs())
+                                        .unwrap_or(0),
                                 });
                             }
                         }
@@ -187,15 +230,22 @@ impl Storage {
                 let mut keys = Vec::new();
                 for (k, v) in &m.files {
                     if let Some(p) = prefix {
-                        if !k.starts_with(p) { continue; }
+                        if !k.starts_with(p) {
+                            continue;
+                        }
                     }
                     keys.push(ObjectInfo {
                         key: k.clone(),
                         size: v.len() as i64,
-                        last_modified_secs: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64,
+                        last_modified_secs: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_secs() as i64,
                     });
                     if let Some(mk) = max_keys {
-                        if keys.len() as i32 >= mk { break; }
+                        if keys.len() as i32 >= mk {
+                            break;
+                        }
                     }
                 }
                 Ok(keys)
@@ -203,7 +253,12 @@ impl Storage {
         }
     }
 
-    pub async fn create_multipart_upload(&self, bucket: &str, key: &str, content_type: Option<&str>) -> Result<String, String> {
+    pub async fn create_multipart_upload(
+        &self,
+        bucket: &str,
+        key: &str,
+        content_type: Option<&str>,
+    ) -> Result<String, String> {
         match self {
             Storage::S3(client) => {
                 let mut req = client.create_multipart_upload().bucket(bucket).key(key);
@@ -216,23 +271,33 @@ impl Storage {
             Storage::Memory(mem) => {
                 let mut m = mem.lock().await;
                 let upload_id = uuid::Uuid::new_v4().to_string();
-                m.multipart_uploads.insert(upload_id.clone(), HashMap::new());
+                m.multipart_uploads
+                    .insert(upload_id.clone(), HashMap::new());
                 Ok(upload_id)
             }
         }
     }
 
-    pub async fn upload_part(&self, bucket: &str, key: &str, upload_id: &str, part_number: i32, data: Vec<u8>) -> Result<String, String> {
+    pub async fn upload_part(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        part_number: i32,
+        data: Vec<u8>,
+    ) -> Result<String, String> {
         match self {
             Storage::S3(client) => {
-                let res = client.upload_part()
+                let res = client
+                    .upload_part()
                     .bucket(bucket)
                     .key(key)
                     .upload_id(upload_id)
                     .part_number(part_number)
                     .body(aws_sdk_s3::primitives::ByteStream::from(data))
                     .send()
-                    .await.map_err(|e| e.to_string())?;
+                    .await
+                    .map_err(|e| e.to_string())?;
                 Ok(res.e_tag().unwrap_or_default().to_string())
             }
             Storage::Memory(mem) => {
@@ -247,7 +312,13 @@ impl Storage {
         }
     }
 
-    pub async fn complete_multipart_upload(&self, bucket: &str, key: &str, upload_id: &str, parts: Vec<CompletedPart>) -> Result<(), String> {
+    pub async fn complete_multipart_upload(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        parts: Vec<CompletedPart>,
+    ) -> Result<(), String> {
         match self {
             Storage::S3(client) => {
                 let mut builder = aws_sdk_s3::types::CompletedMultipartUpload::builder();
@@ -256,16 +327,18 @@ impl Storage {
                         aws_sdk_s3::types::CompletedPart::builder()
                             .part_number(p.part_number)
                             .e_tag(p.e_tag)
-                            .build()
+                            .build(),
                     );
                 }
-                client.complete_multipart_upload()
+                client
+                    .complete_multipart_upload()
                     .bucket(bucket)
                     .key(key)
                     .upload_id(upload_id)
                     .multipart_upload(builder.build())
                     .send()
-                    .await.map_err(|e| e.to_string())?;
+                    .await
+                    .map_err(|e| e.to_string())?;
                 Ok(())
             }
             Storage::Memory(mem) => {
@@ -287,15 +360,22 @@ impl Storage {
     }
 
     #[allow(dead_code)]
-    pub async fn abort_multipart_upload(&self, bucket: &str, key: &str, upload_id: &str) -> Result<(), String> {
+    pub async fn abort_multipart_upload(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+    ) -> Result<(), String> {
         match self {
             Storage::S3(client) => {
-                client.abort_multipart_upload()
+                client
+                    .abort_multipart_upload()
                     .bucket(bucket)
                     .key(key)
                     .upload_id(upload_id)
                     .send()
-                    .await.map_err(|e| e.to_string())?;
+                    .await
+                    .map_err(|e| e.to_string())?;
                 Ok(())
             }
             Storage::Memory(mem) => {

@@ -1360,6 +1360,7 @@
                                         <th>User</th>
                                         <th>Active Shares</th>
                                         <th>Storage Used</th>
+                                        <th>2FA Enabled</th>
                                         <th>Actions</th>
                                     </tr>
                                 </thead>
@@ -1445,6 +1446,16 @@
                             </div>
                         </div>
                     </div>
+                </div>
+
+                <!-- Passkeys Section -->
+                <div style="display: flex; flex-direction: column; gap: 0.8rem; border-bottom: 1px solid var(--surface-border); padding-bottom: 1.5rem;">
+                    <h4 style="font-size: 0.9rem; font-weight: 600; color: var(--text-main); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 0.25rem;">Passkeys</h4>
+                    <p style="font-size: 0.85rem; color: var(--text-muted);">Set up a passkey to sign in securely using your fingerprint, face, or screen lock.</p>
+                    <button type="button" class="btn btn-secondary" id="btn-setup-passkey" style="align-self: flex-start; padding: 0.5rem 1rem; font-weight: 600;">
+                        Set up Passkey
+                    </button>
+                    <div id="passkeys-list-container" class="mt-3" style="display: flex; flex-direction: column; gap: 0.5rem; margin-top: 0.5rem;"></div>
                 </div>
 
                 <!-- Change Password Form -->
@@ -1615,6 +1626,16 @@
                     <button class="btn" type="submit" id="btn-auth-submit" style="justify-content: center; padding: 0.6rem; font-weight: 600; margin-top: 0.5rem;">
                         Sign In
                     </button>
+                    <div id="auth-passkey-container" style="display: flex; flex-direction: column; width: 100%;">
+                        <div style="display: flex; align-items: center; justify-content: center; margin: 0.5rem 0;">
+                            <div style="height: 1px; background: var(--surface-border); flex: 1;"></div>
+                            <span style="padding: 0 0.5rem; font-size: 0.75rem; color: var(--text-muted); text-transform: uppercase;">or</span>
+                            <div style="height: 1px; background: var(--surface-border); flex: 1;"></div>
+                        </div>
+                        <button type="button" class="btn btn-secondary" id="btn-auth-passkey" style="justify-content: center; padding: 0.6rem; font-weight: 600;">
+                            Sign in with Passkey
+                        </button>
+                    </div>
                 </form>
                 <div style="text-align: center; font-size: 0.8rem; color: var(--text-muted); margin-top: 0.5rem;">
                     <span id="auth-toggle-text">Don't have an account?</span>
@@ -1685,6 +1706,26 @@
     <div class="toast-container" id="toast-container"></div>
 
     <script>
+        function bufferToBase64url(buffer) {
+            const bytes = new Uint8Array(buffer);
+            let str = '';
+            for (let i = 0; i < bytes.byteLength; i++) {
+                str += String.fromCharCode(bytes[i]);
+            }
+            return btoa(str).replace(/\+/g, "-").replace(/\//g, "_").replace(/=/g, "");
+        }
+
+        function base64urlToBuffer(base64url) {
+            const padding = "=".repeat((4 - base64url.length % 4) % 4);
+            const base64 = (base64url + padding).replace(/\-/g, "+").replace(/_/g, "/");
+            const rawData = atob(base64);
+            const outputArray = new Uint8Array(rawData.length);
+            for (let i = 0; i < rawData.length; ++i) {
+                outputArray[i] = rawData.charCodeAt(i);
+            }
+            return outputArray.buffer;
+        }
+
         // Store selected files before upload
         let selectedFiles = [];
         let currentShareUUID = null;
@@ -2727,6 +2768,7 @@
             if (viewId === 'view-profile') {
                 navProfile.classList.add('active');
                 loadUserProfileView();
+                loadUserPasskeysView();
             }
             if (viewId === 'view-admin') {
                 loadAdminStats();
@@ -2909,7 +2951,7 @@
         }
 
         // Native Custom Prompt Modal helper
-        function customPrompt(message, title = 'Rename Session', defaultValue = '') {
+        function customPrompt(message, title = 'Rename Session', defaultValue = '', isPassword = false) {
             return new Promise((resolve) => {
                 const modal = document.getElementById('prompt-modal');
                 const titleEl = document.getElementById('prompt-modal-title');
@@ -2921,8 +2963,9 @@
 
                 titleEl.textContent = title;
                 messageEl.textContent = message;
-                inputEl.maxLength = 32;
-                inputEl.value = defaultValue.slice(0, 32);
+                inputEl.maxLength = isPassword ? 128 : 32;
+                inputEl.value = isPassword ? '' : defaultValue.slice(0, 32);
+                inputEl.type = isPassword ? 'password' : 'text';
 
                 openAppModal(modal);
                 setTimeout(() => {
@@ -2941,7 +2984,7 @@
                 };
 
                 const onOk = () => {
-                    const val = inputEl.value.slice(0, 32);
+                    const val = isPassword ? inputEl.value : inputEl.value.slice(0, 32);
                     cleanup();
                     resolve(val);
                 };
@@ -5137,6 +5180,8 @@
             authPasswordInput.value = '';
             authConfirmPasswordInput.value = '';
             authConfirmPasswordWrap.style.display = 'none';
+            const authPasskeyContainer = document.getElementById('auth-passkey-container');
+            if (authPasskeyContainer) authPasskeyContainer.style.display = 'flex';
             const totpInput = document.getElementById('auth-totp');
             const totpWrap = document.getElementById('auth-totp-wrap');
             if (totpWrap) {
@@ -5169,12 +5214,15 @@
             }
             if (totpInput) totpInput.value = '';
 
+            const authPasskeyContainer = document.getElementById('auth-passkey-container');
+
             if (isRegisterMode) {
                 authModalTitle.textContent = 'Create Account';
                 btnAuthSubmit.textContent = 'Register';
                 authToggleText.textContent = 'Already have an account?';
                 authToggleLink.textContent = 'Sign In';
                 authConfirmPasswordWrap.style.display = 'flex';
+                if (authPasskeyContainer) authPasskeyContainer.style.display = 'none';
             } else {
                 authModalTitle.textContent = 'Sign In';
                 btnAuthSubmit.textContent = 'Sign In';
@@ -5182,11 +5230,197 @@
                 authToggleLink.textContent = 'Create Account';
                 authConfirmPasswordWrap.style.display = 'none';
                 authConfirmPasswordInput.value = '';
+                if (authPasskeyContainer) authPasskeyContainer.style.display = 'flex';
             }
         });
 
+        let currentPasskeyAuthData = null;
+        let currentPasskeySessionId = null;
+
+        const btnAuthPasskey = document.getElementById('btn-auth-passkey');
+        if (btnAuthPasskey) {
+            btnAuthPasskey.addEventListener('click', async () => {
+                const username = authUsernameInput.value.trim();
+                const totpInput = document.getElementById('auth-totp');
+                const totpWrap = document.getElementById('auth-totp-wrap');
+
+                if (currentPasskeyAuthData) {
+                    if (!totpInput || !totpInput.value) {
+                        showToast('Please enter your 2FA code', 'error');
+                        return;
+                    }
+                    btnAuthPasskey.disabled = true;
+                    try {
+                        let finishRes = await fetch('/api/passkey/auth_finish', {
+                            method: 'POST',
+                            headers: {'Content-Type': 'application/json'},
+                            body: JSON.stringify({
+                                username: username || null,
+                                session_id: currentPasskeySessionId,
+                                auth: currentPasskeyAuthData,
+                                totp_code: totpInput.value
+                            })
+                        });
+                        if (!finishRes.ok) {
+                            const text = await finishRes.text();
+                            if (text === "INVALID_2FA") {
+                                throw new Error("Invalid 2FA code");
+                            } else {
+                                throw new Error(text);
+                            }
+                        }
+                        const finalData = await finishRes.json();
+                        const loggedInUsername = finalData.username;
+                        localStorage.setItem('dill_session_token', finalData.token);
+                        localStorage.setItem('dill_username', loggedInUsername);
+                        
+                        let encKeyHex = localStorage.getItem('dill_enc_key_' + loggedInUsername) || localStorage.getItem('dill_enc_key');
+                        if (!encKeyHex) {
+                            const pwd = await customPrompt('Please enter your password once to unlock zero-knowledge encryption on this device:', 'Unlock Device Encryption', '', true);
+                            if (pwd) {
+                                const keys = await deriveUserKeys(loggedInUsername, pwd);
+                                encKeyHex = bufToHex(keys.encKeyBuf);
+                                localStorage.setItem('dill_enc_key_' + loggedInUsername, encKeyHex);
+                            }
+                        }
+                        if (encKeyHex) {
+                            localStorage.setItem('dill_enc_key', encKeyHex);
+                            const pfpEncHex = finalData.pfp_enc || finalData.pfp;
+                            if (pfpEncHex) {
+                                try {
+                                    const decryptedPfp = await decryptPfp(pfpEncHex, hexToBuf(encKeyHex));
+                                    if (decryptedPfp) localStorage.setItem('dill_pfp', decryptedPfp);
+                                } catch(e) {}
+                            }
+                        }
+                        window.location.reload();
+                    } catch (e) {
+                        showToast(e.message, 'error');
+                    } finally {
+                        btnAuthPasskey.disabled = false;
+                    }
+                    return;
+                }
+
+                btnAuthPasskey.disabled = true;
+                try {
+                    let res = await fetch('/api/passkey/auth_start', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({username: username || null})
+                    });
+                    if (!res.ok) throw new Error(await res.text());
+                    const startData = await res.json();
+                    const rcr = startData.rcr;
+                    const sessionId = startData.session_id;
+                    
+                    const preformatGetAssertReq = (obj) => {
+                        if (typeof obj === 'string') return base64urlToBuffer(obj);
+                        if (Array.isArray(obj)) return obj.map(preformatGetAssertReq);
+                        if (typeof obj === 'object' && obj !== null) {
+                            const result = {};
+                            for (const key in obj) {
+                                if (key === 'challenge' || key === 'id') {
+                                    result[key] = base64urlToBuffer(obj[key]);
+                                } else if (key === 'allowCredentials') {
+                                    result[key] = obj[key].map(c => ({...c, id: base64urlToBuffer(c.id)}));
+                                } else {
+                                    result[key] = obj[key];
+                                }
+                            }
+                            return result;
+                        }
+                        return obj;
+                    };
+                    
+                    const publicKeyCredentialRequestOptions = preformatGetAssertReq(rcr.publicKey);
+                    const credential = await navigator.credentials.get({ publicKey: publicKeyCredentialRequestOptions });
+                    
+                    const authData = {
+                        id: credential.id,
+                        rawId: bufferToBase64url(credential.rawId),
+                        type: credential.type,
+                        response: {
+                            authenticatorData: bufferToBase64url(credential.response.authenticatorData),
+                            clientDataJSON: bufferToBase64url(credential.response.clientDataJSON),
+                            signature: bufferToBase64url(credential.response.signature),
+                            userHandle: credential.response.userHandle ? bufferToBase64url(credential.response.userHandle) : null
+                        }
+                    };
+                    
+                    let finishRes = await fetch('/api/passkey/auth_finish', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({
+                            username: username || null,
+                            session_id: sessionId,
+                            auth: authData
+                        })
+                    });
+                    
+                    if (!finishRes.ok) {
+                        const text = await finishRes.text();
+                        if (text === "2FA_REQUIRED") {
+                            currentPasskeyAuthData = authData;
+                            currentPasskeySessionId = sessionId;
+                            if (totpWrap) {
+                                totpWrap.style.display = 'flex';
+                                void totpWrap.offsetWidth;
+                                totpWrap.style.maxHeight = '100px';
+                                totpWrap.style.opacity = '1';
+                                totpInput.focus();
+                            }
+                            showToast("Please enter your 2FA code", "info");
+                            return;
+                        } else {
+                            throw new Error(text);
+                        }
+                    }
+                    
+                    const finalData = await finishRes.json();
+                    
+                    const loggedInUsername = finalData.username;
+                    localStorage.setItem('dill_session_token', finalData.token);
+                    localStorage.setItem('dill_username', loggedInUsername);
+                    
+                    let encKeyHex = localStorage.getItem('dill_enc_key_' + loggedInUsername) || localStorage.getItem('dill_enc_key');
+                    if (!encKeyHex) {
+                        const pwd = await customPrompt('Please enter your password once to unlock zero-knowledge encryption on this device:', 'Unlock Device Encryption', '', true);
+                        if (pwd) {
+                            const keys = await deriveUserKeys(loggedInUsername, pwd);
+                            encKeyHex = bufToHex(keys.encKeyBuf);
+                            localStorage.setItem('dill_enc_key_' + loggedInUsername, encKeyHex);
+                        }
+                    }
+                    if (encKeyHex) {
+                        localStorage.setItem('dill_enc_key', encKeyHex);
+                        const pfpEncHex = finalData.pfp_enc || finalData.pfp;
+                        if (pfpEncHex) {
+                            try {
+                                const decryptedPfp = await decryptPfp(pfpEncHex, hexToBuf(encKeyHex));
+                                if (decryptedPfp) localStorage.setItem('dill_pfp', decryptedPfp);
+                            } catch(e) {}
+                        }
+                    }
+                    window.location.reload();
+                    
+                } catch (e) {
+                    showToast(e.message || 'Passkey login failed', 'error');
+                } finally {
+                    btnAuthPasskey.disabled = false;
+                }
+            });
+        }
+
         authForm.addEventListener('submit', async (e) => {
             e.preventDefault();
+            
+            if (typeof currentPasskeyAuthData !== 'undefined' && currentPasskeyAuthData) {
+                const btnAuthPasskey = document.getElementById('btn-auth-passkey');
+                if (btnAuthPasskey) btnAuthPasskey.click();
+                return;
+            }
+
             const username = authUsernameInput.value.trim();
             const password = authPasswordInput.value;
 
@@ -5265,6 +5499,7 @@
             localStorage.setItem('dill_session_token', data.token);
             localStorage.setItem('dill_username', username);
             localStorage.setItem('dill_enc_key', bufToHex(encKeyBuf));
+            localStorage.setItem('dill_enc_key_' + username, bufToHex(encKeyBuf));
             const pfpEncHex = data.pfp_enc || data.pfp;
             if (pfpEncHex) {
                 const decryptedPfp = await decryptPfp(pfpEncHex, encKeyBuf);
@@ -5573,6 +5808,61 @@
             });
         }
 
+        const btnSetupPasskey = document.getElementById('btn-setup-passkey');
+        if (btnSetupPasskey) {
+            btnSetupPasskey.addEventListener('click', async () => {
+                const token = localStorage.getItem('dill_session_token');
+                btnSetupPasskey.disabled = true;
+                try {
+                    let res = await fetch('/api/passkey/register_start', {
+                        method: 'POST',
+                        headers: {'Authorization': `Bearer ${token}`}
+                    });
+                    if (!res.ok) throw new Error(await res.text());
+                    const ccr = await res.json();
+                    
+                    const preformatMakeCredReq = (obj) => {
+                        const result = {...obj};
+                        if (result.challenge) result.challenge = base64urlToBuffer(result.challenge);
+                        if (result.user && result.user.id) result.user.id = base64urlToBuffer(result.user.id);
+                        if (result.excludeCredentials) {
+                            result.excludeCredentials = result.excludeCredentials.map(c => ({...c, id: base64urlToBuffer(c.id)}));
+                        }
+                        return result;
+                    };
+                    
+                    const publicKeyCredentialCreationOptions = preformatMakeCredReq(ccr.publicKey);
+                    const credential = await navigator.credentials.create({ publicKey: publicKeyCredentialCreationOptions });
+                    
+                    const regData = {
+                        id: credential.id,
+                        rawId: bufferToBase64url(credential.rawId),
+                        type: credential.type,
+                        response: {
+                            attestationObject: bufferToBase64url(credential.response.attestationObject),
+                            clientDataJSON: bufferToBase64url(credential.response.clientDataJSON)
+                        }
+                    };
+                    
+                    let finishRes = await fetch('/api/passkey/register_finish', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'Authorization': `Bearer ${token}`
+                        },
+                        body: JSON.stringify(regData)
+                    });
+                    if (!finishRes.ok) throw new Error(await finishRes.text());
+                    showToast('Passkey setup successful!', 'success');
+                    loadUserPasskeysView();
+                } catch (e) {
+                    showToast(e.message || 'Passkey setup failed', 'error');
+                } finally {
+                    btnSetupPasskey.disabled = false;
+                }
+            });
+        }
+
         document.getElementById('btn-toggle-2fa').addEventListener('click', async () => {
             const btn = document.getElementById('btn-toggle-2fa');
             const token = localStorage.getItem('dill_session_token');
@@ -5866,7 +6156,7 @@
                 usersBody.innerHTML = '';
 
                 if (stats.length === 0) {
-                    usersBody.innerHTML = `<tr><td colspan="4" style="text-align:center; color:var(--text-muted); padding:2rem;">No user accounts found.</td></tr>`;
+                    usersBody.innerHTML = `<tr><td colspan="5" style="text-align:center; color:var(--text-muted); padding:2rem;">No user accounts found.</td></tr>`;
                     return;
                 }
 
@@ -5878,6 +6168,7 @@
                         </td>
                         <td>${u.shares.length} shares</td>
                         <td>${formatBytes(u.total_size)}</td>
+                        <td>${u.has_2fa ? '<span style="color:var(--success)">Yes</span>' : '<span style="color:var(--text-muted)">No</span>'}</td>
                         <td>
                             <div class="share-actions">
                                 <button class="action-btn toggle-shares-btn" data-username="${u.username}" style="padding: 0.35rem 0.6rem; font-size:0.75rem; font-weight:600; color:var(--primary);">
@@ -5934,7 +6225,7 @@
                     }
 
                     subRow.innerHTML = `
-                        <td colspan="4" style="background: rgba(255, 255, 255, 0.005); padding: 0.5rem 1rem 1rem 1rem;">
+                        <td colspan="5" style="background: rgba(255, 255, 255, 0.005); padding: 0.5rem 1rem 1rem 1rem;">
                             <div style="border-left: 2px solid var(--primary); padding-left: 1rem;">
                                 <h4 style="font-size:0.8rem; margin-bottom:0.25rem;">Active Shares for ${u.username}</h4>
                                 ${sharesListHTML}
@@ -5948,7 +6239,7 @@
                     sessionsSubRow.id = `sessions-subrow-${u.username}`;
                     sessionsSubRow.style.display = 'none';
                     sessionsSubRow.innerHTML = `
-                        <td colspan="4" style="background: rgba(255, 255, 255, 0.005); padding: 0.5rem 1rem 1rem 1rem;">
+                        <td colspan="5" style="background: rgba(255, 255, 255, 0.005); padding: 0.5rem 1rem 1rem 1rem;">
                             <div style="border-left: 2px solid var(--primary); padding-left: 1rem;">
                                 <h4 style="font-size:0.8rem; margin-bottom:0.25rem;">Active Sessions for ${u.username}</h4>
                                 <div id="admin-sessions-container-${u.username}">
@@ -6164,10 +6455,11 @@
                 });
 
             } catch (err) {
+                console.error('Error loading admin stats:', err);
                 if (adminLoading) adminLoading.style.display = 'none';
                 dashboard.style.display = 'block';
                 showToast(err.message, 'error');
-                usersBody.innerHTML = `<tr><td colspan="4" style="text-align:center; color:var(--danger); padding:2rem;">Error: ${err.message}</td></tr>`;
+                usersBody.innerHTML = `<tr><td colspan="5" style="text-align:center; color:var(--danger); padding:2rem;">Error: ${err.message}</td></tr>`;
             }
         }
 
@@ -6363,6 +6655,112 @@
             else if (ua.indexOf('Opera') !== -1 || ua.indexOf('OPR') !== -1) browser = 'Opera';
 
             return `${browser} on ${os}`;
+        }
+
+        // Fetch and display active user passkeys
+        async function loadUserPasskeysView() {
+            const token = localStorage.getItem('dill_session_token');
+            const passkeysListContainer = document.getElementById('passkeys-list-container');
+            if (!token || !passkeysListContainer) return;
+
+            passkeysListContainer.innerHTML = `
+                <div style="text-align:center; padding: 1rem 0;">
+                    <div class="loader" style="margin:1rem auto;"></div>
+                    <span style="font-size:0.85rem; color:var(--text-muted);">Loading passkeys...</span>
+                </div>
+            `;
+
+            try {
+                const res = await fetch('/api/user/passkeys', {
+                    headers: { 'Authorization': `Bearer ${token}` }
+                });
+
+                if (!res.ok) {
+                    throw new Error(await res.text());
+                }
+
+                const passkeys = await res.json();
+                passkeysListContainer.innerHTML = '';
+
+                if (passkeys.length === 0) {
+                    passkeysListContainer.innerHTML = `
+                        <div style="text-align:center; color:var(--text-muted); padding:1rem 0; font-size: 0.85rem;">
+                            No passkeys set up.
+                        </div>
+                    `;
+                    return;
+                }
+
+                passkeys.forEach((pk, index) => {
+                    const row = document.createElement('div');
+                    row.style.display = 'flex';
+                    row.style.alignItems = 'center';
+                    row.style.justifyContent = 'space-between';
+                    row.style.background = 'rgba(0,0,0,0.1)';
+                    row.style.padding = '0.75rem 1rem';
+                    row.style.borderRadius = '6px';
+                    row.style.border = '1px solid var(--surface-border)';
+                    
+                    const name = pk.name || `Passkey ${index + 1}`;
+                    
+                    row.innerHTML = `
+                        <div style="display:flex; flex-direction:column; gap:0.2rem;">
+                            <span style="font-weight:600; font-size: 0.9rem; color:var(--text-main);">${escapeHtml(name)}</span>
+                            <span style="font-size:0.75rem; color:var(--text-muted); font-family: monospace;">ID: ${pk.id.substring(0, 16)}...</span>
+                        </div>
+                        <div style="display:flex; gap:0.5rem;">
+                            <button class="btn btn-secondary btn-rename" style="padding: 0.3rem 0.6rem; font-size: 0.75rem;" data-id="${pk.id}">Rename</button>
+                            <button class="btn btn-danger btn-delete" style="padding: 0.3rem 0.6rem; font-size: 0.75rem;" data-id="${pk.id}">Delete</button>
+                        </div>
+                    `;
+                    
+                    const renameBtn = row.querySelector('.btn-rename');
+                    renameBtn.addEventListener('click', async () => {
+                        const newName = await customPrompt("Enter new name for this passkey:", "Rename Passkey", name);
+                        if (newName === null || newName === name) return;
+                        try {
+                            const rnRes = await fetch(`/api/user/passkeys/${pk.id}`, {
+                                method: 'PUT',
+                                headers: {
+                                    'Authorization': `Bearer ${token}`,
+                                    'Content-Type': 'application/json'
+                                },
+                                body: JSON.stringify({ name: newName })
+                            });
+                            if (!rnRes.ok) throw new Error(await rnRes.text());
+                            showToast('Passkey renamed', 'success');
+                            loadUserPasskeysView();
+                        } catch (e) {
+                            showToast('Failed to rename passkey', 'error');
+                        }
+                    });
+                    
+                    const deleteBtn = row.querySelector('.btn-delete');
+                    deleteBtn.addEventListener('click', async () => {
+                        if (!await customConfirm("Are you sure you want to delete this passkey?", "Delete Passkey", "Delete")) return;
+                        try {
+                            const delRes = await fetch(`/api/user/passkeys/${pk.id}`, {
+                                method: 'DELETE',
+                                headers: { 'Authorization': `Bearer ${token}` }
+                            });
+                            if (!delRes.ok) throw new Error(await delRes.text());
+                            showToast('Passkey deleted', 'success');
+                            loadUserPasskeysView();
+                        } catch (e) {
+                            showToast('Failed to delete passkey', 'error');
+                        }
+                    });
+                    
+                    passkeysListContainer.appendChild(row);
+                });
+
+            } catch (err) {
+                passkeysListContainer.innerHTML = `
+                    <div style="text-align:center; color:var(--error); padding:1rem 0; font-size: 0.85rem;">
+                        Failed to load passkeys: ${err.message}
+                    </div>
+                `;
+            }
         }
 
         // Fetch and display active user sessions
