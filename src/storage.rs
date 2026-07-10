@@ -20,6 +20,7 @@ pub struct GetObjectOutput {
     pub body: Body,
     pub content_type: Option<String>,
     pub content_length: Option<u64>,
+    pub content_range: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -52,11 +53,13 @@ impl Storage {
                     Ok(res) => {
                         let ct = res.content_type.clone();
                         let cl = res.content_length;
+                        let cr = res.content_range.clone();
                         let stream = tokio_util::io::ReaderStream::new(res.body.into_async_read());
                         Ok(GetObjectOutput {
                             body: Body::from_stream(stream),
                             content_type: ct,
                             content_length: cl.map(|v| v as u64),
+                            content_range: cr,
                         })
                     }
                     Err(e) => Err(e.to_string()),
@@ -67,7 +70,7 @@ impl Storage {
                 if let Some(data) = m.files.get(key) {
                     let mut start = 0;
                     let mut end = data.len();
-                    if let Some(r) = range_header {
+                    if let Some(ref r) = range_header {
                         if let Some(r_str) = r.strip_prefix("bytes=") {
                             let mut parts = r_str.split('-');
                             if let Some(s) = parts.next() {
@@ -81,10 +84,19 @@ impl Storage {
                         }
                     }
                     let slice = data[start.min(data.len())..end.min(data.len())].to_vec();
+                    let content_range = if range_header.is_some() {
+                        let actual_start = start.min(data.len());
+                        let actual_end = end.min(data.len()).saturating_sub(1);
+                        Some(format!("bytes {}-{}/{}", actual_start, actual_end, data.len()))
+                    } else {
+                        None
+                    };
+                    let slice_len = slice.len();
                     Ok(GetObjectOutput {
                         body: Body::from(slice),
                         content_type: m.content_types.get(key).cloned(),
-                        content_length: Some(data.len() as u64),
+                        content_length: Some(slice_len as u64),
+                        content_range,
                     })
                 } else {
                     Err("Not found".to_string())

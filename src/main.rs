@@ -1724,30 +1724,11 @@ async fn download_file(
 ) -> impl IntoResponse {
     let key = format!("uploads/{}/{}", uuid, filename);
 
-    // Parse a single HTTP range (start-end). Multi-range is not supported and
-    // we respond with the full body (200) in that case, which is spec-compliant.
-    let range_header = headers
+    let raw_range_header = headers
         .get(axum::http::header::RANGE)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.strip_prefix("bytes="))
-        .and_then(|spec| {
-            // Accept only a single range; ignore multiple ranges / suffix forms.
-            if spec.contains(',') {
-                return None;
-            }
-            let mut it = spec.split('-');
-            let start_str = it.next()?.trim();
-            let end_str = it.next().map(|s| s.trim()).unwrap_or("");
-            let start: u64 = start_str.parse().ok()?;
-            let end: Option<u64> = if end_str.is_empty() {
-                None
-            } else {
-                end_str.parse().ok()
-            };
-            Some((start, end))
-        });
+        .and_then(|v| v.to_str().ok().map(|s| s.to_string()));
 
-    let res = match state.storage.get_object(&state.bucket, &key, None).await {
+    let res = match state.storage.get_object(&state.bucket, &key, raw_range_header).await {
         Ok(output) => output,
         Err(e) => {
             tracing::error!("S3 GetObject error: {:?}", e);
@@ -1760,7 +1741,7 @@ async fn download_file(
 
     let body = res.body;
 
-    let status = if range_header.is_some() {
+    let status = if res.content_range.is_some() {
         StatusCode::PARTIAL_CONTENT
     } else {
         StatusCode::OK
@@ -1780,10 +1761,10 @@ async fn download_file(
         builder = builder.header(CONTENT_LENGTH, content_length);
     }
 
-    if let Some(content_range) = res.content_type.clone() {
+    if let Some(content_range) = res.content_range {
         builder = builder.header(
             axum::http::header::CONTENT_RANGE,
-            content_range.as_str().to_string(),
+            content_range,
         );
     }
 
