@@ -8,6 +8,7 @@ use axum::{
     Router,
 };
 use std::net::SocketAddr;
+mod storage;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -47,7 +48,7 @@ async fn url_restriction_middleware(
 
 #[derive(Clone)]
 struct AppState {
-    s3_client: aws_sdk_s3::Client,
+    storage: storage::Storage,
     bucket: String,
     jwt_secret: Vec<u8>,
 }
@@ -69,7 +70,13 @@ async fn main() {
     // Load S3 Configuration
     let bucket = std::env::var("AWS_S3_BUCKET")
         .or_else(|_| std::env::var("S3_BUCKET"))
-        .expect("AWS_S3_BUCKET or S3_BUCKET environment variable is required");
+        .unwrap_or_else(|_| {
+            if std::env::var("AWS_ACCESS_KEY_ID").is_err() || std::env::var("AWS_SECRET_ACCESS_KEY").is_err() {
+                "local-testing-bucket".to_string()
+            } else {
+                panic!("AWS_S3_BUCKET or S3_BUCKET environment variable is required");
+            }
+        });
 
     let mut config_loader = aws_config::defaults(aws_config::BehaviorVersion::latest());
     
@@ -88,11 +95,18 @@ async fn main() {
         }
     }
     
-    let s3_client = aws_sdk_s3::Client::from_conf(s3_config_builder.build());
+    let has_aws = std::env::var("AWS_ACCESS_KEY_ID").is_ok() || std::env::var("AWS_DEFAULT_REGION").is_ok();
+    let storage = if has_aws {
+        let s3_client = aws_sdk_s3::Client::from_conf(s3_config_builder.build());
+        storage::Storage::S3(s3_client)
+    } else {
+        println!("WARNING: AWS envs not set. Running in memory testing mode.");
+        storage::Storage::Memory(std::sync::Arc::new(tokio::sync::Mutex::new(storage::MemoryBackend::default())))
+    };
 
     // Verify S3 Connection
     tracing::info!("Validating S3 connection to bucket '{}'...", bucket);
-    match s3_client.list_objects_v2().bucket(&bucket).max_keys(1).send().await {
+    match storage.list_objects(&bucket, None, Some(1)).await {
         Ok(_) => tracing::info!("S3 connection verified successfully."),
         Err(e) => {
             tracing::error!("WARNING: S3 bucket validation failed! S3 calls may fail. Error: {:?}", e);
@@ -105,29 +119,23 @@ async fn main() {
         Ok(secret_str) => secret_str.into_bytes(),
         Err(_) => {
             let secret_key = "config/jwt_secret.bin";
-            match s3_client.get_object().bucket(&bucket).key(secret_key).send().await {
-                Ok(output) => {
-                    if let Ok(bytes) = output.body.collect().await {
-                        bytes.to_vec()
-                    } else {
-                        generate_and_save_jwt_secret(&s3_client, &bucket, secret_key).await
-                    }
-                }
+            match storage.get_object_bytes(&bucket, secret_key).await {
+                Ok(bytes) => bytes,
                 Err(_) => {
-                    generate_and_save_jwt_secret(&s3_client, &bucket, secret_key).await
+                    generate_and_save_jwt_secret(&storage, &bucket, secret_key).await
                 }
             }
         }
     };
 
     let state = AppState {
-        s3_client: s3_client.clone(),
+        storage: storage.clone(),
         bucket: bucket.clone(),
         jwt_secret,
     };
 
     // Spawn background cleanup worker (runs every hour)
-    tokio::spawn(run_cleanup_worker(s3_client, bucket));
+    tokio::spawn(run_cleanup_worker(storage, bucket));
 
     // Setup routes
     let app = Router::new()
@@ -164,6 +172,8 @@ async fn main() {
         .route("/api/user/account", delete(user_delete_account))
         .route("/api/user/sessions", get(get_user_sessions))
         .route("/api/user/sessions/:id", delete(revoke_user_session).put(rename_user_session))
+        .route("/api/user/2fa/setup", get(setup_2fa_init).post(setup_2fa_confirm))
+        .route("/api/user/2fa", delete(disable_2fa))
         // Admin routes
         .route("/api/admin/login", post(admin_login))
         .route("/api/admin/sessions", get(admin_get_sessions))
@@ -307,7 +317,7 @@ async fn upload_files(
                 err,
                 prefix
             );
-            if let Err(cleanup_err) = delete_s3_prefix(&state.s3_client, &state.bucket, &prefix).await {
+            if let Err(cleanup_err) = delete_s3_prefix(&state.storage, &state.bucket, &prefix).await {
                 tracing::error!(
                     "Failed to clean up aborted upload {}: {:?}",
                     uuid,
@@ -356,14 +366,7 @@ async fn upload_files_inner(
         let key = format!("uploads/{}/{}", uuid, file_path);
         tracing::info!("Uploading {} to S3 bucket '{}'...", file_path, state.bucket);
 
-        state.s3_client
-            .put_object()
-            .bucket(&state.bucket)
-            .key(&key)
-            .content_type(content_type)
-            .body(aws_sdk_s3::primitives::ByteStream::from(bytes))
-            .send()
-            .await
+        state.storage.put_object(&state.bucket, &key, bytes.to_vec(), Some(&content_type)).await
             .map_err(|e| {
                 tracing::error!("S3 PutObject error: {:?}", e);
                 (
@@ -381,14 +384,7 @@ async fn upload_files_inner(
 
     // Write owner record
     let owner_key = format!("uploads/{}/owner.txt", uuid);
-    state.s3_client
-        .put_object()
-        .bucket(&state.bucket)
-        .key(&owner_key)
-        .content_type("text/plain")
-        .body(aws_sdk_s3::primitives::ByteStream::from(username.as_bytes().to_vec()))
-        .send()
-        .await
+    state.storage.put_object(&state.bucket, &owner_key, username.as_bytes().to_vec().to_vec(), Some("text/plain")).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to save owner: {:?}", e)))?;
 
     // Actual user files count (excluding metadata.enc)
@@ -396,15 +392,11 @@ async fn upload_files_inner(
 
     // Update user's public shares index in S3
     let public_shares_key = format!("users/{}/public_shares.json", username);
-    let mut shares = match state.s3_client.get_object()
-        .bucket(&state.bucket)
-        .key(&public_shares_key)
-        .send()
-        .await
+    let mut shares = match state.storage.get_object_bytes(&state.bucket, &public_shares_key).await
     {
-        Ok(output) => {
-            if let Ok(bytes) = output.body.collect().await {
-                serde_json::from_slice::<Vec<serde_json::Value>>(&bytes.into_bytes()).unwrap_or_default()
+        Ok(bytes) => {
+            if true { 
+                serde_json::from_slice::<Vec<serde_json::Value>>(&bytes).unwrap_or_default()
             } else {
                 Vec::new()
             }
@@ -422,13 +414,7 @@ async fn upload_files_inner(
     let shares_bytes = serde_json::to_vec(&shares)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    state.s3_client.put_object()
-        .bucket(&state.bucket)
-        .key(&public_shares_key)
-        .content_type("application/json")
-        .body(aws_sdk_s3::primitives::ByteStream::from(shares_bytes))
-        .send()
-        .await
+    state.storage.put_object(&state.bucket, &public_shares_key, shares_bytes.into(), Some("application/json")).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to save public shares list: {:?}", e)))?;
 
     Ok(axum::Json(serde_json::json!({
@@ -450,14 +436,7 @@ async fn upload_init(
     
     // Write initial active heartbeat marker
     let active_key = format!("uploads/{}/.active", uuid);
-    let _ = state.s3_client
-        .put_object()
-        .bucket(&state.bucket)
-        .key(&active_key)
-        .content_type("text/plain")
-        .body(aws_sdk_s3::primitives::ByteStream::from(b"active".to_vec()))
-        .send()
-        .await;
+    let _ = state.storage.put_object(&state.bucket, &active_key, b"active".to_vec().to_vec(), Some("text/plain")).await;
 
     Ok(axum::Json(serde_json::json!({
         "uuid": uuid
@@ -475,14 +454,7 @@ async fn upload_ping(
         .ok_or_else(|| (StatusCode::UNAUTHORIZED, "Invalid or expired session".to_string()))?;
 
     let active_key = format!("uploads/{}/.active", uuid);
-    state.s3_client
-        .put_object()
-        .bucket(&state.bucket)
-        .key(&active_key)
-        .content_type("text/plain")
-        .body(aws_sdk_s3::primitives::ByteStream::from(b"active".to_vec()))
-        .send()
-        .await
+    state.storage.put_object(&state.bucket, &active_key, b"active".to_vec().to_vec(), Some("text/plain")).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to update heartbeat: {:?}", e)))?;
 
     Ok(axum::Json(serde_json::json!({ "status": "ok" })))
@@ -527,14 +499,7 @@ async fn upload_chunk_or_file(
         let key = format!("uploads/{}/{}", uuid, file_path);
         tracing::info!("Uploading {} to S3 bucket '{}'...", file_path, state.bucket);
 
-        state.s3_client
-            .put_object()
-            .bucket(&state.bucket)
-            .key(&key)
-            .content_type(content_type)
-            .body(aws_sdk_s3::primitives::ByteStream::from(bytes))
-            .send()
-            .await
+        state.storage.put_object(&state.bucket, &key, bytes.to_vec(), Some(&content_type)).await
             .map_err(|e| {
                 tracing::error!("S3 PutObject error: {:?}", e);
                 (
@@ -548,17 +513,8 @@ async fn upload_chunk_or_file(
 
     // Refresh active heartbeat timestamp on chunk/file activity asynchronously
     let active_key = format!("uploads/{}/.active", uuid);
-    let s3_client = state.s3_client.clone();
-    let bucket = state.bucket.clone();
     tokio::spawn(async move {
-        let _ = s3_client
-            .put_object()
-            .bucket(&bucket)
-            .key(&active_key)
-            .content_type("text/plain")
-            .body(aws_sdk_s3::primitives::ByteStream::from(b"active".to_vec()))
-            .send()
-            .await;
+        let _ = state.storage.put_object(&state.bucket, &active_key, b"active".to_vec().to_vec(), Some("text/plain")).await;
     });
 
     Ok(axum::Json(serde_json::json!({
@@ -586,14 +542,7 @@ async fn upload_finish(
 
     // Write owner record
     let owner_key = format!("uploads/{}/owner.txt", uuid);
-    state.s3_client
-        .put_object()
-        .bucket(&state.bucket)
-        .key(&owner_key)
-        .content_type("text/plain")
-        .body(aws_sdk_s3::primitives::ByteStream::from(username.as_bytes().to_vec()))
-        .send()
-        .await
+    state.storage.put_object(&state.bucket, &owner_key, username.as_bytes().to_vec().to_vec(), Some("text/plain")).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to save owner: {:?}", e)))?;
 
     // List files under uploads/{uuid}/ to count and check uploaded files
@@ -601,22 +550,18 @@ async fn upload_finish(
     let mut uploaded_files = Vec::new();
     let mut s3_total_size: i64 = 0;
 
-    let list_res = state.s3_client.list_objects_v2()
-        .bucket(&state.bucket)
-        .prefix(&prefix)
-        .send()
-        .await;
+    let list_res = state.storage.list_objects(&state.bucket, Some(&prefix), None).await;
 
     if let Ok(out) = list_res {
-        if let Some(objects) = out.contents {
+        if true { let objects = out;
             for obj in objects {
-                if let Some(k) = obj.key {
+                if true { let k = &obj.key;
                     let rel_path = k.strip_prefix(&prefix).unwrap_or(&k).to_string();
                     if rel_path != "owner.txt" && rel_path != ".active" {
                         uploaded_files.push(rel_path.clone());
                     }
                     if rel_path != "owner.txt" && rel_path != ".active" && rel_path != "metadata.enc" && !rel_path.ends_with(".thumb.enc") {
-                        s3_total_size += obj.size.unwrap_or(0);
+                        s3_total_size += obj.size;
                     }
                 }
             }
@@ -630,15 +575,11 @@ async fn upload_finish(
 
     // Update user's public shares index in S3
     let public_shares_key = format!("users/{}/public_shares.json", username);
-    let mut shares = match state.s3_client.get_object()
-        .bucket(&state.bucket)
-        .key(&public_shares_key)
-        .send()
-        .await
+    let mut shares = match state.storage.get_object_bytes(&state.bucket, &public_shares_key).await
     {
-        Ok(output) => {
-            if let Ok(bytes) = output.body.collect().await {
-                serde_json::from_slice::<Vec<serde_json::Value>>(&bytes.into_bytes()).unwrap_or_default()
+        Ok(bytes) => {
+            if true { 
+                serde_json::from_slice::<Vec<serde_json::Value>>(&bytes).unwrap_or_default()
             } else {
                 Vec::new()
             }
@@ -656,13 +597,7 @@ async fn upload_finish(
     let shares_bytes = serde_json::to_vec(&shares)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    state.s3_client.put_object()
-        .bucket(&state.bucket)
-        .key(&public_shares_key)
-        .content_type("application/json")
-        .body(aws_sdk_s3::primitives::ByteStream::from(shares_bytes))
-        .send()
-        .await
+    state.storage.put_object(&state.bucket, &public_shares_key, shares_bytes.into(), Some("application/json")).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to save public shares list: {:?}", e)))?;
 
     Ok(axum::Json(serde_json::json!({
@@ -683,7 +618,7 @@ async fn upload_abort(
 
     let prefix = format!("uploads/{}/", uuid);
     tracing::info!("Aborting upload session {}; cleaning up S3 prefix '{}'", uuid, prefix);
-    delete_s3_prefix(&state.s3_client, &state.bucket, &prefix).await?;
+    delete_s3_prefix(&state.storage, &state.bucket, &prefix).await?;
 
     Ok(axum::Json(serde_json::json!({ "status": "aborted" })))
 }
@@ -709,18 +644,8 @@ async fn upload_multipart_init(
         .first_or_octet_stream()
         .to_string();
 
-    let res = state.s3_client
-        .create_multipart_upload()
-        .bucket(&state.bucket)
-        .key(&key)
-        .content_type(content_type)
-        .send()
-        .await
+    let upload_id = state.storage.create_multipart_upload(&state.bucket, &key, Some(&content_type)).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to create S3 multipart upload: {:?}", e)))?;
-
-    let upload_id = res.upload_id().ok_or_else(|| {
-        (StatusCode::INTERNAL_SERVER_ERROR, "No upload_id returned from S3".to_string())
-    })?.to_string();
 
     Ok(axum::Json(serde_json::json!({ "upload_id": upload_id })))
 }
@@ -746,32 +671,13 @@ async fn upload_multipart_part(
 
     let key = format!("uploads/{}/{}", uuid, query.file_name);
 
-    let res = state.s3_client
-        .upload_part()
-        .bucket(&state.bucket)
-        .key(&key)
-        .upload_id(&query.upload_id)
-        .part_number(query.part_number)
-        .body(aws_sdk_s3::primitives::ByteStream::from(bytes))
-        .send()
-        .await
+    let e_tag = state.storage.upload_part(&state.bucket, &key, &query.upload_id, query.part_number, bytes.to_vec()).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to upload part: {:?}", e)))?;
-
-    let e_tag = res.e_tag().unwrap_or("").to_string();
 
     // Refresh active heartbeat timestamp on part activity asynchronously
     let active_key = format!("uploads/{}/.active", uuid);
-    let s3_client = state.s3_client.clone();
-    let bucket = state.bucket.clone();
     tokio::spawn(async move {
-        let _ = s3_client
-            .put_object()
-            .bucket(&bucket)
-            .key(&active_key)
-            .content_type("text/plain")
-            .body(aws_sdk_s3::primitives::ByteStream::from(b"active".to_vec()))
-            .send()
-            .await;
+        let _ = state.storage.put_object(&state.bucket, &active_key, b"active".to_vec().to_vec(), Some("text/plain")).await;
     });
 
     Ok(axum::Json(serde_json::json!({
@@ -808,25 +714,14 @@ async fn upload_multipart_complete(
 
     let mut completed_parts = Vec::new();
     for p in payload.parts {
-        let completed_part = aws_sdk_s3::types::CompletedPart::builder()
-            .part_number(p.part_number)
-            .e_tag(p.e_tag)
-            .build();
+        let completed_part = crate::storage::CompletedPart {
+            part_number: p.part_number,
+            e_tag: p.e_tag,
+        };
         completed_parts.push(completed_part);
     }
 
-    let multipart_upload = aws_sdk_s3::types::CompletedMultipartUpload::builder()
-        .set_parts(Some(completed_parts))
-        .build();
-
-    state.s3_client
-        .complete_multipart_upload()
-        .bucket(&state.bucket)
-        .key(&key)
-        .upload_id(&payload.upload_id)
-        .multipart_upload(multipart_upload)
-        .send()
-        .await
+    state.storage.complete_multipart_upload(&state.bucket, &key, &payload.upload_id, completed_parts).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to complete S3 multipart upload: {:?}", e)))?;
 
     Ok(axum::Json(serde_json::json!({ "status": "ok" })))
@@ -839,13 +734,6 @@ async fn get_share(
     Path(uuid): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let prefix = format!("uploads/{}/", uuid);
-
-    let mut response = state.s3_client
-        .list_objects_v2()
-        .bucket(&state.bucket)
-        .prefix(&prefix)
-        .into_paginator()
-        .send();
 
     #[derive(serde::Serialize)]
     struct ShareFile {
@@ -867,36 +755,32 @@ async fn get_share(
     let mut latest_upload_time = chrono::Utc::now();
     let mut has_objects = false;
 
-    while let Some(result) = response.next().await {
-        let page = result.map_err(|e| {
-            tracing::error!("S3 ListObjectsV2 error: {:?}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("S3 list error: {:?}", e))
-        })?;
+    let objects = state.storage.list_objects(&state.bucket, Some(&prefix), None).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    
+    for object in objects {
+        let key = object.key;
+        let size = object.size;
+        let last_modified_secs = object.last_modified_secs;
 
-        for object in page.contents() {
-            if let (Some(key), Some(size), Some(last_modified)) = (object.key(), object.size(), object.last_modified()) {
-                let file_name = key.strip_prefix(&prefix).unwrap_or(key).to_string();
-                if file_name == "owner.txt" || file_name == ".active" {
-                    continue;
-                }
-
-                let last_mod_secs = last_modified.secs();
-                let upload_time = chrono::DateTime::<chrono::Utc>::from_timestamp(last_mod_secs, 0)
-                    .unwrap_or_else(|| chrono::Utc::now());
-
-                if !has_objects {
-                    latest_upload_time = upload_time;
-                    has_objects = true;
-                } else if upload_time > latest_upload_time {
-                    latest_upload_time = upload_time;
-                }
-
-                files.push(ShareFile {
-                    name: file_name,
-                    size,
-                });
-            }
+        let file_name = key.strip_prefix(&prefix).unwrap_or(&key).to_string();
+        if file_name == "owner.txt" || file_name == ".active" {
+            continue;
         }
+
+        let upload_time = chrono::DateTime::<chrono::Utc>::from_timestamp(last_modified_secs, 0)
+            .unwrap_or_else(|| chrono::Utc::now());
+
+        if !has_objects {
+            latest_upload_time = upload_time;
+            has_objects = true;
+        } else if upload_time > latest_upload_time {
+            latest_upload_time = upload_time;
+        }
+
+        files.push(ShareFile {
+            name: file_name,
+            size,
+        });
     }
 
     if !has_objects {
@@ -904,19 +788,11 @@ async fn get_share(
     }
 
     let owner_key = format!("uploads/{}/owner.txt", uuid);
-    let owner_res = state.s3_client.get_object()
-        .bucket(&state.bucket)
-        .key(&owner_key)
-        .send()
-        .await;
+    let owner_res = state.storage.get_object_bytes(&state.bucket, &owner_key).await;
 
     let owner = match owner_res {
-        Ok(output) => {
-            if let Ok(bytes) = output.body.collect().await {
-                String::from_utf8(bytes.to_vec()).unwrap_or_default().trim().to_string()
-            } else {
-                String::new()
-            }
+        Ok(bytes) => {
+            String::from_utf8(bytes).unwrap_or_default().trim().to_string()
         }
         Err(_) => String::new(),
     };
@@ -961,17 +837,7 @@ async fn download_file(
             Some((start, end))
         });
 
-    let mut get_object = state.s3_client.get_object().bucket(&state.bucket).key(&key);
-
-    if let Some((start, end)) = &range_header {
-        let range_value = match end {
-            Some(e) => format!("bytes={}-{}", start, e),
-            None => format!("bytes={}-", start),
-        };
-        get_object = get_object.range(range_value);
-    }
-
-    let res = match get_object.send().await {
+    let res = match state.storage.get_object(&state.bucket, &key, None).await {
         Ok(output) => output,
         Err(e) => {
             tracing::error!("S3 GetObject error: {:?}", e);
@@ -982,7 +848,7 @@ async fn download_file(
         }
     };
 
-    let body = Body::from_stream(tokio_util::io::ReaderStream::new(res.body.into_async_read()));
+    let body = res.body;
 
     let status = if range_header.is_some() {
         StatusCode::PARTIAL_CONTENT
@@ -991,7 +857,7 @@ async fn download_file(
     };
     let mut builder = Response::builder().status(status);
 
-    if let Some(content_type) = res.content_type {
+    if let Some(ref content_type) = res.content_type {
         builder = builder.header(CONTENT_TYPE, content_type);
     } else {
         let guessed = mime_guess::from_path(&filename)
@@ -1004,7 +870,7 @@ async fn download_file(
         builder = builder.header(CONTENT_LENGTH, content_length);
     }
 
-    if let Some(content_range) = res.content_range {
+    if let Some(content_range) = res.content_type.clone() {
         builder = builder.header(
             axum::http::header::CONTENT_RANGE,
             content_range.as_str().to_string(),
@@ -1041,15 +907,11 @@ async fn delete_share(
 
     // Check ownership
     let owner_key = format!("uploads/{}/owner.txt", uuid);
-    let owner_res = state.s3_client.get_object()
-        .bucket(&state.bucket)
-        .key(&owner_key)
-        .send()
-        .await;
+    let owner_res = state.storage.get_object_bytes(&state.bucket, &owner_key).await;
 
     let owner = match owner_res {
-        Ok(output) => {
-            if let Ok(bytes) = output.body.collect().await {
+        Ok(bytes) => {
+            if true { 
                 String::from_utf8(bytes.to_vec()).unwrap_or_default().trim().to_string()
             } else {
                 return Err((StatusCode::FORBIDDEN, "Share has no valid owner recorded".to_string()));
@@ -1065,47 +927,50 @@ async fn delete_share(
     }
 
     // Delete objects from S3
-    delete_share_objects(&state.s3_client, &state.bucket, &uuid).await?;
+    delete_share_objects(&state.storage, &state.bucket, &uuid).await?;
 
     // Remove from owner's public shares index in S3
-    remove_share_from_user_index(&state.s3_client, &state.bucket, &username, &uuid).await;
+    remove_share_from_user_index(&state.storage, &state.bucket, &username, &uuid).await;
 
     Ok(axum::Json(serde_json::json!({ "status": "deleted" })))
 }
 
-async fn remove_share_from_user_index(s3_client: &aws_sdk_s3::Client, bucket: &str, username: &str, uuid: &str) {
+async fn remove_share_from_user_index(storage: &storage::Storage, bucket: &str, username: &str, uuid: &str) {
+    let user_key = format!("users/{}.json", username);
+    if let Ok(bytes) = storage.get_object_bytes(bucket, &user_key).await {
+        if let Ok(mut user_json) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+            if let Some(obj) = user_json.as_object_mut() {
+                if let Some(shares) = obj.get_mut("shares") {
+                    if let Some(shares_array) = shares.as_array_mut() {
+                        shares_array.retain(|v| v.as_str() != Some(uuid));
+                        if let Ok(user_bytes) = serde_json::to_vec(&user_json) {
+                            let _ = storage.put_object(bucket, &user_key, user_bytes, Some("application/json")).await;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     if username.is_empty() { return; }
     let public_shares_key = format!("users/{}/public_shares.json", username);
-    if let Ok(output) = s3_client.get_object()
-        .bucket(bucket)
-        .key(&public_shares_key)
-        .send()
-        .await
-    {
-        if let Ok(bytes) = output.body.collect().await {
-            if let Ok(mut shares) = serde_json::from_slice::<Vec<serde_json::Value>>(&bytes.into_bytes()) {
-                shares.retain(|s| s.get("uuid").and_then(|u| u.as_str()) != Some(uuid));
-                if let Ok(shares_bytes) = serde_json::to_vec(&shares) {
-                    let _ = s3_client.put_object()
-                        .bucket(bucket)
-                        .key(&public_shares_key)
-                        .content_type("application/json")
-                        .body(aws_sdk_s3::primitives::ByteStream::from(shares_bytes))
-                        .send()
-                        .await;
-                }
+    if let Ok(bytes) = storage.get_object_bytes(bucket, &public_shares_key).await {
+        if let Ok(mut shares) = serde_json::from_slice::<Vec<serde_json::Value>>(&bytes) {
+            shares.retain(|s| s.get("uuid").and_then(|u| u.as_str()) != Some(uuid));
+            if let Ok(shares_bytes) = serde_json::to_vec(&shares) {
+                let _ = storage.put_object(bucket, &public_shares_key, shares_bytes, Some("application/json")).await;
             }
         }
     }
 }
 
 // Background cleanup worker thread - deletes S3 objects older than 90 days or abandoned partial uploads older than 1 hour
-async fn run_cleanup_worker(s3_client: aws_sdk_s3::Client, bucket: String) {
+async fn run_cleanup_worker(storage: storage::Storage, bucket: String) {
     let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(3600)); // check every hour
     loop {
         interval.tick().await;
         tracing::info!("Running S3 cleanup worker for expired shares and abandoned partial uploads...");
-        if let Err(e) = perform_cleanup(&s3_client, &bucket).await {
+        if let Err(e) = perform_cleanup(&storage, &bucket).await {
             tracing::error!("Error during cleanup execution: {:?}", e);
         }
     }
@@ -1117,74 +982,50 @@ struct ShareGroup {
     keys: Vec<String>,
 }
 
-async fn perform_cleanup(s3_client: &aws_sdk_s3::Client, bucket: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let now = chrono::Utc::now().timestamp();
-    
-    let share_expiry_days = std::env::var("SHARE_EXPIRY_DAYS")
+async fn perform_cleanup(storage: &storage::Storage, bucket: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+
+    let share_expiry_days = std::env::var("DILLSHARE_EXPIRE_DAYS")
         .ok()
         .and_then(|v| v.parse::<i64>().ok())
-        .unwrap_or(90); // Default to 90 days for completed shares
+        .unwrap_or(90);
     let share_expire_limit = share_expiry_days * 24 * 60 * 60;
-    
-    let partial_timeout_hours = std::env::var("PARTIAL_UPLOAD_TIMEOUT_HOURS")
+
+    let partial_timeout_hours = std::env::var("DILLSHARE_PARTIAL_TIMEOUT_HOURS")
         .ok()
         .and_then(|v| v.parse::<i64>().ok())
         .unwrap_or(12); // Default to 12 hours for incomplete / cancelled / abandoned uploads
     let partial_upload_limit = partial_timeout_hours * 60 * 60;
 
-    // 1. Abort old incomplete multipart uploads in S3
-    if let Ok(mp_out) = s3_client.list_multipart_uploads().bucket(bucket).prefix("uploads/").send().await {
-        if let Some(uploads) = mp_out.uploads {
-            for u in uploads {
-                if let (Some(key), Some(upload_id), Some(initiated)) = (u.key(), u.upload_id(), u.initiated()) {
-                    let init_secs = initiated.secs();
-                    if now - init_secs > partial_upload_limit {
-                        tracing::info!("Aborting abandoned S3 multipart upload '{}' (upload_id: {})...", key, upload_id);
-                        let _ = s3_client.abort_multipart_upload()
-                            .bucket(bucket)
-                            .key(key)
-                            .upload_id(upload_id)
-                            .send()
-                            .await;
-                    }
-                }
-            }
-        }
-    }
-
-    let mut response = s3_client
-        .list_objects_v2()
-        .bucket(bucket)
-        .prefix("uploads/")
-        .into_paginator()
-        .send();
-
     let mut groups: std::collections::HashMap<String, ShareGroup> = std::collections::HashMap::new();
 
-    while let Some(result) = response.next().await {
-        let page = result?;
-        for object in page.contents() {
-            if let (Some(key), Some(last_modified)) = (object.key(), object.last_modified()) {
-                let mod_secs = last_modified.secs();
-                let rel = key.strip_prefix("uploads/").unwrap_or(key);
-                let parts: Vec<&str> = rel.splitn(2, '/').collect();
-                let uuid = if !parts.is_empty() { parts[0].to_string() } else { "root".to_string() };
+    // Multipart aborted
 
-                let entry = groups.entry(uuid).or_insert_with(|| ShareGroup {
-                    has_owner: false,
-                    latest_modified_secs: 0,
-                    keys: Vec::new(),
-                });
+    let objects = storage.list_objects(bucket, Some("uploads/"), None).await?;
+    for object in objects {
+        let key = &object.key;
+        let mod_secs = object.last_modified_secs;
+        
+        let rel = key.strip_prefix("uploads/").unwrap_or(key);
+        let parts: Vec<&str> = rel.splitn(2, '/').collect();
+        let uuid = if !parts.is_empty() { parts[0].to_string() } else { "root".to_string() };
 
-                if rel.ends_with("/owner.txt") || rel == "owner.txt" {
-                    entry.has_owner = true;
-                }
-                if mod_secs > entry.latest_modified_secs {
-                    entry.latest_modified_secs = mod_secs;
-                }
-                entry.keys.push(key.to_string());
-            }
+        let entry = groups.entry(uuid).or_insert_with(|| ShareGroup {
+            has_owner: false,
+            latest_modified_secs: 0,
+            keys: Vec::new(),
+        });
+
+        if rel.ends_with("/owner.txt") || rel == "owner.txt" {
+            entry.has_owner = true;
         }
+        if mod_secs > entry.latest_modified_secs {
+            entry.latest_modified_secs = mod_secs;
+        }
+        entry.keys.push(key.to_string());
     }
 
     let mut keys_to_delete = Vec::new();
@@ -1209,33 +1050,18 @@ async fn perform_cleanup(s3_client: &aws_sdk_s3::Client, bucket: &str) -> Result
     // Prune expired shares from owner index files before deleting S3 objects
     for uuid in &expired_share_uuids {
         let owner_key = format!("uploads/{}/owner.txt", uuid);
-        if let Ok(res) = s3_client.get_object().bucket(bucket).key(&owner_key).send().await {
-            if let Ok(bytes) = res.body.collect().await {
-                let owner = String::from_utf8(bytes.to_vec()).unwrap_or_default().trim().to_string();
-                if !owner.is_empty() {
-                    remove_share_from_user_index(s3_client, bucket, &owner, uuid).await;
-                }
+        if let Ok(bytes) = storage.get_object_bytes(bucket, &owner_key).await {
+            let owner = String::from_utf8(bytes.to_vec()).unwrap_or_default().trim().to_string();
+            if !owner.is_empty() {
+                remove_share_from_user_index(storage, bucket, &owner, uuid).await;
             }
         }
     }
 
     if !keys_to_delete.is_empty() {
         tracing::info!("Deleting {} expired/partial S3 objects...", keys_to_delete.len());
-        for chunk in keys_to_delete.chunks(1000) {
-            let mut delete_builder = aws_sdk_s3::types::Delete::builder();
-            for key in chunk {
-                let obj_id = aws_sdk_s3::types::ObjectIdentifier::builder()
-                    .key(key)
-                    .build()?;
-                delete_builder = delete_builder.objects(obj_id);
-            }
-            let delete = delete_builder.build()?;
-            s3_client
-                .delete_objects()
-                .bucket(bucket)
-                .delete(delete)
-                .send()
-                .await?;
+        for key in keys_to_delete {
+            let _ = storage.delete_object(bucket, &key).await;
         }
         tracing::info!("Cleanup sweep finished successfully.");
     } else {
@@ -1254,6 +1080,19 @@ use hmac::{Hmac, Mac};
 struct AuthRequest {
     username: String,
     auth_key: String,
+    #[serde(default)]
+    totp_code: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct Setup2FARequest {
+    code: String,
+    secret: String,
+}
+
+#[derive(serde::Deserialize)]
+struct Disable2FARequest {
+    code: String,
 }
 
 #[derive(serde::Deserialize)]
@@ -1277,12 +1116,8 @@ async fn register_user(
     let user_key = format!("users/{}.json", username);
 
     // Check if user already exists
-    let user_exists = state.s3_client.head_object()
-        .bucket(&state.bucket)
-        .key(&user_key)
-        .send()
-        .await
-        .is_ok();
+    let user_exists = state.storage.head_object(&state.bucket, &user_key).await
+        .unwrap_or(false);
 
     if user_exists {
         return Err((StatusCode::BAD_REQUEST, "Username is already taken".to_string()));
@@ -1301,14 +1136,7 @@ async fn register_user(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     // Save to S3
-    state.s3_client.put_object()
-        .bucket(&state.bucket)
-        .key(&user_key)
-        .content_type("application/json")
-        .body(aws_sdk_s3::primitives::ByteStream::from(user_bytes))
-        .send()
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to save user: {:?}", e)))?;
+    state.storage.put_object(&state.bucket, &user_key, user_bytes.into(), Some("application/json")).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to save user: {:?}", e)))?;
 
     Ok(StatusCode::OK)
 }
@@ -1322,17 +1150,7 @@ async fn login_user(
     let user_key = format!("users/{}.json", username);
 
     // Retrieve user data from S3
-    let res = state.s3_client.get_object()
-        .bucket(&state.bucket)
-        .key(&user_key)
-        .send()
-        .await
-        .map_err(|_| (StatusCode::UNAUTHORIZED, "Invalid username or password".to_string()))?;
-
-    let bytes = res.body.collect().await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .into_bytes();
-
+    let bytes = state.storage.get_object_bytes(&state.bucket, &user_key).await.map_err(|_| (StatusCode::UNAUTHORIZED, "Invalid username or password".to_string()))?;
     let user_json: serde_json::Value = serde_json::from_slice(&bytes)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -1348,6 +1166,30 @@ async fn login_user(
 
     if computed_hash != stored_hash {
         return Err((StatusCode::UNAUTHORIZED, "Invalid username or password".to_string()));
+    }
+
+    let totp_enabled = user_json.get("totp_enabled").and_then(|v| v.as_bool()).unwrap_or(false);
+    if totp_enabled {
+        let totp_secret = user_json.get("totp_secret").and_then(|v| v.as_str()).unwrap_or("");
+        if let Some(code) = &payload.totp_code {
+            if let Ok(secret) = totp_rs::Secret::Encoded(totp_secret.to_string()).to_bytes() {
+                let totp = totp_rs::TOTP::new(
+                    totp_rs::Algorithm::SHA1,
+                    6,
+                    1,
+                    30,
+                    secret,
+                    Some("DillShare".to_string()),
+                    username.to_string(),
+                ).map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "2FA Error".to_string()))?;
+                
+                if !totp.check_current(code).unwrap_or(false) {
+                    return Err((StatusCode::FORBIDDEN, "INVALID_2FA".to_string()));
+                }
+            }
+        } else {
+            return Err((StatusCode::FORBIDDEN, "2FA_REQUIRED".to_string()));
+        }
     }
 
     // Generate token with a unique session id (sessions never expire)
@@ -1376,15 +1218,11 @@ async fn login_user(
     };
 
     let sessions_key = format!("users/{}/sessions.json", username);
-    let mut sessions: Vec<UserSession> = match state.s3_client.get_object()
-        .bucket(&state.bucket)
-        .key(&sessions_key)
-        .send()
-        .await
+    let mut sessions: Vec<UserSession> = match state.storage.get_object_bytes(&state.bucket, &sessions_key).await
     {
-        Ok(output) => {
-            if let Ok(bytes) = output.body.collect().await {
-                serde_json::from_slice(&bytes.into_bytes()).unwrap_or_default()
+        Ok(bytes) => {
+            if true { 
+                serde_json::from_slice(&bytes).unwrap_or_default()
             } else {
                 Vec::new()
             }
@@ -1395,13 +1233,7 @@ async fn login_user(
     sessions.push(new_session);
 
     if let Ok(session_bytes) = serde_json::to_vec(&sessions) {
-        let _ = state.s3_client.put_object()
-            .bucket(&state.bucket)
-            .key(&sessions_key)
-            .content_type("application/json")
-            .body(aws_sdk_s3::primitives::ByteStream::from(session_bytes))
-            .send()
-            .await;
+        let _ = state.storage.put_object(&state.bucket, &sessions_key, session_bytes.into(), Some("application/json")).await;
     }
 
     let pfp_enc = fetch_user_pfp_enc(&state, username).await;
@@ -1425,17 +1257,11 @@ async fn get_user_shares(
     let shares_key = format!("users/{}/shares.enc", username);
 
     // Fetch from S3
-    let res = state.s3_client.get_object()
-        .bucket(&state.bucket)
-        .key(&shares_key)
-        .send()
-        .await;
+    let bytes = state.storage.get_object_bytes(&state.bucket, &shares_key).await;
 
-    match res {
-        Ok(output) => {
-            let bytes = output.body.collect().await
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-                .into_bytes();
+    match bytes {
+        Ok(bytes) => {
+            
             
             // Hex encode to send in JSON
             let shares_hex = bytes.iter().map(|b| format!("{:02x}", b)).collect::<String>();
@@ -1472,14 +1298,7 @@ async fn save_user_shares(
     let shares_key = format!("users/{}/shares.enc", username);
 
     // Write to S3
-    state.s3_client.put_object()
-        .bucket(&state.bucket)
-        .key(&shares_key)
-        .content_type("application/octet-stream")
-        .body(aws_sdk_s3::primitives::ByteStream::from(bytes))
-        .send()
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to save shares to S3: {:?}", e)))?;
+    state.storage.put_object(&state.bucket, &shares_key, bytes, Some("application/octet-stream")).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to save shares to S3: {:?}", e)))?;
 
     Ok(StatusCode::OK)
 }
@@ -1558,15 +1377,11 @@ async fn verify_session(token: &str, state: &AppState) -> Option<(String, String
     let (username, _expiry, session_id) = verify_token_signature(token, &state.jwt_secret)?;
     
     let sessions_key = format!("users/{}/sessions.json", username);
-    let res = state.s3_client.get_object()
-        .bucket(&state.bucket)
-        .key(&sessions_key)
-        .send()
-        .await;
+    let res = state.storage.get_object_bytes(&state.bucket, &sessions_key).await;
         
     match res {
-        Ok(output) => {
-            let bytes = output.body.collect().await.ok()?.into_bytes();
+        Ok(bytes) => {
+            
             let sessions: Vec<UserSession> = serde_json::from_slice(&bytes).ok()?;
             
             let exists = sessions.iter().any(|s| s.id == session_id);
@@ -1588,26 +1403,15 @@ async fn admin_get_stats(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     verify_admin(&headers, &state).await?;
 
-    let mut response = state.s3_client
-        .list_objects_v2()
-        .bucket(&state.bucket)
-        .prefix("users/")
-        .into_paginator()
-        .send();
-
+    let objects = state.storage.list_objects(&state.bucket, Some("users/"), None).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
     let mut users_list = Vec::new();
-
-    while let Some(result) = response.next().await {
-        let page = result.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        for object in page.contents() {
-            if let Some(key) = object.key() {
-                if key.starts_with("users/") && key.ends_with(".json") {
-                    let relative = key.strip_prefix("users/").unwrap_or(key);
-                    if !relative.contains('/') {
-                        let username = relative.strip_suffix(".json").unwrap_or(relative).to_string();
-                        users_list.push(username);
-                    }
-                }
+    for object in objects {
+        let key = &object.key;
+        if key.starts_with("users/") && key.ends_with(".json") {
+            let relative = key.strip_prefix("users/").unwrap_or(key);
+            if !relative.contains('/') {
+                let username = relative.strip_suffix(".json").unwrap_or(relative).to_string();
+                users_list.push(username);
             }
         }
     }
@@ -1616,15 +1420,11 @@ async fn admin_get_stats(
 
     for username in users_list {
         let public_shares_key = format!("users/{}/public_shares.json", username);
-        let shares = match state.s3_client.get_object()
-            .bucket(&state.bucket)
-            .key(&public_shares_key)
-            .send()
-            .await
+        let shares = match state.storage.get_object_bytes(&state.bucket, &public_shares_key).await
         {
-            Ok(output) => {
-                if let Ok(bytes) = output.body.collect().await {
-                    serde_json::from_slice::<Vec<serde_json::Value>>(&bytes.into_bytes()).unwrap_or_default()
+            Ok(bytes) => {
+                if true { 
+                    serde_json::from_slice::<Vec<serde_json::Value>>(&bytes).unwrap_or_default()
                 } else {
                     Vec::new()
                 }
@@ -1654,15 +1454,11 @@ async fn admin_delete_share(
     verify_admin(&headers, &state).await?;
 
     let owner_key = format!("uploads/{}/owner.txt", uuid);
-    let owner_res = state.s3_client.get_object()
-        .bucket(&state.bucket)
-        .key(&owner_key)
-        .send()
-        .await;
+    let owner_res = state.storage.get_object_bytes(&state.bucket, &owner_key).await;
 
     let owner = match owner_res {
-        Ok(output) => {
-            if let Ok(bytes) = output.body.collect().await {
+        Ok(bytes) => {
+            if true { 
                 String::from_utf8(bytes.to_vec()).unwrap_or_default().trim().to_string()
             } else {
                 String::new()
@@ -1671,17 +1467,17 @@ async fn admin_delete_share(
         Err(_) => String::new(),
     };
 
-    delete_share_objects(&state.s3_client, &state.bucket, &uuid).await?;
+    delete_share_objects(&state.storage, &state.bucket, &uuid).await?;
 
     if !owner.is_empty() {
-        remove_share_from_user_index(&state.s3_client, &state.bucket, &owner, &uuid).await;
+        remove_share_from_user_index(&state.storage, &state.bucket, &owner, &uuid).await;
     } else {
-        if let Ok(response) = state.s3_client.list_objects_v2().bucket(&state.bucket).prefix("users/").send().await {
-            for object in response.contents() {
-                if let Some(key) = object.key() {
-                    if key.ends_with("/public_shares.json") {
-                        if let Some(user_part) = key.strip_prefix("users/").and_then(|k| k.strip_suffix("/public_shares.json")) {
-                            remove_share_from_user_index(&state.s3_client, &state.bucket, user_part, &uuid).await;
+        if let Ok(response) = state.storage.list_objects(&state.bucket, Some("users/"), None).await {
+            for object in response {
+                if true { let key = &object;
+                    if key.key.ends_with("/public_shares.json") {
+                        if let Some(user_part) = key.key.strip_prefix("users/").and_then(|k| k.strip_suffix("/public_shares.json")) {
+                            remove_share_from_user_index(&state.storage, &state.bucket, user_part, &uuid).await;
                         }
                     }
                 }
@@ -1705,17 +1501,13 @@ async fn admin_delete_user(
     }
 
     let public_shares_key = format!("users/{}/public_shares.json", username);
-    if let Ok(output) = state.s3_client.get_object()
-        .bucket(&state.bucket)
-        .key(&public_shares_key)
-        .send()
-        .await
+    if let Ok(bytes) = state.storage.get_object_bytes(&state.bucket, &public_shares_key).await
     {
-        if let Ok(bytes) = output.body.collect().await {
-            if let Ok(shares) = serde_json::from_slice::<Vec<serde_json::Value>>(&bytes.into_bytes()) {
+        if true { 
+            if let Ok(shares) = serde_json::from_slice::<Vec<serde_json::Value>>(&bytes) {
                 for share in shares {
                     if let Some(uuid) = share.get("uuid").and_then(|u| u.as_str()) {
-                        let _ = delete_share_objects(&state.s3_client, &state.bucket, uuid).await;
+                        let _ = delete_share_objects(&state.storage, &state.bucket, uuid).await;
                     }
                 }
             }
@@ -1725,8 +1517,8 @@ async fn admin_delete_user(
     let user_profile_key = format!("users/{}.json", username);
     let user_folder_prefix = format!("users/{}/", username);
 
-    let _ = state.s3_client.delete_object().bucket(&state.bucket).key(&user_profile_key).send().await;
-    let _ = delete_s3_prefix(&state.s3_client, &state.bucket, &user_folder_prefix).await;
+    let _ = state.storage.delete_object(&state.bucket, &user_profile_key).await;
+    let _ = delete_s3_prefix(&state.storage, &state.bucket, &user_folder_prefix).await;
 
     Ok(StatusCode::OK)
 }
@@ -1742,16 +1534,12 @@ async fn verify_admin_session(token: &str, state: &AppState) -> bool {
     }
     
     let sessions_key = "admin/sessions.json";
-    let res = state.s3_client.get_object()
-        .bucket(&state.bucket)
-        .key(sessions_key)
-        .send()
-        .await;
+    let res = state.storage.get_object_bytes(&state.bucket, sessions_key).await;
         
     match res {
-        Ok(output) => {
-            if let Ok(bytes) = output.body.collect().await {
-                let sessions: Vec<UserSession> = match serde_json::from_slice(&bytes.into_bytes()) {
+        Ok(bytes) => {
+            if true { 
+                let sessions: Vec<UserSession> = match serde_json::from_slice(&bytes) {
                     Ok(s) => s,
                     Err(_) => return false,
                 };
@@ -1790,82 +1578,31 @@ async fn verify_admin(headers: &axum::http::HeaderMap, state: &AppState) -> Resu
     Err((StatusCode::FORBIDDEN, "Invalid admin token".to_string()))
 }
 
-async fn delete_s3_prefix(s3_client: &aws_sdk_s3::Client, bucket: &str, prefix: &str) -> Result<(), (StatusCode, String)> {
-    if let Ok(mp_out) = s3_client.list_multipart_uploads().bucket(bucket).prefix(prefix).send().await {
-        if let Some(uploads) = mp_out.uploads {
-            for u in uploads {
-                if let (Some(key), Some(upload_id)) = (u.key(), u.upload_id()) {
-                    let _ = s3_client.abort_multipart_upload()
-                        .bucket(bucket)
-                        .key(key)
-                        .upload_id(upload_id)
-                        .send()
-                        .await;
-                }
-            }
-        }
+async fn delete_s3_prefix(storage: &storage::Storage, bucket: &str, prefix: &str) -> Result<(), (StatusCode, String)> {
+    let keys = storage.list_objects(bucket, Some(prefix), None).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    for key in keys {
+        let _ = storage.delete_object(bucket, &key.key).await;
     }
-
-    let mut response = s3_client
-        .list_objects_v2()
-        .bucket(bucket)
-        .prefix(prefix)
-        .into_paginator()
-        .send();
-
-    let mut keys_to_delete = Vec::new();
-
-    while let Some(result) = response.next().await {
-        let page = result.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        for object in page.contents() {
-            if let Some(key) = object.key() {
-                keys_to_delete.push(key.to_string());
-            }
-        }
-    }
-
-    if !keys_to_delete.is_empty() {
-        for chunk in keys_to_delete.chunks(1000) {
-            let mut delete_builder = aws_sdk_s3::types::Delete::builder();
-            for key in chunk {
-                let obj_id = aws_sdk_s3::types::ObjectIdentifier::builder()
-                    .key(key)
-                    .build()
-                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-                delete_builder = delete_builder.objects(obj_id);
-            }
-            let delete = delete_builder.build()
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-            s3_client
-                .delete_objects()
-                .bucket(bucket)
-                .delete(delete)
-                .send()
-                .await
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        }
-    }
-
     Ok(())
 }
 
-async fn delete_share_objects(s3_client: &aws_sdk_s3::Client, bucket: &str, uuid: &str) -> Result<(), (StatusCode, String)> {
+async fn delete_share_objects(storage: &storage::Storage, bucket: &str, uuid: &str) -> Result<(), (StatusCode, String)> {
     let prefix = format!("uploads/{}/", uuid);
-    delete_s3_prefix(s3_client, bucket, &prefix).await
+    delete_s3_prefix(storage, bucket, &prefix).await?;
+    
+    let info_key = format!("shares/{}.json", uuid);
+    let _ = storage.delete_object(bucket, &info_key).await;
+    
+    Ok(())
 }
 
 async fn fetch_user_pfp_enc(state: &AppState, username: &str) -> String {
     let pfp_key = format!("users/{}/pfp.enc", username);
-    match state.s3_client.get_object()
-        .bucket(&state.bucket)
-        .key(&pfp_key)
-        .send()
-        .await
+    match state.storage.get_object_bytes(&state.bucket, &pfp_key).await
     {
-        Ok(output) => {
-            if let Ok(bytes) = output.body.collect().await {
-                let vec = bytes.into_bytes().to_vec();
+        Ok(bytes) => {
+            if true { 
+                let vec = bytes;
                 vec.iter().map(|b| format!("{:02x}", b)).collect::<String>()
             } else {
                 String::new()
@@ -1886,10 +1623,21 @@ async fn get_user_profile(
 
     let pfp_enc = fetch_user_pfp_enc(&state, &username).await;
 
+    let user_key = format!("users/{}.json", username);
+    let mut totp_enabled = false;
+    if let Ok(bytes) = state.storage.get_object_bytes(&state.bucket, &user_key).await {
+        if true {
+            if let Ok(user_json) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                totp_enabled = user_json.get("totp_enabled").and_then(|v| v.as_bool()).unwrap_or(false);
+            }
+        }
+    }
+
     Ok(axum::Json(serde_json::json!({
         "username": username,
         "pfp_enc": pfp_enc,
-        "pfp": pfp_enc
+        "pfp": pfp_enc,
+        "totp_enabled": totp_enabled
     })))
 }
 
@@ -1913,19 +1661,13 @@ async fn save_user_profile(
 
     // Clean up legacy base64 pfp from users/{username}.json if present
     let user_key = format!("users/{}.json", username);
-    if let Ok(res) = state.s3_client.get_object().bucket(&state.bucket).key(&user_key).send().await {
-        if let Ok(bytes) = res.body.collect().await {
-            if let Ok(mut user_json) = serde_json::from_slice::<serde_json::Value>(&bytes.into_bytes()) {
+    if let Ok(bytes) = state.storage.get_object_bytes(&state.bucket, &user_key).await {
+        if true {
+            if let Ok(mut user_json) = serde_json::from_slice::<serde_json::Value>(&bytes) {
                 if let Some(obj) = user_json.as_object_mut() {
                     if obj.remove("pfp").is_some() {
                         if let Ok(user_bytes) = serde_json::to_vec(&user_json) {
-                            let _ = state.s3_client.put_object()
-                                .bucket(&state.bucket)
-                                .key(&user_key)
-                                .content_type("application/json")
-                                .body(aws_sdk_s3::primitives::ByteStream::from(user_bytes))
-                                .send()
-                                .await;
+                            let _ = state.storage.put_object(&state.bucket, &user_key, user_bytes.into(), Some("application/json")).await;
                         }
                     }
                 }
@@ -1942,11 +1684,7 @@ async fn save_user_profile(
     let pfp_key = format!("users/{}/pfp.enc", username);
 
     if hex_data.trim().is_empty() {
-        let _ = state.s3_client.delete_object()
-            .bucket(&state.bucket)
-            .key(&pfp_key)
-            .send()
-            .await;
+        let _ = state.storage.delete_object(&state.bucket, &pfp_key).await;
     } else {
         let mut bytes = Vec::new();
         let hex_str = hex_data.trim();
@@ -1962,13 +1700,7 @@ async fn save_user_profile(
             return Err((StatusCode::BAD_REQUEST, "Profile picture too large".to_string()));
         }
 
-        state.s3_client.put_object()
-            .bucket(&state.bucket)
-            .key(&pfp_key)
-            .content_type("application/octet-stream")
-            .body(aws_sdk_s3::primitives::ByteStream::from(bytes))
-            .send()
-            .await
+        state.storage.put_object(&state.bucket, &pfp_key, bytes, Some("application/octet-stream")).await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to update profile picture: {:?}", e)))?;
     }
 
@@ -1996,17 +1728,8 @@ async fn user_change_password(
 
     let user_key = format!("users/{}.json", username);
 
-    let res = state.s3_client.get_object()
-        .bucket(&state.bucket)
-        .key(&user_key)
-        .send()
-        .await
+    let bytes = state.storage.get_object_bytes(&state.bucket, &user_key).await
         .map_err(|_| (StatusCode::NOT_FOUND, "User profile not found".to_string()))?;
-
-    let bytes = res.body.collect().await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .into_bytes();
-
     let mut user_json: serde_json::Value = serde_json::from_slice(&bytes)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -2035,13 +1758,7 @@ async fn user_change_password(
     let user_bytes = serde_json::to_vec(&user_json)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    state.s3_client.put_object()
-        .bucket(&state.bucket)
-        .key(&user_key)
-        .content_type("application/json")
-        .body(aws_sdk_s3::primitives::ByteStream::from(user_bytes))
-        .send()
-        .await
+    state.storage.put_object(&state.bucket, &user_key, user_bytes.into(), Some("application/json")).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to update profile: {:?}", e)))?;
 
     let mut enc_bytes = Vec::new();
@@ -2055,23 +1772,13 @@ async fn user_change_password(
     }
 
     let shares_key = format!("users/{}/shares.enc", username);
-    state.s3_client.put_object()
-        .bucket(&state.bucket)
-        .key(&shares_key)
-        .content_type("application/octet-stream")
-        .body(aws_sdk_s3::primitives::ByteStream::from(enc_bytes))
-        .send()
-        .await
+    state.storage.put_object(&state.bucket, &shares_key, enc_bytes, Some("application/octet-stream")).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to save new shares: {:?}", e)))?;
 
     if let Some(ref new_pfp) = payload.new_pfp_enc {
         let pfp_key = format!("users/{}/pfp.enc", username);
         if new_pfp.trim().is_empty() {
-            let _ = state.s3_client.delete_object()
-                .bucket(&state.bucket)
-                .key(&pfp_key)
-                .send()
-                .await;
+            let _ = state.storage.delete_object(&state.bucket, &pfp_key).await;
         } else {
             let mut bytes = Vec::new();
             let hex_str = new_pfp.trim();
@@ -2082,27 +1789,17 @@ async fn user_change_password(
                     bytes.push(byte);
                 }
             }
-            let _ = state.s3_client.put_object()
-                .bucket(&state.bucket)
-                .key(&pfp_key)
-                .content_type("application/octet-stream")
-                .body(aws_sdk_s3::primitives::ByteStream::from(bytes))
-                .send()
-                .await;
+            let _ = state.storage.put_object(&state.bucket, &pfp_key, bytes, Some("application/octet-stream")).await;
         }
     }
 
     // Revoke all OTHER sessions of this user upon password change (forces relogin on other devices)
     let sessions_key = format!("users/{}/sessions.json", username);
-    let mut sessions: Vec<UserSession> = match state.s3_client.get_object()
-        .bucket(&state.bucket)
-        .key(&sessions_key)
-        .send()
-        .await
+    let mut sessions: Vec<UserSession> = match state.storage.get_object_bytes(&state.bucket, &sessions_key).await
     {
-        Ok(output) => {
-            if let Ok(bytes) = output.body.collect().await {
-                serde_json::from_slice(&bytes.into_bytes()).unwrap_or_default()
+        Ok(bytes) => {
+            if true { 
+                serde_json::from_slice(&bytes).unwrap_or_default()
             } else {
                 Vec::new()
             }
@@ -2113,13 +1810,7 @@ async fn user_change_password(
     sessions.retain(|s| s.id == current_session_id);
 
     if let Ok(session_bytes) = serde_json::to_vec(&sessions) {
-        let _ = state.s3_client.put_object()
-            .bucket(&state.bucket)
-            .key(&sessions_key)
-            .content_type("application/json")
-            .body(aws_sdk_s3::primitives::ByteStream::from(session_bytes))
-            .send()
-            .await;
+        let _ = state.storage.put_object(&state.bucket, &sessions_key, session_bytes.into(), Some("application/json")).await;
     }
 
     Ok(StatusCode::OK)
@@ -2135,17 +1826,13 @@ async fn user_delete_account(
         .ok_or_else(|| (StatusCode::UNAUTHORIZED, "Invalid or expired session".to_string()))?;
 
     let public_shares_key = format!("users/{}/public_shares.json", username);
-    if let Ok(output) = state.s3_client.get_object()
-        .bucket(&state.bucket)
-        .key(&public_shares_key)
-        .send()
-        .await
+    if let Ok(bytes) = state.storage.get_object_bytes(&state.bucket, &public_shares_key).await
     {
-        if let Ok(bytes) = output.body.collect().await {
-            if let Ok(shares) = serde_json::from_slice::<Vec<serde_json::Value>>(&bytes.into_bytes()) {
+        if true { 
+            if let Ok(shares) = serde_json::from_slice::<Vec<serde_json::Value>>(&bytes) {
                 for share in shares {
                     if let Some(uuid) = share.get("uuid").and_then(|u| u.as_str()) {
-                        let _ = delete_share_objects(&state.s3_client, &state.bucket, uuid).await;
+                        let _ = delete_share_objects(&state.storage, &state.bucket, uuid).await;
                     }
                 }
             }
@@ -2155,27 +1842,20 @@ async fn user_delete_account(
     let user_profile_key = format!("users/{}.json", username);
     let user_folder_prefix = format!("users/{}/", username);
 
-    let _ = state.s3_client.delete_object().bucket(&state.bucket).key(&user_profile_key).send().await;
-    let _ = delete_s3_prefix(&state.s3_client, &state.bucket, &user_folder_prefix).await;
+    let _ = state.storage.delete_object(&state.bucket, &user_profile_key).await;
+    let _ = delete_s3_prefix(&state.storage, &state.bucket, &user_folder_prefix).await;
 
     Ok(StatusCode::OK)
 }
 
-async fn generate_and_save_jwt_secret(s3_client: &aws_sdk_s3::Client, bucket: &str, key: &str) -> Vec<u8> {
-    let secret = [
-        uuid::Uuid::new_v4().into_bytes().to_vec(),
-        uuid::Uuid::new_v4().into_bytes().to_vec(),
-    ].concat();
-
-    let _ = s3_client.put_object()
-        .bucket(bucket)
-        .key(key)
-        .content_type("application/octet-stream")
-        .body(aws_sdk_s3::primitives::ByteStream::from(secret.clone()))
-        .send()
-        .await;
-
-    secret
+async fn generate_and_save_jwt_secret(storage: &storage::Storage, bucket: &str, key: &str) -> Vec<u8> {
+    let mut secret = [0u8; 32];
+    use rand::Rng;
+    rand::rng().fill_bytes(&mut secret);
+    
+    let _ = storage.put_object(bucket, key, secret.to_vec(), None).await;
+    
+    secret.to_vec()
 }
 
 async fn get_user_sessions(
@@ -2188,15 +1868,11 @@ async fn get_user_sessions(
         .ok_or_else(|| (StatusCode::UNAUTHORIZED, "Invalid or expired session".to_string()))?;
 
     let sessions_key = format!("users/{}/sessions.json", username);
-    let sessions: Vec<UserSession> = match state.s3_client.get_object()
-        .bucket(&state.bucket)
-        .key(&sessions_key)
-        .send()
-        .await
+    let sessions: Vec<UserSession> = match state.storage.get_object_bytes(&state.bucket, &sessions_key).await
     {
-        Ok(output) => {
-            if let Ok(bytes) = output.body.collect().await {
-                serde_json::from_slice(&bytes.into_bytes()).unwrap_or_default()
+        Ok(bytes) => {
+            if true { 
+                serde_json::from_slice(&bytes).unwrap_or_default()
             } else {
                 Vec::new()
             }
@@ -2233,15 +1909,11 @@ async fn revoke_user_session(
         .ok_or_else(|| (StatusCode::UNAUTHORIZED, "Invalid or expired session".to_string()))?;
 
     let sessions_key = format!("users/{}/sessions.json", username);
-    let mut sessions: Vec<UserSession> = match state.s3_client.get_object()
-        .bucket(&state.bucket)
-        .key(&sessions_key)
-        .send()
-        .await
+    let mut sessions: Vec<UserSession> = match state.storage.get_object_bytes(&state.bucket, &sessions_key).await
     {
-        Ok(output) => {
-            if let Ok(bytes) = output.body.collect().await {
-                serde_json::from_slice(&bytes.into_bytes()).unwrap_or_default()
+        Ok(bytes) => {
+            if true { 
+                serde_json::from_slice(&bytes).unwrap_or_default()
             } else {
                 Vec::new()
             }
@@ -2256,13 +1928,7 @@ async fn revoke_user_session(
         let session_bytes = serde_json::to_vec(&sessions)
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-        state.s3_client.put_object()
-            .bucket(&state.bucket)
-            .key(&sessions_key)
-            .content_type("application/json")
-            .body(aws_sdk_s3::primitives::ByteStream::from(session_bytes))
-            .send()
-            .await
+        state.storage.put_object(&state.bucket, &sessions_key, session_bytes.into(), Some("application/json")).await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to update sessions: {:?}", e)))?;
     }
 
@@ -2286,15 +1952,11 @@ async fn rename_user_session(
         .ok_or_else(|| (StatusCode::UNAUTHORIZED, "Invalid or expired session".to_string()))?;
 
     let sessions_key = format!("users/{}/sessions.json", username);
-    let mut sessions: Vec<UserSession> = match state.s3_client.get_object()
-        .bucket(&state.bucket)
-        .key(&sessions_key)
-        .send()
-        .await
+    let mut sessions: Vec<UserSession> = match state.storage.get_object_bytes(&state.bucket, &sessions_key).await
     {
-        Ok(output) => {
-            if let Ok(bytes) = output.body.collect().await {
-                serde_json::from_slice(&bytes.into_bytes()).unwrap_or_default()
+        Ok(bytes) => {
+            if true { 
+                serde_json::from_slice(&bytes).unwrap_or_default()
             } else {
                 Vec::new()
             }
@@ -2319,13 +1981,7 @@ async fn rename_user_session(
         let session_bytes = serde_json::to_vec(&sessions)
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-        state.s3_client.put_object()
-            .bucket(&state.bucket)
-            .key(&sessions_key)
-            .content_type("application/json")
-            .body(aws_sdk_s3::primitives::ByteStream::from(session_bytes))
-            .send()
-            .await
+        state.storage.put_object(&state.bucket, &sessions_key, session_bytes.into(), Some("application/json")).await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to update session: {:?}", e)))?;
     }
 
@@ -2340,15 +1996,11 @@ async fn admin_get_user_sessions(
     verify_admin(&headers, &state).await?;
 
     let sessions_key = format!("users/{}/sessions.json", username);
-    let sessions: Vec<UserSession> = match state.s3_client.get_object()
-        .bucket(&state.bucket)
-        .key(&sessions_key)
-        .send()
-        .await
+    let sessions: Vec<UserSession> = match state.storage.get_object_bytes(&state.bucket, &sessions_key).await
     {
-        Ok(output) => {
-            if let Ok(bytes) = output.body.collect().await {
-                serde_json::from_slice(&bytes.into_bytes()).unwrap_or_default()
+        Ok(bytes) => {
+            if true { 
+                serde_json::from_slice(&bytes).unwrap_or_default()
             } else {
                 Vec::new()
             }
@@ -2381,15 +2033,11 @@ async fn admin_revoke_user_session(
     verify_admin(&headers, &state).await?;
 
     let sessions_key = format!("users/{}/sessions.json", username);
-    let mut sessions: Vec<UserSession> = match state.s3_client.get_object()
-        .bucket(&state.bucket)
-        .key(&sessions_key)
-        .send()
-        .await
+    let mut sessions: Vec<UserSession> = match state.storage.get_object_bytes(&state.bucket, &sessions_key).await
     {
-        Ok(output) => {
-            if let Ok(bytes) = output.body.collect().await {
-                serde_json::from_slice(&bytes.into_bytes()).unwrap_or_default()
+        Ok(bytes) => {
+            if true { 
+                serde_json::from_slice(&bytes).unwrap_or_default()
             } else {
                 Vec::new()
             }
@@ -2404,13 +2052,7 @@ async fn admin_revoke_user_session(
         let session_bytes = serde_json::to_vec(&sessions)
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-        state.s3_client.put_object()
-            .bucket(&state.bucket)
-            .key(&sessions_key)
-            .content_type("application/json")
-            .body(aws_sdk_s3::primitives::ByteStream::from(session_bytes))
-            .send()
-            .await
+        state.storage.put_object(&state.bucket, &sessions_key, session_bytes.into(), Some("application/json")).await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to update sessions: {:?}", e)))?;
     }
 
@@ -2462,15 +2104,11 @@ async fn admin_login(
     };
     
     let sessions_key = "admin/sessions.json";
-    let mut sessions: Vec<UserSession> = match state.s3_client.get_object()
-        .bucket(&state.bucket)
-        .key(sessions_key)
-        .send()
-        .await
+    let mut sessions: Vec<UserSession> = match state.storage.get_object_bytes(&state.bucket, sessions_key).await
     {
-        Ok(output) => {
-            if let Ok(bytes) = output.body.collect().await {
-                serde_json::from_slice(&bytes.into_bytes()).unwrap_or_default()
+        Ok(bytes) => {
+            if true { 
+                serde_json::from_slice(&bytes).unwrap_or_default()
             } else {
                 Vec::new()
             }
@@ -2481,13 +2119,7 @@ async fn admin_login(
     sessions.push(new_session);
     
     if let Ok(session_bytes) = serde_json::to_vec(&sessions) {
-        state.s3_client.put_object()
-            .bucket(&state.bucket)
-            .key(sessions_key)
-            .content_type("application/json")
-            .body(aws_sdk_s3::primitives::ByteStream::from(session_bytes))
-            .send()
-            .await
+        state.storage.put_object(&state.bucket, sessions_key, session_bytes.into(), Some("application/json")).await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to save admin session: {:?}", e)))?;
     }
     
@@ -2501,15 +2133,11 @@ async fn admin_get_sessions(
     verify_admin(&headers, &state).await?;
 
     let sessions_key = "admin/sessions.json";
-    let sessions: Vec<UserSession> = match state.s3_client.get_object()
-        .bucket(&state.bucket)
-        .key(sessions_key)
-        .send()
-        .await
+    let sessions: Vec<UserSession> = match state.storage.get_object_bytes(&state.bucket, sessions_key).await
     {
-        Ok(output) => {
-            if let Ok(bytes) = output.body.collect().await {
-                serde_json::from_slice(&bytes.into_bytes()).unwrap_or_default()
+        Ok(bytes) => {
+            if true { 
+                serde_json::from_slice(&bytes).unwrap_or_default()
             } else {
                 Vec::new()
             }
@@ -2553,15 +2181,11 @@ async fn admin_revoke_session(
     verify_admin(&headers, &state).await?;
 
     let sessions_key = "admin/sessions.json";
-    let mut sessions: Vec<UserSession> = match state.s3_client.get_object()
-        .bucket(&state.bucket)
-        .key(sessions_key)
-        .send()
-        .await
+    let mut sessions: Vec<UserSession> = match state.storage.get_object_bytes(&state.bucket, sessions_key).await
     {
-        Ok(output) => {
-            if let Ok(bytes) = output.body.collect().await {
-                serde_json::from_slice(&bytes.into_bytes()).unwrap_or_default()
+        Ok(bytes) => {
+            if true { 
+                serde_json::from_slice(&bytes).unwrap_or_default()
             } else {
                 Vec::new()
             }
@@ -2576,13 +2200,7 @@ async fn admin_revoke_session(
         let session_bytes = serde_json::to_vec(&sessions)
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-        state.s3_client.put_object()
-            .bucket(&state.bucket)
-            .key(sessions_key)
-            .content_type("application/json")
-            .body(aws_sdk_s3::primitives::ByteStream::from(session_bytes))
-            .send()
-            .await
+        state.storage.put_object(&state.bucket, sessions_key, session_bytes.into(), Some("application/json")).await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to update sessions: {:?}", e)))?;
     }
 
@@ -2598,15 +2216,11 @@ async fn admin_rename_session(
     verify_admin(&headers, &state).await?;
 
     let sessions_key = "admin/sessions.json";
-    let mut sessions: Vec<UserSession> = match state.s3_client.get_object()
-        .bucket(&state.bucket)
-        .key(sessions_key)
-        .send()
-        .await
+    let mut sessions: Vec<UserSession> = match state.storage.get_object_bytes(&state.bucket, sessions_key).await
     {
-        Ok(output) => {
-            if let Ok(bytes) = output.body.collect().await {
-                serde_json::from_slice(&bytes.into_bytes()).unwrap_or_default()
+        Ok(bytes) => {
+            if true { 
+                serde_json::from_slice(&bytes).unwrap_or_default()
             } else {
                 Vec::new()
             }
@@ -2631,15 +2245,135 @@ async fn admin_rename_session(
         let session_bytes = serde_json::to_vec(&sessions)
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-        state.s3_client.put_object()
-            .bucket(&state.bucket)
-            .key(sessions_key)
-            .content_type("application/json")
-            .body(aws_sdk_s3::primitives::ByteStream::from(session_bytes))
-            .send()
-            .await
+        state.storage.put_object(&state.bucket, sessions_key, session_bytes.into(), Some("application/json")).await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to update admin session: {:?}", e)))?;
     }
+
+    Ok(StatusCode::OK)
+}
+
+async fn setup_2fa_init(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let token = extract_token(&headers)?;
+    let (username, _) = verify_session(&token, &state)
+        .await
+        .ok_or_else(|| (StatusCode::UNAUTHORIZED, "Invalid or expired session".to_string()))?;
+
+    let secret = totp_rs::Secret::generate_secret();
+    let totp = totp_rs::TOTP::new(
+        totp_rs::Algorithm::SHA1,
+        6,
+        1,
+        30,
+        secret.to_bytes().unwrap(),
+        Some("DillShare".to_string()),
+        username,
+    ).map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Failed to create TOTP".to_string()))?;
+
+    let qr = totp.get_qr_base64().map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Failed to generate QR code".to_string()))?;
+
+    Ok(axum::Json(serde_json::json!({
+        "secret": secret.to_encoded().to_string(),
+        "qr_base64": qr
+    })))
+}
+
+async fn setup_2fa_confirm(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    axum::Json(payload): axum::Json<Setup2FARequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let token = extract_token(&headers)?;
+    let (username, _) = verify_session(&token, &state)
+        .await
+        .ok_or_else(|| (StatusCode::UNAUTHORIZED, "Invalid or expired session".to_string()))?;
+
+    let secret = totp_rs::Secret::Encoded(payload.secret.clone());
+    let totp = totp_rs::TOTP::new(
+        totp_rs::Algorithm::SHA1,
+        6,
+        1,
+        30,
+        secret.to_bytes().map_err(|_| (StatusCode::BAD_REQUEST, "Invalid secret".to_string()))?,
+        Some("DillShare".to_string()),
+        username.clone(),
+    ).map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Failed to create TOTP".to_string()))?;
+
+    if !totp.check_current(&payload.code).unwrap_or(false) {
+        return Err((StatusCode::BAD_REQUEST, "Invalid 2FA code".to_string()));
+    }
+
+    let user_key = format!("users/{}.json", username);
+    let mut user_json: serde_json::Value = match state.storage.get_object_bytes(&state.bucket, &user_key).await {
+        Ok(bytes) => {
+            
+            serde_json::from_slice(&bytes).map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Invalid JSON".to_string()))?
+        }
+        Err(_) => return Err((StatusCode::INTERNAL_SERVER_ERROR, "User not found".to_string())),
+    };
+
+    if let Some(obj) = user_json.as_object_mut() {
+        obj.insert("totp_enabled".to_string(), serde_json::json!(true));
+        obj.insert("totp_secret".to_string(), serde_json::json!(payload.secret));
+    }
+
+    let user_bytes = serde_json::to_vec(&user_json).map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "JSON error".to_string()))?;
+    state.storage.put_object(&state.bucket, &user_key, user_bytes.into(), Some("application/json")).await
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Failed to save user".to_string()))?;
+
+    Ok(StatusCode::OK)
+}
+
+async fn disable_2fa(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    axum::Json(payload): axum::Json<Disable2FARequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let token = extract_token(&headers)?;
+    let (username, _) = verify_session(&token, &state)
+        .await
+        .ok_or_else(|| (StatusCode::UNAUTHORIZED, "Invalid or expired session".to_string()))?;
+
+    let user_key = format!("users/{}.json", username);
+    let mut user_json: serde_json::Value = match state.storage.get_object_bytes(&state.bucket, &user_key).await {
+        Ok(bytes) => {
+            
+            serde_json::from_slice(&bytes).map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Invalid JSON".to_string()))?
+        }
+        Err(_) => return Err((StatusCode::INTERNAL_SERVER_ERROR, "User not found".to_string())),
+    };
+
+    let totp_enabled = user_json.get("totp_enabled").and_then(|v| v.as_bool()).unwrap_or(false);
+    if !totp_enabled {
+        return Err((StatusCode::BAD_REQUEST, "2FA is not enabled".to_string()));
+    }
+
+    let totp_secret = user_json.get("totp_secret").and_then(|v| v.as_str()).unwrap_or("");
+    let secret = totp_rs::Secret::Encoded(totp_secret.to_string());
+    let totp = totp_rs::TOTP::new(
+        totp_rs::Algorithm::SHA1,
+        6,
+        1,
+        30,
+        secret.to_bytes().map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Invalid internal secret".to_string()))?,
+        Some("DillShare".to_string()),
+        username.clone(),
+    ).map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Failed to create TOTP".to_string()))?;
+
+    if !totp.check_current(&payload.code).unwrap_or(false) {
+        return Err((StatusCode::BAD_REQUEST, "Invalid 2FA code".to_string()));
+    }
+
+    if let Some(obj) = user_json.as_object_mut() {
+        obj.insert("totp_enabled".to_string(), serde_json::json!(false));
+        obj.remove("totp_secret");
+    }
+
+    let user_bytes = serde_json::to_vec(&user_json).map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "JSON error".to_string()))?;
+    state.storage.put_object(&state.bucket, &user_key, user_bytes.into(), Some("application/json")).await
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Failed to save user".to_string()))?;
 
     Ok(StatusCode::OK)
 }
