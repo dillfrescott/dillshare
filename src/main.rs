@@ -655,46 +655,48 @@ async fn passkey_auth_finish(
         .await;
 
     // Check 2FA before finalizing
-    let user_key = format!("users/{}/user.json", username);
-    if let Ok(user_bytes) = state
+    let user_key = format!("users/{}.json", username);
+    let user_bytes = state
         .storage
         .get_object_bytes(&state.bucket, &user_key)
         .await
-    {
-        if let Ok(user_json) = serde_json::from_slice::<serde_json::Value>(&user_bytes) {
-            let totp_enabled = user_json
-                .get("totp_enabled")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            if totp_enabled {
-                let totp_secret = user_json
-                    .get("totp_secret")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                if let Some(code) = &payload.totp_code {
-                    if let Ok(secret) = totp_rs::Secret::Encoded(totp_secret.to_string()).to_bytes()
-                    {
-                        let totp = totp_rs::TOTP::new(
-                            totp_rs::Algorithm::SHA1,
-                            6,
-                            1,
-                            30,
-                            secret,
-                            Some("DillShare".to_string()),
-                            username.to_string(),
-                        )
-                        .map_err(|_| {
-                            (StatusCode::INTERNAL_SERVER_ERROR, "2FA Error".to_string())
-                        })?;
+        .map_err(|_| (StatusCode::UNAUTHORIZED, "User not found".to_string()))?;
 
-                        if !totp.check_current(code).unwrap_or(false) {
-                            return Err((StatusCode::FORBIDDEN, "INVALID_2FA".to_string()));
-                        }
-                    }
-                } else {
-                    return Err((StatusCode::FORBIDDEN, "2FA_REQUIRED".to_string()));
+    let user_json: serde_json::Value = serde_json::from_slice(&user_bytes)
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Invalid user data".to_string()))?;
+
+    let totp_enabled = user_json
+        .get("totp_enabled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    if totp_enabled {
+        let totp_secret = user_json
+            .get("totp_secret")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if let Some(code) = &payload.totp_code {
+            if let Ok(secret) = totp_rs::Secret::Encoded(totp_secret.to_string()).to_bytes()
+            {
+                let totp = totp_rs::TOTP::new(
+                    totp_rs::Algorithm::SHA1,
+                    6,
+                    1,
+                    30,
+                    secret,
+                    Some("DillShare".to_string()),
+                    username.to_string(),
+                )
+                .map_err(|_| {
+                    (StatusCode::INTERNAL_SERVER_ERROR, "2FA Error".to_string())
+                })?;
+
+                if !totp.check_current(code).unwrap_or(false) {
+                    return Err((StatusCode::FORBIDDEN, "INVALID_2FA".to_string()));
                 }
             }
+        } else {
+            return Err((StatusCode::FORBIDDEN, "2FA_REQUIRED".to_string()));
         }
     }
 

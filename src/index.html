@@ -5234,75 +5234,14 @@
             }
         });
 
-        let currentPasskeyAuthData = null;
-        let currentPasskeySessionId = null;
-
         const btnAuthPasskey = document.getElementById('btn-auth-passkey');
         if (btnAuthPasskey) {
             btnAuthPasskey.addEventListener('click', async () => {
                 const username = authUsernameInput.value.trim();
-                const totpInput = document.getElementById('auth-totp');
-                const totpWrap = document.getElementById('auth-totp-wrap');
-
-                if (currentPasskeyAuthData) {
-                    if (!totpInput || !totpInput.value) {
-                        showToast('Please enter your 2FA code', 'error');
-                        return;
-                    }
-                    btnAuthPasskey.disabled = true;
-                    try {
-                        let finishRes = await fetch('/api/passkey/auth_finish', {
-                            method: 'POST',
-                            headers: {'Content-Type': 'application/json'},
-                            body: JSON.stringify({
-                                username: username || null,
-                                session_id: currentPasskeySessionId,
-                                auth: currentPasskeyAuthData,
-                                totp_code: totpInput.value
-                            })
-                        });
-                        if (!finishRes.ok) {
-                            const text = await finishRes.text();
-                            if (text === "INVALID_2FA") {
-                                throw new Error("Invalid 2FA code");
-                            } else {
-                                throw new Error(text);
-                            }
-                        }
-                        const finalData = await finishRes.json();
-                        const loggedInUsername = finalData.username;
-                        localStorage.setItem('dill_session_token', finalData.token);
-                        localStorage.setItem('dill_username', loggedInUsername);
-                        
-                        let encKeyHex = localStorage.getItem('dill_enc_key_' + loggedInUsername) || localStorage.getItem('dill_enc_key');
-                        if (!encKeyHex) {
-                            const pwd = await customPrompt('Please enter your password once to unlock zero-knowledge encryption on this device:', 'Unlock Device Encryption', '', true);
-                            if (pwd) {
-                                const keys = await deriveUserKeys(loggedInUsername, pwd);
-                                encKeyHex = bufToHex(keys.encKeyBuf);
-                                localStorage.setItem('dill_enc_key_' + loggedInUsername, encKeyHex);
-                            }
-                        }
-                        if (encKeyHex) {
-                            localStorage.setItem('dill_enc_key', encKeyHex);
-                            const pfpEncHex = finalData.pfp_enc || finalData.pfp;
-                            if (pfpEncHex) {
-                                try {
-                                    const decryptedPfp = await decryptPfp(pfpEncHex, hexToBuf(encKeyHex));
-                                    if (decryptedPfp) localStorage.setItem('dill_pfp', decryptedPfp);
-                                } catch(e) {}
-                            }
-                        }
-                        window.location.reload();
-                    } catch (e) {
-                        showToast(e.message, 'error');
-                    } finally {
-                        btnAuthPasskey.disabled = false;
-                    }
-                    return;
-                }
 
                 btnAuthPasskey.disabled = true;
+                const originalHtml = btnAuthPasskey.innerHTML;
+                btnAuthPasskey.innerHTML = `<div class="loader" style="width:0.85rem; height:0.85rem; border-width:1px; margin:0 auto; display:inline-block; vertical-align:middle;"></div>`;
                 try {
                     let res = await fetch('/api/passkey/auth_start', {
                         method: 'POST',
@@ -5348,33 +5287,37 @@
                         }
                     };
                     
-                    let finishRes = await fetch('/api/passkey/auth_finish', {
-                        method: 'POST',
-                        headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify({
-                            username: username || null,
-                            session_id: sessionId,
-                            auth: authData
-                        })
-                    });
+                    let authFinishBody = {
+                        username: username || null,
+                        session_id: sessionId,
+                        auth: authData
+                    };
                     
-                    if (!finishRes.ok) {
-                        const text = await finishRes.text();
-                        if (text === "2FA_REQUIRED") {
-                            currentPasskeyAuthData = authData;
-                            currentPasskeySessionId = sessionId;
-                            if (totpWrap) {
-                                totpWrap.style.display = 'flex';
-                                void totpWrap.offsetWidth;
-                                totpWrap.style.maxHeight = '100px';
-                                totpWrap.style.opacity = '1';
-                                totpInput.focus();
+                    let finishRes;
+                    while (true) {
+                        finishRes = await fetch('/api/passkey/auth_finish', {
+                            method: 'POST',
+                            headers: {'Content-Type': 'application/json'},
+                            body: JSON.stringify(authFinishBody)
+                        });
+                        
+                        if (!finishRes.ok) {
+                            const text = await finishRes.text();
+                            if (text === "2FA_REQUIRED" || text === "INVALID_2FA") {
+                                if (text === "INVALID_2FA") {
+                                    showToast("Invalid 2FA code", "error");
+                                }
+                                const code = await customPrompt('Please enter your 6-digit 2FA code:', 'Two-Factor Authentication');
+                                if (!code) {
+                                    throw new Error("2FA code required");
+                                }
+                                authFinishBody.totp_code = code;
+                                continue;
+                            } else {
+                                throw new Error(text);
                             }
-                            showToast("Please enter your 2FA code", "info");
-                            return;
-                        } else {
-                            throw new Error(text);
                         }
+                        break;
                     }
                     
                     const finalData = await finishRes.json();
@@ -5408,18 +5351,13 @@
                     showToast(e.message || 'Passkey login failed', 'error');
                 } finally {
                     btnAuthPasskey.disabled = false;
+                    btnAuthPasskey.innerHTML = originalHtml;
                 }
             });
         }
 
         authForm.addEventListener('submit', async (e) => {
             e.preventDefault();
-            
-            if (typeof currentPasskeyAuthData !== 'undefined' && currentPasskeyAuthData) {
-                const btnAuthPasskey = document.getElementById('btn-auth-passkey');
-                if (btnAuthPasskey) btnAuthPasskey.click();
-                return;
-            }
 
             const username = authUsernameInput.value.trim();
             const password = authPasswordInput.value;
