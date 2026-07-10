@@ -12,6 +12,39 @@ use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
+async fn url_restriction_middleware(
+    axum::extract::Extension(allowed_url): axum::extract::Extension<Option<String>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Result<axum::response::Response, axum::http::StatusCode> {
+    if let Some(url) = allowed_url {
+        let expected_host = url.trim_start_matches("https://").trim_start_matches("http://").trim_end_matches('/');
+        
+        let host = req.headers().get(axum::http::header::HOST)
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or("");
+        
+        let host_without_port = host.split(':').next().unwrap_or("");
+        let expected_without_port = expected_host.split(':').next().unwrap_or("");
+        
+        if host_without_port != expected_without_port {
+            tracing::warn!("Forbidden: Host '{}' does not match allowed URL '{}'", host, url);
+            return Err(axum::http::StatusCode::FORBIDDEN);
+        }
+
+        if let Some(origin) = req.headers().get(axum::http::header::ORIGIN) {
+            if let Ok(origin_str) = origin.to_str() {
+                if origin_str != url && origin_str.trim_end_matches('/') != url.trim_end_matches('/') {
+                    tracing::warn!("Forbidden: Origin '{}' does not match allowed URL '{}'", origin_str, url);
+                    return Err(axum::http::StatusCode::FORBIDDEN);
+                }
+            }
+        }
+    }
+    
+    Ok(next.run(req).await)
+}
+
 #[derive(Clone)]
 struct AppState {
     s3_client: aws_sdk_s3::Client,
@@ -149,9 +182,29 @@ async fn main() {
         .fallback(serve_index)
         // Router configurations
         .layer(DefaultBodyLimit::disable()) // Disable Axum's default 2MB multipart limit
-        .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(state);
+
+    let allowed_url = std::env::var("URL").ok();
+    
+    let app = if let Some(url) = allowed_url.clone() {
+        use axum::http::HeaderValue;
+        use tower_http::cors::Any;
+        if let Ok(origin) = url.parse::<HeaderValue>() {
+            app.layer(CorsLayer::new()
+                .allow_origin(origin)
+                .allow_methods(Any)
+                .allow_headers(Any))
+        } else {
+            app.layer(CorsLayer::permissive())
+        }
+    } else {
+        app.layer(CorsLayer::permissive())
+    };
+
+    let app = app
+        .layer(axum::middleware::from_fn(url_restriction_middleware))
+        .layer(axum::Extension(allowed_url));
 
     let port = std::env::var("PORT")
         .ok()
