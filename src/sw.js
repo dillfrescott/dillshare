@@ -1,4 +1,4 @@
-/*
+﻿/*
  * Dill Share streaming-preview service worker.
  *
  * Intercepts URLs of the form:
@@ -319,22 +319,41 @@ async function respondChunkedRange(meta, start, end, isRange) {
     }
     console.log('[dill-sw] respondChunkedRange:', start, '-', end, 'len', totalLength, 'status', status, 'chunks', ranges.length, 'ct', meta.contentType);
 
-    // Stream decrypted chunk slices to the media element as they are produced,
-    // using in-memory cached chunks for instant seeking and playback resume.
+    // Pipelined prefetch: kick off decryption of the next chunk while the
+    // current one is being streamed to the media element. getDecryptedChunk
+    // deduplicates via the chunk cache (Map of in-flight promises), so firing a
+    // prefetch is safe even if the consumer later requests the same chunk.
+    // This overlaps the network fetch + AES-GCM decrypt of chunk N+1 with the
+    // enqueue/playback of chunk N, eliminating the chunk-by-chunk stalls that
+    // made playback choppy ("start and stop") even on excellent connections.
+    const PREFETCH_AHEAD = 3;
     let aborted = false;
     const streamAc = new AbortController();
     let chunkIndex = 0;
+
+    // Prime the pipeline: start the first PREFETCH_AHEAD fetches immediately so
+    // they are already in flight before we begin yielding anything.
+    for (let i = 0; i < Math.min(PREFETCH_AHEAD, ranges.length); i++) {
+        getDecryptedChunk(meta, ranges[i], streamAc.signal);
+    }
+
     const stream = new ReadableStream({
         async start(controller) {
             try {
-                for (const r of ranges) {
+                for (let i = 0; i < ranges.length; i++) {
                     if (aborted) break;
                     if (controller.desiredSize === null) break;
 
-                    const pt = await getDecryptedChunk(meta, r, streamAc.signal);
+                    // Start fetching the chunk PREFETCH_AHEAD positions ahead so
+                    // its network round-trip overlaps the current chunk's decrypt.
+                    if (i + PREFETCH_AHEAD < ranges.length) {
+                        getDecryptedChunk(meta, ranges[i + PREFETCH_AHEAD], streamAc.signal);
+                    }
+
+                    const pt = await getDecryptedChunk(meta, ranges[i], streamAc.signal);
                     if (aborted || controller.desiredSize === null) break;
 
-                    const piece = pt.subarray(r.plainStartInChunk, r.plainEndInChunk);
+                    const piece = pt.subarray(ranges[i].plainStartInChunk, ranges[i].plainEndInChunk);
                     if (piece.length > 0) {
                         try { controller.enqueue(piece); }
                         catch (_) { break; } // stream closed by consumer mid-enqueue

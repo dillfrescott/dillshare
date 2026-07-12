@@ -1,4 +1,4 @@
-<!DOCTYPE html>
+﻿<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
@@ -3658,7 +3658,11 @@
 
                         const chunkSize = ENCRYPT_CHUNK_SIZE; // 4MB
                         const totalPlainChunks = Math.max(1, Math.ceil(file.size / chunkSize));
-                        const CHUNKS_PER_PART = 2; // 8MB per S3 part (> 5MB S3 min limit)
+                        // Adaptive S3 part size: bigger parts = fewer round-trips on
+                        // fast links. 16MB (4 chunks) for large files keeps us well
+                        // above S3's 5MB minimum and halves the request count vs the
+                        // old fixed 8MB parts; small files still use 2 chunks (8MB).
+                        const CHUNKS_PER_PART = file.size >= (64 * 1024 * 1024) ? 4 : 2;
                         const totalParts = Math.ceil(totalPlainChunks / CHUNKS_PER_PART);
 
                         const completedParts = new Array(totalParts);
@@ -3670,14 +3674,27 @@
                         // --- Decoupled producer/consumer pipeline ---
                         // Encryption (CPU-bound) and upload (network-bound) run in
                         // SEPARATE worker pools. Encryption workers push ready-to-send
-                        // parts into a bounded queue; a small fixed pool of upload
-                        // workers drains it. This overlaps encryption and network
-                        // transfer instead of alternating them, which turns the spiky
+                        // parts into a bounded queue; a pool of upload workers drains
+                        // it. Handoff is signaled with Promises (not setTimeout
+                        // polling) so there is NO idle gap between a producer finishing
+                        // a part and a consumer picking it up -- this turns the spiky
                         // "encrypt-then-upload" saw-tooth into a smooth, continuously
                         // saturated upload stream.
                         const readyParts = [];          // queue of { pIdx, partNum, partBlob }
                         let producersDone = false;
                         let uploadError = null;
+
+                        // Promise-based wakeup: resolves when a part becomes available
+                        // or producers finish. Replaced on each cycle to avoid races.
+                        let partAvailable = null;
+                        let partAvailableResolve = null;
+                        function newPartSignal() {
+                            partAvailable = new Promise(r => { partAvailableResolve = r; });
+                        }
+        function notifyPartAvailable() {
+            if (partAvailableResolve) { const r = partAvailableResolve; partAvailableResolve = null; r(); }
+        }
+        newPartSignal();
 
                         // Bound the queue so encryption doesn't run far ahead of
                         // uploads (keeps memory in check, smooths the supply).
@@ -3715,28 +3732,38 @@
                                 partTotalBytes[pIdx] = partBlob.size;
 
                                 // Backpressure: wait if the queue is full so
-                                // encryption doesn't outrun the network.
+                                // encryption doesn't outrun the network. Uses
+                                // promise signaling instead of polling, so there is
+                                // no idle gap once a slot frees up.
                                 while (readyParts.length >= MAX_QUEUED_PARTS && !isUploadCancelled && !uploadError) {
-                                    await new Promise(r => setTimeout(r, 5));
+                                    await partAvailable;
                                 }
                                 if (isUploadCancelled || uploadError) break;
                                 readyParts.push({ pIdx, partNum, partBlob });
+                                notifyPartAvailable();
                             }
                         }
-                        // Upload (network) workers: a small fixed pool keeps the link
-                        // saturated smoothly. Cap is deliberately LOWER than the old
-                        // 6-16-per-file value to avoid bursting the link all at once.
-                        const numUploadWorkers = 3;
+                        // Upload (network) workers: scale with cores to keep a fast
+                        // link saturated. More workers than encryption producers lets
+                        // network round-trips overlap CPU work; bounded so we don't
+                        // burst the link or exhaust memory.
+                        const numUploadWorkers = Math.max(3, Math.min(6, navigator.hardwareConcurrency || 4));
 
                         async function uploadWorker() {
                             while (!isUploadCancelled && !uploadError) {
                                 let job = null;
                                 if (readyParts.length > 0) {
                                     job = readyParts.shift();
+                                    // Notify a waiting producer that a queue slot
+                                    // opened, so it can resume immediately.
+                                    notifyPartAvailable();
+                                    newPartSignal();
                                 } else if (producersDone) {
                                     break;
                                 } else {
-                                    await new Promise(r => setTimeout(r, 5));
+                                    // No part ready yet: wait on the promise signal
+                                    // (zero-gap) instead of polling with setTimeout.
+                                    await Promise.race([partAvailable, new Promise(r => setTimeout(r, 1000))]);
                                     continue;
                                 }
                                 if (!job) continue;
@@ -3772,10 +3799,13 @@
                         for (let w = 0; w < numEncrypt; w++) {
                             encryptWorkers.push(encryptWorker());
                         }
-                        // Mark production complete once all encryption is done.
+                        // Mark production complete once all encryption is done, and
+                        // wake any upload worker blocked on the part signal so it can
+                        // observe producersDone and exit cleanly.
                         (async () => {
                             await Promise.all(encryptWorkers);
                             producersDone = true;
+                            notifyPartAvailable();
                         })();
 
                         // Start a small, fixed upload consumer pool.
@@ -4329,7 +4359,7 @@
 
                 // Setup countdown clock
                 const totalShareSize = (currentShareData.files || []).reduce((sum, f) => sum + (f.size || 0), 0);
-                shareCreatedDate.textContent = `Uploaded on: ${new Date(currentShareData.upload_time).toLocaleString()} • Total Size: ${formatBytes(totalShareSize)}`;
+                shareCreatedDate.textContent = `Uploaded on: ${new Date(currentShareData.upload_time).toLocaleString()} â€¢ Total Size: ${formatBytes(totalShareSize)}`;
                 shareCountdown.style.display = 'inline-flex';
 
                 // Render decrypted share message if present
@@ -4408,7 +4438,7 @@
         }
 
         // Load and decrypt a pre-generated encrypted thumbnail (file_<id>.thumb.enc)
-        // — a tiny standalone object, so RAM/bandwidth stay flat regardless of the
+        // â€” a tiny standalone object, so RAM/bandwidth stay flat regardless of the
         // original file size. `file.thumb` (set in metadata at upload time) gates
         // the fetch; older shares without that field fall back to the SVG icon.
         // `isVideo` only controls the badge overlay; the thumbnail itself is
@@ -4841,7 +4871,7 @@
 
         // Download all files in share decrypted inside a streaming ZIP.
         // Uses fflate's streaming Zip API so that decrypted chunks flow directly
-        // into the ZIP output → disk sink, keeping memory usage flat regardless
+        // into the ZIP output â†’ disk sink, keeping memory usage flat regardless
         // of total share size. Falls back to in-memory blob only as last resort.
         btnDownloadAll.addEventListener('click', async () => {
             if (btnDownloadAll.disabled) return;
@@ -4941,8 +4971,8 @@
                     triggerPrefetch(k);
                 }
 
-                // Process each file: prefetch → stream-decrypt → push chunks into
-                // fflate ZipPassThrough entry → ZIP output flows to disk sink.
+                // Process each file: prefetch â†’ stream-decrypt â†’ push chunks into
+                // fflate ZipPassThrough entry â†’ ZIP output flows to disk sink.
                 for (let i = 0; i < totalFiles; i++) {
                     for (let k = i + 1; k <= i + PREFETCH_DEPTH && k < totalFiles; k++) {
                         triggerPrefetch(k);
