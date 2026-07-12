@@ -3667,9 +3667,27 @@
 
                         let currentPartIdx = 0;
 
-                        async function partWorker() {
-                            while (currentPartIdx < totalParts) {
-                                if (isUploadCancelled) break;
+                        // --- Decoupled producer/consumer pipeline ---
+                        // Encryption (CPU-bound) and upload (network-bound) run in
+                        // SEPARATE worker pools. Encryption workers push ready-to-send
+                        // parts into a bounded queue; a small fixed pool of upload
+                        // workers drains it. This overlaps encryption and network
+                        // transfer instead of alternating them, which turns the spiky
+                        // "encrypt-then-upload" saw-tooth into a smooth, continuously
+                        // saturated upload stream.
+                        const readyParts = [];          // queue of { pIdx, partNum, partBlob }
+                        let producersDone = false;
+                        let uploadError = null;
+
+                        // Bound the queue so encryption doesn't run far ahead of
+                        // uploads (keeps memory in check, smooths the supply).
+                        const MAX_QUEUED_PARTS = Math.max(4, Math.min(8, (navigator.hardwareConcurrency || 4)));
+
+                        // Encryption (CPU) workers: scale with cores, not the network.
+                        const numEncryptWorkers = Math.max(2, Math.min(navigator.hardwareConcurrency || 4, 8));
+
+                        async function encryptWorker() {
+                            while (currentPartIdx < totalParts && !isUploadCancelled && !uploadError) {
                                 const pIdx = currentPartIdx++;
                                 const partNum = pIdx + 1;
 
@@ -3693,36 +3711,81 @@
                                     })());
                                 }
                                 const encChunks = await Promise.all(chunkPromises);
-
                                 const partBlob = new Blob(encChunks, { type: 'application/octet-stream' });
                                 partTotalBytes[pIdx] = partBlob.size;
 
+                                // Backpressure: wait if the queue is full so
+                                // encryption doesn't outrun the network.
+                                while (readyParts.length >= MAX_QUEUED_PARTS && !isUploadCancelled && !uploadError) {
+                                    await new Promise(r => setTimeout(r, 5));
+                                }
+                                if (isUploadCancelled || uploadError) break;
+                                readyParts.push({ pIdx, partNum, partBlob });
+                            }
+                        }
+                        // Upload (network) workers: a small fixed pool keeps the link
+                        // saturated smoothly. Cap is deliberately LOWER than the old
+                        // 6-16-per-file value to avoid bursting the link all at once.
+                        const numUploadWorkers = 3;
+
+                        async function uploadWorker() {
+                            while (!isUploadCancelled && !uploadError) {
+                                let job = null;
+                                if (readyParts.length > 0) {
+                                    job = readyParts.shift();
+                                } else if (producersDone) {
+                                    break;
+                                } else {
+                                    await new Promise(r => setTimeout(r, 5));
+                                    continue;
+                                }
+                                if (!job) continue;
+
+                                const { pIdx, partNum, partBlob } = job;
                                 const partUrl = `/api/upload/${uuid}/multipart/part?upload_id=${encodeURIComponent(upload_id)}&part_number=${partNum}&file_name=${encodeURIComponent(fileName)}`;
-                                const resData = await uploadBinaryBody(partUrl, partBlob, 'application/octet-stream', token, (loaded, total) => {
-                                    partLoadedBytes[pIdx] = loaded;
+                                try {
+                                    const resData = await uploadBinaryBody(partUrl, partBlob, 'application/octet-stream', token, (loaded, total) => {
+                                        partLoadedBytes[pIdx] = loaded;
+                                        fileLoadedBytes[i] = partLoadedBytes.reduce((a, b) => a + b, 0);
+                                        fileTotalBytes[i] = partTotalBytes.reduce((a, b) => a + b, 0);
+                                        updateUploadProgressUI();
+                                    });
+
+                                    partLoadedBytes[pIdx] = partBlob.size;
                                     fileLoadedBytes[i] = partLoadedBytes.reduce((a, b) => a + b, 0);
-                                    fileTotalBytes[i] = partTotalBytes.reduce((a, b) => a + b, 0);
                                     updateUploadProgressUI();
-                                });
 
-                                partLoadedBytes[pIdx] = partBlob.size;
-                                fileLoadedBytes[i] = partLoadedBytes.reduce((a, b) => a + b, 0);
-                                updateUploadProgressUI();
-
-                                completedParts[pIdx] = {
-                                    part_number: partNum,
-                                    e_tag: resData.e_tag
-                                };
+                                    completedParts[pIdx] = {
+                                        part_number: partNum,
+                                        e_tag: resData.e_tag
+                                    };
+                                } catch (err) {
+                                    uploadError = err;
+                                    return;
+                                }
                             }
                         }
 
-                        const concurrency = Math.max(6, Math.min(16, (navigator.hardwareConcurrency || 4) * 2));
-                        const partWorkers = [];
-                        const numPartWorkers = Math.min(concurrency, totalParts);
-                        for (let w = 0; w < numPartWorkers; w++) {
-                            partWorkers.push(partWorker());
+                        // Start encryption producers.
+                        const encryptWorkers = [];
+                        const numEncrypt = Math.min(numEncryptWorkers, totalParts);
+                        for (let w = 0; w < numEncrypt; w++) {
+                            encryptWorkers.push(encryptWorker());
                         }
-                        await Promise.all(partWorkers);
+                        // Mark production complete once all encryption is done.
+                        (async () => {
+                            await Promise.all(encryptWorkers);
+                            producersDone = true;
+                        })();
+
+                        // Start a small, fixed upload consumer pool.
+                        const uploadWorkers = [];
+                        for (let w = 0; w < numUploadWorkers; w++) {
+                            uploadWorkers.push(uploadWorker());
+                        }
+                        await Promise.all(uploadWorkers);
+
+                        if (uploadError) throw uploadError;
 
                         if (isUploadCancelled) throw new Error('Upload cancelled');
 
